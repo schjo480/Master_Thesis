@@ -1,0 +1,62 @@
+seml:
+  executable: main.py
+  name: mid_tdrive_edge_coordinates_experiment
+  output_dir: experiments/tdrive_edge_coordinates_experiment
+  project_root_dir: ../..
+  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/mid_python38
+
+slurm:
+  experiments_per_job: 1
+  sbatch_options:
+    # partition: gpu_large
+    gres: gpu:1       # num GPUs
+    mem: 16G          # memory
+    cpus-per-task: 2  # num cores
+    time: 0-23:00     # max time, D-HH:MM
+
+fixed:
+  output_dir: experiments/tdrive_edge_coordinates_experiment
+  dataset: 'tdrive_edge_coordinates'
+  lr: 0.001
+  epochs: 20
+  batch_size: 1
+  diffnet: TransformerConcatLinear
+  encoder_dim: 256
+  tf_layer: 3
+  eval_batch_size: 256
+  k_eval: 25
+  seed: 123
+  eval_every: 5
+
+  data_dir: processed_data_noise
+
+  # Testing
+  eval_at: 40
+  eval_mode: False
+  # set to "ddim" to enable fast sampling
+  sampling: ddim
+  ############### Trajectron++ Config #################
+  # misc
+  conf: None
+  debug: False
+  preprocess_workers: 0
+  # model parameters
+  offline_scene_graph: yes
+  dynamic_edges: yes
+  edge_state_combine_method: sum
+  edge_influence_combine_method: attention
+  edge_addition_filter: [0.25, 0.5, 0.75, 1.0]
+  edge_removal_filter: [1.0, 0.0]
+  override_attention_radius: []
+  incl_robot_node: False
+  map_encoding: False
+  augment: False
+  node_freq_mult_train: False
+  node_freq_mult_eval: False
+  scene_freq_mult_train: False
+  scene_freq_mult_eval: False
+  scene_freq_mult_viz: False
+  no_edge_encoding: False
+  # Data Parameters:
+  device: cuda
+  eval_device: cuda

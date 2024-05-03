@@ -1,0 +1,45 @@
+model:
+  name: edge_encoder
+  args:
+    hidden_channels: 256
+    time_embedding_dim: 128
+    condition_dim: 256
+    out_ch: 1 
+    num_heads: 1
+    dropout: 0.1
+    model_output: logits  # Can be 'logits' or 'logistic_pars'
+
+  diffusion_betas:
+    type: linear
+    start: 1.e-4  # 1e-4 gauss, 0.02 uniform
+    stop: 0.02  # 0.02 gauss, 1. uniform
+    num_timesteps: 1000
+
+  model_prediction: x_start  # Options: 'x_start','xprev'
+  transition_mat_type: gaussian  # Options: 'gaussian','uniform','absorbing'
+  transition_bands: null
+  loss_type: cross_entropy_x_start  # Options: kl, cross_entropy_x_start, hybrid
+  hybrid_coeff: 0.001  # Only used for hybrid loss type.
+
+train:
+  batch_size: 1
+  optimizer: adam
+  lr: 0.0001
+  gradient_accumulation: True
+  gradient_accumulation_steps: 16
+  num_epochs: 20000
+  #learning_rate_warmup_steps: 0
+  weight_decay: 0.0
+  lr_decay: 0.000005 # = 0.1/num_epochs so that lr at the end is 1/10 of lr at beginning
+  grad_clip: 1.0
+  log_loss_every_steps: 20
+
+test:
+  batch_size: 1
+
+data:
+  history_len: 5
+  future_len: 2
+  num_classes: 1
+  edge_features: ['one_hot_edges']
+  # edge_features: ['one_hot_edges', 'edge_orientations']

@@ -2,7 +2,7 @@
 name = "MA_Diffusion_base_trajectory_prediction"
 version = "0.0.1"
 authors = [
-    { name = "schmitj", email = "my@mail.com" },
+    { name = "schmitj", email = "joe.schmit@tum.de" },
 ]
 dependencies = [
     # General science & ml
