@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv
+from torch_geometric.nn.conv import GATv2Conv
 
 
 def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
@@ -59,10 +59,6 @@ class Edge_Encoder(nn.Module):
         # self.out_channels = self.config['model']['args']['out_channels']
         self.model_output = self.config['model_output']
         
-        '''num_res_blocks
-        attn_resolutions
-        dropout'''
-        
         # Time embedding
         self.max_time = 1000.
         self.time_embedding_dim = self.config['time_embedding_dim']
@@ -76,11 +72,8 @@ class Edge_Encoder(nn.Module):
         # GNN layers
         self.hidden_channels = hidden_channels
         self.num_heads = self.config['num_heads']
-        self.conv1 = GATConv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv2 = GATConv(self.hidden_channels*self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        
-        # Edge Embedding
-        self.edge_embedding = nn.Linear(self.num_edge_features, self.hidden_channels)
+        self.conv1 = GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
+        self.conv2 = GATv2Conv(self.hidden_channels*self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
         
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
@@ -99,11 +92,8 @@ class Edge_Encoder(nn.Module):
         # TODO: Integrate edge indices of trajectories (possibly just do it with mask as edge attribute?)
         # --> This works if we are working with a batch size of 1
         # --> Possibly need gradient accumulation for faster training
-        '''x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
-        x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]'''
+        
         # Edge Embedding
-        # edge_emb = F.relu(self.edge_embedding(edge_attr))
         x = F.relu(self.conv1(x, edge_index, edge_attr.squeeze(0)))
         x = F.relu(self.conv2(x, edge_index, edge_attr.squeeze(0)))
         x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
