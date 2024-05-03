@@ -1,0 +1,34 @@
+seml:
+  executable: main.py
+  name: tdrive_scone_experiment
+  output_dir: experiments/tdrive_scone_experiment
+  project_root_dir: ..
+  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/mid_python38
+
+slurm:
+  experiments_per_job: 1
+  sbatch_options:
+    gres: gpu:1       # num GPUs
+    mem: 32G          # memory
+    cpus-per-task: 2  # num cores
+    time: 0-48:00     # max time, D-HH:MM
+    
+model:
+  name: scone
+  input_features: trajectory
+  activation: tanh
+  hidden_dims: [16, 16, 16]
+
+data:
+  reduce_instances_to: null # we would need to reduce nodes that can not be reached via either edges OR cells (cumbersome to compute for some speedup)
+  compute_cell_complex: true
+
+
+trainer:
+  accelerator: gpu
+  
+task:
+  order_step_loss_weights: [1.0, null, null]
+
+    
+  

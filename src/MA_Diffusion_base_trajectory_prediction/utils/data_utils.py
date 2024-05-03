@@ -170,16 +170,11 @@ def load_new_format(new_file_path):
         node_coordinates = new_hf['graph']['node_coordinates'][:]
         edges = new_hf['graph']['edges'][:]
         
-        if 'pNEUMA' in new_file_path:
-            for i in tqdm(new_hf['trajectories'].keys()):
-                for j in new_hf['trajectories'][i].keys():
-                    path_group = new_hf['trajectories'][i][j]
-                    path = {attr: path_group[attr][()] for attr in path_group.keys() if not isinstance(path_group[attr], h5py.Group)}
-                    paths.append(path)
-        else:
-            for i in tqdm(new_hf['trajectories'].keys()):
+        for i in tqdm(new_hf['trajectories'].keys()):
                 path_group = new_hf['trajectories'][i]
                 path = {attr: path_group[attr][()] for attr in path_group.keys()}
+                if 'edge_orientation' in path:
+                    path['edge_orientations'] = path.pop('edge_orientation')
                 paths.append(path)
 
     return paths, node_coordinates, edges
@@ -224,7 +219,7 @@ def copy_and_create_datasets(old_hf, new_hf, modified_node_coordinates, modified
     del new_hf['graph/node_coordinates']
     del new_hf['graph/edges']
     new_hf.create_dataset('graph/node_coordinates', data=modified_node_coordinates)
-    new_hf.create_dataset('graph/edges', data=modified_edges)
+    #new_hf.create_dataset('graph/edges', data=modified_edges)
     new_hf['graph'].create_dataset('edge_used_by_trajectory', data=get_edge_used_by_trajectories(modified_paths))
 
 
@@ -272,3 +267,34 @@ def modify_and_save_data(old_file_path, new_file_path, modified_paths, modified_
         flatten_node_features(new_hf, node_mapping)
         flatten_edge_features(new_hf, edge_mapping)
         create_trajectories_group(new_hf, modified_paths)
+
+
+def remove_bad_matches(paths, threshold_percentile: int = 95, mode: str = 'max'):
+    max_dist_abs = []
+    mean_dist = []
+    for i in range(len(paths)):
+        if len(paths[i]['distance_observation_to_matched_edge']) > 0:
+            max_dist_abs.append(np.max(paths[i]['distance_observation_to_matched_edge']))
+            mean_dist.append(np.mean(paths[i]['distance_observation_to_matched_edge']))
+
+    new_paths = []
+    bad_matches = []
+    if len(max_dist_abs) > 0:
+        if mode == 'max':
+            threshold = np.percentile(max_dist_abs, threshold_percentile)
+            for path in tqdm(paths):
+                if (len(path['distance_observation_to_matched_edge']) > 0):
+                    if np.max(path['distance_observation_to_matched_edge']) < threshold:
+                        new_paths.append(path)
+                    else:
+                        bad_matches.append(path)
+        elif mode == 'mean':
+            threshold = np.percentile(mean_dist, threshold_percentile)
+            for path in tqdm(paths):
+                if (len(path['distance_observation_to_matched_edge']) > 0):
+                    if np.mean(path['distance_observation_to_matched_edge']) < threshold:
+                        new_paths.append(path)
+                    else:
+                        bad_matches.append(path)
+                
+    return new_paths, bad_matches

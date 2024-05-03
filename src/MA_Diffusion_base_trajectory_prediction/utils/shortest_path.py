@@ -27,9 +27,7 @@ import math
         shortest_paths.append(shortest_path)
     return shortest_paths'''
 
-# Here is the version for returning edge idxs as well
-
-def calculate_shortest_paths(paths, node_coordinates, edges, distance_measure='edge'):
+def calculate_shortest_paths(paths, node_coordinates, edges, distance_measure='edge', multiple_paths=False):
     G = nx.Graph()
     edge_coordinates = node_coordinates[edges]
     for node, coordinates in enumerate(node_coordinates):
@@ -49,32 +47,67 @@ def calculate_shortest_paths(paths, node_coordinates, edges, distance_measure='e
         end_edge_idx = path['edge_idxs'][-1]
         start_edge = edges[start_edge_idx]
         end_edge = edges[end_edge_idx]
-        start_node = start_edge[0]
-        end_node = end_edge[1]
+        start_node = start_edge[0] if path['edge_orientations'][0] == 1 else start_edge[1]
+        end_node = end_edge[1] if path['edge_orientations'][-1] == 1 else end_edge[0]
         if distance_measure == 'edge':
-            shortest_path_nodes = nx.shortest_path(G, start_node, end_node)
-            shortest_path_edge_idxs = []
-            shortest_path_edge_orientation = [] 
+            if multiple_paths:
+                shortest_path_nodes = nx.all_shortest_paths(G, start_node, end_node)
+                shortest_path_edge_idxs = []
+                shortest_path_edge_orientation = [] 
+                
+                for shortest_path_int in shortest_path_nodes:
+                    shortest_path_edge_idxs_int = []
+                    shortest_path_edge_orientation_int = [] 
+                    for i in range(len(shortest_path_int) - 1):
+                        node1 = shortest_path_int[i]
+                        node2 = shortest_path_int[i + 1]
+                        edge_idx = np.where(((edges[:, 0] == node1) & (edges[:, 1] == node2)) | (edges[:, 0] == node2) & (edges[:, 1] == node1))[0]
+                        shortest_path_edge_idxs_int.append(edge_idx[0])
+                        shortest_path_edge_orientation_int.append(1 if edges[edge_idx][0][0] == node1 else -1)
+                    shortest_path_edge_idxs.append(shortest_path_edge_idxs_int)
+                    shortest_path_edge_orientation.append(shortest_path_edge_orientation_int)
+                
+            else:
+                shortest_path_nodes = nx.shortest_path(G, start_node, end_node)
+                shortest_path_edge_idxs = []
+                shortest_path_edge_orientation = [] 
 
-            for i in range(len(shortest_path_nodes) - 1):
-                node1 = shortest_path_nodes[i]
-                node2 = shortest_path_nodes[i + 1]
-                edge_idx = np.where(((edges[:, 0] == node1) & (edges[:, 1] == node2)) | (edges[:, 0] == node2) & (edges[:, 1] == node1))[0]
-                shortest_path_edge_idxs.append(edge_idx[0])  # Modify here to append the first element of the array
-                shortest_path_edge_orientation.append(1 if edges[edge_idx][0][0] == node1 else -1)
+                for i in range(len(shortest_path_nodes) - 1):
+                    node1 = shortest_path_nodes[i]
+                    node2 = shortest_path_nodes[i + 1]
+                    edge_idx = np.where(((edges[:, 0] == node1) & (edges[:, 1] == node2)) | (edges[:, 0] == node2) & (edges[:, 1] == node1))[0]
+                    shortest_path_edge_idxs.append(edge_idx[0])
+                    shortest_path_edge_orientation.append(1 if edges[edge_idx][0][0] == node1 else -1)
 
         elif distance_measure == 'euclidean':
-            shortest_path_nodes = nx.shortest_path(G, start_node, end_node, weight='euclidean_distance')
-            shortest_path_edge_idxs = []
-            shortest_path_edge_orientation = []  
+            if multiple_paths:
+                shortest_path_nodes = nx.all_shortest_paths(G, start_node, end_node, weight='euclidean_distance')
+                shortest_path_edge_idxs = []
+                shortest_path_edge_orientation = [] 
+                
+                for shortest_path_int in shortest_path_nodes:
+                    shortest_path_edge_idxs_int = []
+                    shortest_path_edge_orientation_int = [] 
+                    for i in range(len(shortest_path_int) - 1):
+                        node1 = shortest_path_int[i]
+                        node2 = shortest_path_int[i + 1]
+                        edge_idx = np.where(((edges[:, 0] == node1) & (edges[:, 1] == node2)) | (edges[:, 0] == node2) & (edges[:, 1] == node1))[0]
+                        shortest_path_edge_idxs_int.append(edge_idx[0])
+                        shortest_path_edge_orientation_int.append(1 if edges[edge_idx][0][0] == node1 else -1)
+                    shortest_path_edge_idxs.append(shortest_path_edge_idxs_int)
+                    shortest_path_edge_orientation.append(shortest_path_edge_orientation_int)
+                    
+            else:
+                shortest_path_nodes = nx.shortest_path(G, start_node, end_node, weight='euclidean_distance')
+                shortest_path_edge_idxs = []
+                shortest_path_edge_orientation = []  
 
-            for i in range(len(shortest_path_nodes) - 1):
-                node1 = shortest_path_nodes[i]
-                node2 = shortest_path_nodes[i + 1]
-                edge_idx = np.where(((edges[:, 0] == node1) & (edges[:, 1] == node2)) | ((edges[:, 0] == node2) & (edges[:, 1] == node1)))[0]
-                shortest_path_edge_idxs.append(edge_idx[0])  # Modify here to append the first element of the array
-                shortest_path_edge_orientation.append(1 if edges[edge_idx][0][0] == node1 else -1)
-
+                for i in range(len(shortest_path_nodes) - 1):
+                    node1 = shortest_path_nodes[i]
+                    node2 = shortest_path_nodes[i + 1]
+                    edge_idx = np.where(((edges[:, 0] == node1) & (edges[:, 1] == node2)) | ((edges[:, 0] == node2) & (edges[:, 1] == node1)))[0]
+                    shortest_path_edge_idxs.append(edge_idx[0])  # Modify here to append the first element of the array
+                    shortest_path_edge_orientation.append(1 if edges[edge_idx][0][0] == node1 else -1)
         shortest_path['edge_idxs'] = shortest_path_edge_idxs
         shortest_path['edge_orientation'] = shortest_path_edge_orientation 
 

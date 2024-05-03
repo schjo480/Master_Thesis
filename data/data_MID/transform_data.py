@@ -8,16 +8,16 @@ from utils.data_utils import TDRIVE, GEOLIFE, load_data, calculate_bbox_and_filt
     get_edge_used_by_trajectories, modify_and_save_data
 
 
-TDRIVE_PATH = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive.h5'
-paths, node_coordinates, edges = load_new_format(TDRIVE_PATH)
+GEOLIFE_PATH = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/geolife.h5'
+paths, node_coordinates, edges = load_new_format(GEOLIFE_PATH)
 edge_coordinates = node_coordinates[edges]
 
 
 
 def transform_data(paths, train_size=0.7, test_size=0.2, val_size=0.1, use_edge_coordinates=False, edge_coordinates=None, use_start_coordinates=False):
-    output_train_file = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/data_MID/tdrive_edge_start_coord_train.txt'
-    output_test_file = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/data_MID/tdrive_edge_start_coord_test.txt'
-    output_val_file = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/data_MID/tdrive_edge_start_coord_val.txt'
+    output_train_file = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/data_MID/geolife_edge_coord_train.txt'
+    output_test_file = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/data_MID/geolife_edge_coord_test.txt'
+    output_val_file = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/data_MID/geolife_edge_coord_val.txt'
 
     num_paths = len(paths)
     num_train = int(num_paths * train_size)
@@ -48,8 +48,9 @@ def save_data(paths, output_file, use_edge_coordinates=False, use_start_coordina
         for path in paths:
             coordinates = path['coordinates']
             timestamps = path['timestamps']
-            taxi_idx = path['taxi_idx']
-            taxi_idx = int(taxi_idx.decode('utf-8').split('.')[0])
+            user_idx = path['user_idx']
+            user_idx = int(user_idx.decode('utf-8'))
+            # taxi_idx = int(taxi_idx.decode('utf-8').split('.')[0])
             
             if use_edge_coordinates:
                 if use_start_coordinates:
@@ -61,7 +62,7 @@ def save_data(paths, output_file, use_edge_coordinates=False, use_start_coordina
                                 timestamp = timestamps[-1] + 10  # create dummy timestamp
                             else:
                                 timestamp = timestamps[i]
-                            line = f"{timestamp}\t{taxi_idx}\t{coordinate_x}\t{coordinate_y}\n"
+                            line = f"{timestamp}\t{user_idx}\t{coordinate_x}\t{coordinate_y}\n"
                             outfile.write(line)
                         else:
                             continue
@@ -75,7 +76,7 @@ def save_data(paths, output_file, use_edge_coordinates=False, use_start_coordina
                             else:
                                 timestamp = timestamps[i]
 
-                            line = f"{timestamp}\t{taxi_idx}\t{coordinate_x}\t{coordinate_y}\n"
+                            line = f"{timestamp}\t{user_idx}\t{coordinate_x}\t{coordinate_y}\n"
                             outfile.write(line)
                         else:
                             continue
@@ -85,7 +86,7 @@ def save_data(paths, output_file, use_edge_coordinates=False, use_start_coordina
                     coordinate_y = coordinates[i, 1]
                     timestamp = timestamps[i]
 
-                    line = f"{timestamp}\t{taxi_idx}\t{coordinate_x}\t{coordinate_y}\n"
+                    line = f"{timestamp}\t{user_idx}\t{coordinate_x}\t{coordinate_y}\n"
                     outfile.write(line)
 
 def interpolate_timestamps(timestamps, index):
