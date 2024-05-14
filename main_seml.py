@@ -53,12 +53,12 @@ def main(data, wandb, diffusion_config, model, training, testing, eval):
 
     model = Graph_Diffusion_Model(data_config=data, wandb_config=wandb, diffusion_config=diffusion_config, model_config=model, train_config=training, test_config=testing, model=edge_encoder, nodes=nodes, edges=edges)
     if eval:
-        sample_list, ground_truth_hist, ground_truth_fut = model.get_samples(load_model=True, model_path='/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm/synthetic_d3pm_seml.pth')
+        sample_list, ground_truth_hist, ground_truth_fut = model.get_samples(load_model=True, model_path=testing['model_path'])
+        return {
+            'sample_list': sample_list,
+            'ground_truth_hist': ground_truth_hist,
+            'ground_truth_fut': ground_truth_fut,
+        }
     else:    
         model.train()
-    # The result will be stored in the MongoDB
-    return {
-        'sample_list': sample_list,
-        'ground_truth_hist': ground_truth_hist,
-        'ground_truth_fut': ground_truth_fut,
-    }
+            
