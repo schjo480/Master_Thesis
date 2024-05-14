@@ -65,21 +65,19 @@ class Edge_Encoder(nn.Module):
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
     
-        # TODO: Adapt model dimensions to fit the new input data
-        # New history data is of shape (bs, num_edges) and not (bs, history_len)
-        # New future data is of shape (bs, num_edges) and not (bs, future_len)
         # Model
         # GNN layers
         self.hidden_channels = hidden_channels
         self.num_heads = self.config['num_heads']
         self.conv1 = GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv2 = GATv2Conv(self.hidden_channels*self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
+        self.conv2 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
+        self.conv3 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
         
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels*self.num_heads, self.condition_dim)  # To encode history to c
         self.future_decoder = nn.Linear(self.hidden_channels, self.num_edges)  # To predict future edges
-        self.adjust_to_future_len = nn.Conv1d(in_channels=self.num_nodes, out_channels=self.future_len, kernel_size=1)
+        self.adjust_to_class_shape = nn.Conv1d(in_channels=self.num_nodes, out_channels=self.num_classes, kernel_size=1)
 
     def forward(self, x, edge_index, t=None, edge_attr=None, condition=None, mode=None):
         '''
@@ -89,16 +87,12 @@ class Edge_Encoder(nn.Module):
             t: torch.Tensor: timestep tensor'''    
         
         # GNN forward pass
-        # TODO: Integrate edge indices of trajectories (possibly just do it with mask as edge attribute?)
-        # --> This works if we are working with a batch size of 1
-        # --> Possibly need gradient accumulation for faster training
         
         # Edge Embedding
         x = F.relu(self.conv1(x, edge_index, edge_attr.squeeze(0)))
         x = F.relu(self.conv2(x, edge_index, edge_attr.squeeze(0)))
         x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
         # x = torch.cat((x, edge_emb), dim=1)
-        
         
         if mode == 'history':
             c = self.history_encoder(x)
@@ -118,11 +112,12 @@ class Edge_Encoder(nn.Module):
             x = torch.cat((x, condition), dim=2) # Concatenate with condition c
             x = F.relu(nn.Linear(x.size(2), self.hidden_channels)(x))
             
-            logits = self.future_decoder(x)
-            logits = F.relu(self.adjust_to_future_len(logits))
-            # TODO: Mimicking original code: (bs, height, width, self.out_ch, self.num_pixel_vals)
-            # this model should output logits of the shape (bs, future_len, 1, num_edges)
-            # Currently it outputs (bs, future_len, num_edges)
-            logits = logits.unsqueeze(2) # (bs, future_len, num_edges) -> (bs, future_len, 1, num_edges)
+            logits = self.future_decoder(x) # (bs, num_nodes, num_edges)
+            
+            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
+            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
 
-            return logits            
+            # Unsqueeze to get the final shape 
+            logits = logits.unsqueeze(2)    # (batch_size, num_edges, 1, num_classes=2)
+
+            return logits

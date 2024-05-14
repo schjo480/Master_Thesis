@@ -225,8 +225,8 @@ class TrajectoryDataset(Dataset):
         valid_history_mask = history_indices >= 0
         valid_future_mask = future_indices >= 0
         
-        history_one_hot_edges = torch.nn.functional.one_hot(history_indices[valid_history_mask], num_classes=len(self.edges)).float()
-        future_one_hot_edges = torch.nn.functional.one_hot(future_indices[valid_future_mask], num_classes=len(self.edges)).float()
+        history_one_hot_edges = torch.nn.functional.one_hot(history_indices[valid_history_mask], num_classes=len(self.edges))
+        future_one_hot_edges = torch.nn.functional.one_hot(future_indices[valid_future_mask], num_classes=len(self.edges))
         
         # Sum across the time dimension to count occurrences of each edge
         history_one_hot_edges = history_one_hot_edges.sum(dim=0)  # (num_edges,)
@@ -394,16 +394,18 @@ nodes = [(0, {'pos': (0.1, 0.65)}),
          (24, {'pos': (0.95, 0.95)}),
          (25, {'pos': (0.9, 0.4)}),
          (26, {'pos': (0.95, 0.05)})]
-edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26)]
+'''edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26)]
 
-'''dataset = TrajectoryDataset(file_path="/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5", 
-                            history_len=5, nodes=nodes, edges=edges, future_len=2, edge_features=['one_hot'])
+dataset = TrajectoryDataset(file_path="/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5", 
+                            history_len=5, nodes=nodes, edges=edges, future_len=4, edge_features=['one_hot'])
 
 dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
 for i, data in enumerate(dataloader):
-    print(data["history_indices"])
-    print(data["history_one_hot_edges"])
-    if i == 1:
-        break'''
-    
+    if len(data["history_indices"]) == 0:
+        continue
+    print(data["future_indices"])
+    print(data["future_one_hot_edges"])
+    if i == 5:
+        break
+    '''
