@@ -168,6 +168,7 @@ def load_new_format(new_file_path):
 
     with h5py.File(new_file_path, 'r') as new_hf:
         node_coordinates = new_hf['graph']['node_coordinates'][:]
+        nodes = [(i, {'pos': tuple(pos)}) for i, pos in enumerate(node_coordinates)]
         edges = new_hf['graph']['edges'][:]
         
         for i in tqdm(new_hf['trajectories'].keys()):
@@ -177,7 +178,7 @@ def load_new_format(new_file_path):
                     path['edge_orientations'] = path.pop('edge_orientation')
                 paths.append(path)
 
-    return paths, node_coordinates, edges
+    return paths, nodes, edges
 
 
 def plot_histograms_before_after_split(paths_before_split, paths_after_split):

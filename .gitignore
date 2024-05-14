@@ -236,6 +236,8 @@ fabric.properties
 
 # Android studio 3.1+ serialized cache file
 .idea/caches/build_file_checksums.ser
+experiments/*
+wandb/*
 processed_data_no_social/tdrive_edge_coordinates_testcustom.pkl
 processed_data_no_social/tdrive_edge_coordinates_traincustom.pkl
 processed_data_no_social/tdrive_edge_coordinates_valcustom.pkl
@@ -277,3 +279,4 @@ wandb/run-20240503_073438-9yfjhsw2/files/requirements.txt
 wandb/run-20240503_081905-ovcmykn5/files/requirements.txt
 wandb/run-20240502_141435-hec0m894/run-hec0m894.wandb
 wandb/run-20240502_141435-hec0m894/files/config.yaml
+experiments/synthetic_d3pm/synthetic_d3pm_8904672_0.out

@@ -47,12 +47,18 @@ def categorical_kl_probs(probs1, probs2, eps=1.e-6):
     kl = (probs1 * (log_probs1 - log_probs2)).sum(dim=-1)
     return kl
 
-def categorical_log_likelihood(x, logits):
-    logits = logits
+def categorical_log_likelihood(x, logits, class_weights):
+    '''logits = logits
     log_probs = F.log_softmax(logits, dim=-1)
     x = x
     x_onehot = F.one_hot(x, num_classes=logits.shape[-1])
-    return (log_probs * x_onehot.float()).sum(dim=-1)
+    return (log_probs * x_onehot.float()).sum(dim=-1)'''
+    
+    log_probs = F.log_softmax(logits, dim=-1)
+    x_onehot = F.one_hot(x, num_classes=logits.shape[-1]).float()
+    # Apply class weights
+    weighted_log_probs = log_probs * class_weights
+    return (weighted_log_probs * x_onehot).sum(dim=-1)
 
 def meanflat(x):
     return x.mean(dim=tuple(range(1, x.ndim)))
