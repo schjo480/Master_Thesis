@@ -250,16 +250,21 @@ class Graph_Diffusion_Model(nn.Module):
     
     def _build_optimizer(self):
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        def lr_lambda(epoch):
-            return 1.0 if epoch < self.learning_rate_warmup_steps else self.lr_decay_parameter ** (epoch - self.learning_rate_warmup_steps)
         
+        def lr_lambda(epoch):
+            if epoch < self.learning_rate_warmup_steps:
+                return 1.0
+            else:
+                decay_lr = self.lr_decay_parameter ** (epoch - self.learning_rate_warmup_steps)
+                return max(decay_lr, 2e-5 / self.lr)
+            
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         print("> Optimizer and Scheduler built!")
         
-        '''print("Parameters to optimize:")
+        """print("Parameters to optimize:")
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                print(name)'''
+                print(name)"""
         
     def _build_train_dataloader(self):
         self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.nodes, self.edges, self.future_len, self.edge_features)

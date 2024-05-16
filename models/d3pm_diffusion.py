@@ -534,13 +534,13 @@ class CategoricalDiffusion:
         true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
         model_logits, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
 
-        kl = categorical_kl_logits(logits1=true_logits, logits2=model_logits)
+        kl = categorical_kl_logits(input_logits=model_logits, target_logits=true_logits)
         assert kl.shape == x_start.shape
-        kl = meanflat(kl) / torch.log(torch.tensor(2.0))
+        kl = kl / torch.log(torch.tensor(2.0))
 
-        decoder_nll = -categorical_log_likelihood(x_start, model_logits)
-        assert decoder_nll.shape == x_start.shape
-        decoder_nll = meanflat(decoder_nll) / torch.log(torch.tensor(2.0))
+        decoder_nll = F.cross_entropy(model_logits, x_start, weight=self.class_weights, reduction='mean')
+        # decoder_nll = -categorical_log_likelihood(x_start, model_logits)
+        #assert decoder_nll.shape == x_start.shape
 
         # At the first timestep return the decoder NLL,
         # otherwise return KL(q(x_{t-1}|x_t,x_start) || p(x_{t-1}|x_t))
@@ -570,24 +570,6 @@ class CategoricalDiffusion:
             q_probs, prior_probs)
         assert kl_prior.shape == x_start.shape
         return meanflat(kl_prior) / torch.log(torch.tensor(2.0))
-
-    '''def cross_entropy_x_start(self, x_start, pred_x_start_logits, class_weights):
-        """Calculate crossentropy between x_start and predicted x_start.
-
-        Args:
-        x_start: original clean data
-        pred_x_start_logits: predicted_logits
-
-        Returns:
-        ce: cross entropy.
-        """
-        ce = -categorical_log_likelihood(x_start, pred_x_start_logits, class_weights)
-        assert ce.shape == x_start.shape
-        ce = meanflat(ce) / torch.log(torch.tensor(2.0))
-
-        assert ce.shape == (x_start.shape[0],)
-        
-        return ce'''
         
     def cross_entropy_x_start(self, x_start, pred_x_start_logits, class_weights):
         """Calculate binary weighted cross entropy between x_start and predicted x_start logits.
@@ -619,21 +601,19 @@ class CategoricalDiffusion:
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
         
-        '''# Initialize the tensor to store edge attributes for all items in the batch
-        edge_attr_t = torch.zeros(x_t.size(0), self.num_classes, 1, dtype=torch.float32)
-
-        # Iterate over each item in the batch to set the appropriate indices to 1
-        for idx, edges in enumerate(x_t):
-            # Set the specific indices for the current batch item
-            # Since we are setting 1s, we'll use the indices directly within our 3D tensor
-            edge_attr_t[idx, edges, 0] = 1.
-            # Generate and set the second attribute to either -1 or 1 randomly
-            # edge_attr_t[idx, edges, 1] = 1. if torch.rand(1) > 0.5 else -1'''
         edge_attr_t = x_t.unsqueeze(-1).type(torch.float32)
 
         # Calculate the loss
         if self.loss_type == 'kl':
-            losses, _ = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t)
+            losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
+                                                               node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
+            
+            pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
+            # NOTE: Currently only works for batch size of 1
+            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
+            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            
+            return losses, pred
             
         elif self.loss_type == 'cross_entropy_x_start':
             _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
@@ -650,7 +630,7 @@ class CategoricalDiffusion:
         elif self.loss_type == 'hybrid':
             vb_losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
                                                                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
-            ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits)
+            ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             losses = vb_losses + self.hybrid_coeff * ce_losses
             
         else:

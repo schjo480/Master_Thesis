@@ -32,12 +32,10 @@ def sample_categorical(logits, uniform_noise):
     sample = torch.argmax(logits + gumbel_noise, dim=-1)
     return F.one_hot(sample, num_classes=logits.shape[-1])
 
-def categorical_kl_logits(logits1, logits2, eps=1.e-6):
-    logits1, logits2 = logits1, logits2
-    probs1 = F.softmax(logits1 + eps, dim=-1)
-    log_probs1 = F.log_softmax(logits1 + eps, dim=-1)
-    log_probs2 = F.log_softmax(logits2 + eps, dim=-1)
-    kl = (probs1 * (log_probs1 - log_probs2)).sum(dim=-1)
+def categorical_kl_logits(input_logits, target_logits, eps=1.e-6):
+    log_probs1 = F.log_softmax(input_logits + eps, dim=-1)
+    log_probs2 = F.log_softmax(target_logits + eps, dim=-1)
+    kl = F.kl_div(log_probs1, log_probs2)
     return kl
 
 def categorical_kl_probs(probs1, probs2, eps=1.e-6):

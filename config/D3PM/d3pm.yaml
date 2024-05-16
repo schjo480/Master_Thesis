@@ -12,7 +12,7 @@ slurm:
     gres: gpu:1       # num GPUs
     mem: 16G          # memory
     cpus-per-task: 1  # num cores
-    time: 0-23:00     # max time, D-HH:MM
+    time: 1-12:00     # max time, D-HH:MM
 
 fixed:
   data:
@@ -33,11 +33,12 @@ fixed:
   
   model:
     name: edge_encoder
-    hidden_channels: 128
+    hidden_channels: 256
     time_embedding_dim: 128
     condition_dim: 128
     out_ch: 1
     num_heads: 3  # 1
+    num_layers: 3
     dropout: 0.1
     model_output: logits
     model_prediction: x_start  # Options: 'x_start','xprev'
@@ -50,12 +51,12 @@ fixed:
   training:
     batch_size: 1
     optimizer: adam
-    lr: 0.001  # 0.00001
+    lr: 0.01  # 0.00001
     gradient_accumulation: True
     gradient_accumulation_steps: 16
     num_epochs: 50000
-    learning_rate_warmup_steps: 5000 # previously 10000
-    lr_decay: 0.9999 # previously 0.9999
+    learning_rate_warmup_steps: 2500 # previously 10000
+    lr_decay: 0.9998 # previously 0.9999
     log_loss_every_steps: 20
     save_model: True
     save_model_every_steps: 1000
@@ -65,14 +66,14 @@ fixed:
     model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_without_last_two_relu_longer_training/synthetic_d3pm_without_last_two_relu_longer_training.pth'
   
   wandb:
-    exp_name: "synthetic_d3pm_without_last_two_relu_longer_training"
+    exp_name: "synthetic_d3pm_multihead_three_convs_large_low_lr"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
-    job_type: "eval"
+    job_type: "train"
     notes: ""
     tags: ["synthetic_graph", "edge_encoder"]
 
-  eval: True
+  eval: False
 
 random:
   samples: 1

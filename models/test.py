@@ -260,10 +260,10 @@ class Graph_Diffusion_Model(nn.Module):
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         print("> Optimizer and Scheduler built!")
         
-        '''print("Parameters to optimize:")
+        """print("Parameters to optimize:")
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                print(name)'''
+                print(name)"""
         
     def _build_train_dataloader(self):
         self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.nodes, self.edges, self.future_len, self.edge_features)
@@ -533,6 +533,7 @@ class Edge_Encoder(nn.Module):
         # Edge Embedding
         x = F.relu(self.conv1(x, edge_index, edge_attr.squeeze(0)))
         x = F.relu(self.conv2(x, edge_index, edge_attr.squeeze(0)))
+        x = F.relu(self.conv3(x, edge_index, edge_attr.squeeze(0)))
         x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
         # x = torch.cat((x, edge_emb), dim=1)
         
@@ -789,7 +790,6 @@ class CategoricalDiffusion:
         # Concatenating the reversed values with the original values
         values = torch.cat([reversed_values, values], dim=0)
         values = F.softmax(values, dim=0)
-        transition_bands = int(transition_bands)
         values = values[transition_bands:]
         
         for k in range(1, transition_bands + 1):
@@ -1064,6 +1064,40 @@ class CategoricalDiffusion:
             return x
 
   # === Log likelihood / loss calculation ===
+
+    def vb_terms_bpd(self, model_fn, *, x_start, x_t, t, node_features=None, edge_index=None, edge_attr=None, condition=None):
+        """Calculate specified terms of the variational bound.
+
+        Args:
+        model_fn: the denoising network
+        x_start: original clean data
+        x_t: noisy data
+        t: timestep of the noisy data (and the corresponding term of the bound
+            to return)
+
+        Returns:
+        a pair `(kl, pred_start_logits)`, where `kl` are the requested bound terms
+        (specified by `t`), and `pred_x_start_logits` is logits of
+        the denoised image.
+        """
+        true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
+        model_logits, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
+        
+        def categorical_kl_logits(input_logits, target_logits, eps=1.e-6):
+            log_probs1 = F.log_softmax(input_logits + eps, dim=-1)
+            log_probs2 = F.log_softmax(target_logits + eps, dim=-1)
+            kl = F.kl_div(log_probs1, log_probs2, log_target=True)
+            return kl
+        kl = categorical_kl_logits(input_logits=model_logits, target_logits=true_logits)
+        kl = kl / torch.log(torch.tensor(2.0))
+
+        decoder_nll = self.cross_entropy_x_start(x_start, model_logits, self.class_weights)
+
+        # At the first timestep return the decoder NLL,
+        # otherwise return KL(q(x_{t-1}|x_t,x_start) || p(x_{t-1}|x_t))
+        # assert kl.shape == decoder_nll.shape == t.shape == (x_start.shape[0],)
+        result = torch.where(t == 0, decoder_nll, kl)
+        return result, pred_x_start_logits
         
     def cross_entropy_x_start(self, x_start, pred_x_start_logits, class_weights):
         """Calculate binary weighted cross entropy between x_start and predicted x_start logits.
@@ -1095,21 +1129,19 @@ class CategoricalDiffusion:
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
         
-        """# Initialize the tensor to store edge attributes for all items in the batch
-        edge_attr_t = torch.zeros(x_t.size(0), self.num_classes, 1, dtype=torch.float32)
-
-        # Iterate over each item in the batch to set the appropriate indices to 1
-        for idx, edges in enumerate(x_t):
-            # Set the specific indices for the current batch item
-            # Since we are setting 1s, we'll use the indices directly within our 3D tensor
-            edge_attr_t[idx, edges, 0] = 1.
-            # Generate and set the second attribute to either -1 or 1 randomly
-            # edge_attr_t[idx, edges, 1] = 1. if torch.rand(1) > 0.5 else -1"""
         edge_attr_t = x_t.unsqueeze(-1).type(torch.float32)
 
         # Calculate the loss
         if self.loss_type == 'kl':
-            losses, _ = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t)
+            losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
+                                                               node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
+            
+            pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
+            # NOTE: Currently only works for batch size of 1
+            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
+            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            
+            return losses, pred        
             
         elif self.loss_type == 'cross_entropy_x_start':
             _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
@@ -1126,33 +1158,13 @@ class CategoricalDiffusion:
         elif self.loss_type == 'hybrid':
             vb_losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
                                                                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
-            ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits)
+            ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             losses = vb_losses + self.hybrid_coeff * ce_losses
             
         else:
             raise NotImplementedError(self.loss_type)
 
         return losses
-
-    def calc_bpd_loop(self, model_fn, *, x_start, rng):
-        """Calculate variational bound (loop over all timesteps and sum)."""
-        batch_size = x_start.shape[0]
-        total_vb = torch.zeros(batch_size)
-
-        for t in range(self.num_timesteps):
-            noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
-            x_t = self.q_sample(x_start=x_start, t=torch.full((batch_size,), t), noise=noise)
-            vb, _ = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=torch.full((batch_size,), t))
-            total_vb += vb
-
-        prior_b = self.prior_bpd(x_start=x_start)
-        total_b = total_vb + prior_b
-
-        return {
-            'total': total_b,
-            'vbterms': total_vb,
-            'prior': prior_b
-        }
 
         
 encoder_model = Edge_Encoder
@@ -1212,20 +1224,20 @@ model_config = {"name": "edge_encoder",
     "model_prediction": "x_start",  # Options: 'x_start','xprev'
     "transition_mat_type": 'gaussian',  # Options: 'gaussian','uniform','absorbing'
     "transition_bands": 0,
-    "loss_type": "cross_entropy_x_start",  # Options: kl, cross_entropy_x_start, hybrid
+    "loss_type": "kl",  # Options: kl, cross_entropy_x_start, hybrid
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     "class_weights": [0.05, 0.95] # = future_len/num_edges and (num_edges - future_len)/num_edges
     }
 
 train_config = {"batch_size": 1,
     "optimizer": "adam",
-    "lr": 0.002,
+    "lr": 0.00005,
     "gradient_accumulation": True,
     "gradient_accumulation_steps": 16,
     "num_epochs": 200,
     "learning_rate_warmup_steps": 8000, # previously 10000
     "lr_decay": 0.9999, # previously 0.9999
-    "log_loss_every_steps": 20,
+    "log_loss_every_steps": 10,
     "save_model": False,
     "save_model_every_steps": 1000}
 
@@ -1233,7 +1245,7 @@ test_config = {"batch_size": 1,
     "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_weighted_loss/synthetic_d3pm_weighted_loss.pth'
   }
 
-wandb_config = {"exp_name": "synthetic_d3pm_f1",
+wandb_config = {"exp_name": "synthetic_d3pm_test",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
     "job_type": "test",
