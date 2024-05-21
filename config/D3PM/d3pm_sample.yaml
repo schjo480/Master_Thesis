@@ -64,7 +64,8 @@ fixed:
   testing:
     batch_size: 1
     model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_new_data_2_long/synthetic_d3pm_new_data_2_long_hidden_dim_128_lr_0_001_ce_weight_0.05.pth'
-  
+    number_samples: 10
+
   wandb:
     exp_name: "synthetic_d3pm_new_data_2"
     project: "trajectory_prediction_using_denoising_diffusion_models"
