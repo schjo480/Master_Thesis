@@ -92,7 +92,12 @@ class Graph_Diffusion_Model(nn.Module):
         
         dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges)
         def model_fn(x, edge_index, t, edge_attr, condition=None): #takes in noised future trajectory (and diffusion timestep)
-            return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+            if self.model_config['name'] == 'edge_encoder':
+                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+            elif self.model_config['name'] == 'edge_encoder_residual':
+                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+            elif self.model_config['name'] == 'edge_encoder_mlp':
+                return self.model.forward(t=t, edge_attr=edge_attr, condition=condition, mode='future')
         
         for epoch in tqdm(range(self.num_epochs)):
             # Update learning rate via scheduler and log it
@@ -128,19 +133,36 @@ class Graph_Diffusion_Model(nn.Module):
                 for data in self.train_data_loader:
                     history_edge_features = data["history_edge_features"]
                     future_edge_indices_one_hot = data['future_one_hot_edges']
+                    # Check if any entry in future_edge_indices_one_hot is not 0 or 1
+                    if not torch.all((future_edge_indices_one_hot == 0) | (future_edge_indices_one_hot == 1)):
+                        continue
+                    batch_size = future_edge_indices_one_hot.size(0)
+                    if self.model_config['name'] == 'edge_encoder_mlp':
+                        if batch_size == self.batch_size:
+                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(self.batch_size, self.num_edges, 1)
+                        else:
+                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(batch_size, self.num_edges, 1)
                     # future_trajectory_indices = data["future_indices"]
                     node_features = self.node_features
                     edge_index = self.edge_tensor
                     
                     self.optimizer.zero_grad()
-                    c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+                    if self.model_config['name'] == 'edge_encoder':
+                        c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+                    elif self.model_config['name'] == 'edge_encoder_residual':
+                        c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+                    elif self.model_config['name'] == 'edge_encoder_mlp':
+                        c = self.model.forward(edge_attr=history_edge_features, mode='history')
+                    
                     x_start = future_edge_indices_one_hot
                     loss, preds = dif.training_losses(model_fn, node_features, edge_index, data, c, x_start=x_start)
-                    f1_score = F1Score(average='micro', num_classes=self.num_classes)
+                    x_start = x_start.squeeze(-1)   # (bs, num_edges, 1) -> (bs, num_edges)
+                    f1_score = F1Score(task='binary', average='micro', num_classes=self.num_classes)
                     total_f1 += f1_score(preds, x_start)
                     total_loss += loss
                     loss.backward()
                     self.optimizer.step()
+                    
             avg_loss = total_loss / len(self.train_data_loader)
             avg_f1 = total_f1 / len(self.train_data_loader)
             if epoch % self.log_loss_every_steps == 0:
@@ -149,6 +171,7 @@ class Graph_Diffusion_Model(nn.Module):
                 self.log.info(f"Epoch {epoch} Average Loss: {avg_loss.item()}")
                 print("Epoch:", epoch)
                 print("Loss:", avg_loss)
+                print("F1:", avg_f1)
                         
             if self.train_config['save_model'] and epoch % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
@@ -160,7 +183,12 @@ class Graph_Diffusion_Model(nn.Module):
             self.load_model(model_path)
         
         def model_fn(x, edge_index, t, edge_attr, condition=None):
-            return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+            if self.model_config['name'] == 'edge_encoder':
+                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+            elif self.model_config['name'] == 'edge_encoder_residual':
+                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+            elif self.model_config['name'] == 'edge_encoder_mlp':
+                return self.model.forward(t=t, edge_attr=edge_attr, condition=condition, mode='future')
         
         sample_list = []
         ground_truth_hist = []
@@ -175,7 +203,12 @@ class Graph_Diffusion_Model(nn.Module):
             node_features = self.node_features
             edge_index = self.edge_tensor
             # Get condition
-            c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+            if self.model_config['name'] == 'edge_encoder':
+                c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+            elif self.model_config['name'] == 'edge_encoder_residual':
+                c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+            elif self.model_config['name'] == 'edge_encoder_mlp':
+                c = self.model.forward(edge_attr=history_edge_features, mode='history')
             
             samples = make_diffusion(self.diffusion_config, self.model_config, 
                                     num_edges=self.num_edges).p_sample_loop(model_fn=model_fn,
@@ -511,10 +544,15 @@ class Edge_Encoder(nn.Module):
         # GNN layers
         self.hidden_channels = hidden_channels
         self.num_heads = self.config['num_heads']
+        self.num_layers = self.config['num_layers']
         self.conv1 = GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
         self.conv2 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
         self.conv3 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        
+        '''self.convs = nn.ModuleList()
+        self.convs.append(GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
+        for _ in range(1, self.num_layers):
+            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
+        '''
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels*self.num_heads, self.condition_dim)  # To encode history to c
@@ -534,6 +572,8 @@ class Edge_Encoder(nn.Module):
         x = F.relu(self.conv1(x, edge_index, edge_attr.squeeze(0)))
         x = F.relu(self.conv2(x, edge_index, edge_attr.squeeze(0)))
         x = F.relu(self.conv3(x, edge_index, edge_attr.squeeze(0)))
+        '''for conv in self.convs:
+            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))'''
         x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
         # x = torch.cat((x, edge_emb), dim=1)
         
@@ -549,7 +589,8 @@ class Edge_Encoder(nn.Module):
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
             t_emb = F.silu(t_emb)
-            t_emb = t_emb.unsqueeze(1).repeat(1, self.num_nodes, 1)
+            t_emb = t_emb.unsqueeze(1).repeat(1, self.num_nodes, 1) # (bs, time_embedding_dim) -> (bs, num_nodes, time_embedding_dim)
+            
             #Concatenation
             x = torch.cat((x, t_emb), dim=2) # Concatenate with time embedding
             x = torch.cat((x, condition), dim=2) # Concatenate with condition c
@@ -570,6 +611,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 def make_diffusion(diffusion_config, model_config, num_edges):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
@@ -581,7 +627,8 @@ def make_diffusion(diffusion_config, model_config, num_edges):
         loss_type=model_config['loss_type'],
         hybrid_coeff=model_config['hybrid_coeff'],
         num_edges=num_edges,
-        class_weights=model_config['class_weights']
+        class_weights=model_config['class_weights'],
+        model_name=model_config['name']
 )
 
 
@@ -622,7 +669,7 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, class_weights, torch_dtype=torch.float32):
+               num_edges, class_weights, torch_dtype=torch.float32, model_name=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
@@ -630,6 +677,7 @@ class CategoricalDiffusion:
         self.hybrid_coeff = hybrid_coeff
         self.class_weights = torch.tensor(class_weights)
         self.torch_dtype = torch_dtype
+        self.model_name = model_name
 
         # Data \in {0, ..., num_edges-1}
         self.num_classes = 2 # 0 or 1
@@ -961,7 +1009,7 @@ class CategoricalDiffusion:
 
     def q_posterior_logits(self, x_start, x_t, t, x_start_logits):
         """Compute logits of q(x_{t-1} | x_t, x_start) in PyTorch."""
-        
+
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.num_classes,), (x_start.shape, x_t.shape)
         else:
@@ -1024,6 +1072,7 @@ class CategoricalDiffusion:
 
     def p_sample(self, model_fn, x, t, noise, node_features=None, edge_index=None, edge_attr=None, condition=None):
         """Sample one timestep from the model p(x_{t-1} | x_t)."""
+        # Get model logits
         model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
         assert noise.shape == model_logits.shape, noise.shape
 
@@ -1082,22 +1131,43 @@ class CategoricalDiffusion:
         """
         true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
         model_logits, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
-        
-        def categorical_kl_logits(input_logits, target_logits, eps=1.e-6):
-            log_probs1 = F.log_softmax(input_logits + eps, dim=-1)
-            log_probs2 = F.log_softmax(target_logits + eps, dim=-1)
-            kl = F.kl_div(log_probs1, log_probs2, log_target=True)
-            return kl
+
         kl = categorical_kl_logits(input_logits=model_logits, target_logits=true_logits)
+        assert kl.shape == x_start.shape
         kl = kl / torch.log(torch.tensor(2.0))
 
-        decoder_nll = self.cross_entropy_x_start(x_start, model_logits, self.class_weights)
+        decoder_nll = F.cross_entropy(model_logits, x_start, weight=self.class_weights, reduction='mean')
+        # decoder_nll = -categorical_log_likelihood(x_start, model_logits)
+        #assert decoder_nll.shape == x_start.shape
 
         # At the first timestep return the decoder NLL,
         # otherwise return KL(q(x_{t-1}|x_t,x_start) || p(x_{t-1}|x_t))
-        # assert kl.shape == decoder_nll.shape == t.shape == (x_start.shape[0],)
+        assert kl.shape == decoder_nll.shape == t.shape == (x_start.shape[0],)
         result = torch.where(t == 0, decoder_nll, kl)
         return result, pred_x_start_logits
+
+    def prior_bpd(self, x_start):
+        """KL(q(x_{T-1}|x_start)|| U(x_{T-1}|0, num_edges-1))."""
+        q_probs = self.q_probs(
+            x_start=x_start,
+            t=torch.full((x_start.shape[0],), self.num_timesteps - 1, dtype=torch.long))
+
+        if self.transition_mat_type in ['gaussian', 'uniform']:
+            # Stationary distribution is a uniform distribution over all pixel values.
+            prior_probs = torch.ones_like(q_probs) / self.num_classes
+        elif self.transition_mat_type == 'absorbing':
+            absorbing_int = torch.full(x_start.shape[:-1], self.num_classes // 2, dtype=torch.int32)
+            prior_probs = F.one_hot(absorbing_int, num_classes=self.num_classes).to(dtype=self.torch_dtype)
+        else:
+            raise ValueError("Invalid transition_mat_type")
+
+
+        assert prior_probs.shape == q_probs.shape
+
+        kl_prior = categorical_kl_probs(
+            q_probs, prior_probs)
+        assert kl_prior.shape == x_start.shape
+        return meanflat(kl_prior) / torch.log(torch.tensor(2.0))
         
     def cross_entropy_x_start(self, x_start, pred_x_start_logits, class_weights):
         """Calculate binary weighted cross entropy between x_start and predicted x_start logits.
@@ -1122,7 +1192,8 @@ class CategoricalDiffusion:
     def training_losses(self, model_fn, node_features=None, edge_index=None, data=None, condition=None, *, x_start):
         """Training loss calculation."""
         # Add noise to data
-        x_start = x_start.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
+        if self.model_name != 'edge_encoder_mlp':
+            x_start = x_start.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],))
 
@@ -1139,9 +1210,9 @@ class CategoricalDiffusion:
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
             # NOTE: Currently only works for batch size of 1
             pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            pred = pred_x_start_logits.argmax(dim=1)                # (num_edges, classes) -> (num_edges,)
             
-            return losses, pred        
+            return losses, pred
             
         elif self.loss_type == 'cross_entropy_x_start':
             _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
@@ -1149,9 +1220,12 @@ class CategoricalDiffusion:
             losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-            # NOTE: Currently only works for batch size of 1
-            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            if (self.model_name == 'edge_encoder') | (self.model_name == 'edge_encoder_residual'):
+                # NOTE: Currently only works for batch size of 1
+                pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
+                pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            elif self.model_name == 'edge_encoder_mlp':
+                pred = pred_x_start_logits.argmax(dim=2)
             
             return losses, pred
             
@@ -1161,16 +1235,308 @@ class CategoricalDiffusion:
             ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             losses = vb_losses + self.hybrid_coeff * ce_losses
             
+            pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
+            # NOTE: Currently only works for batch size of 1
+            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
+            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            
+            return losses, pred
+            
         else:
             raise NotImplementedError(self.loss_type)
 
         return losses
 
+    def calc_bpd_loop(self, model_fn, *, x_start, rng):
+        """Calculate variational bound (loop over all timesteps and sum)."""
+        batch_size = x_start.shape[0]
+        total_vb = torch.zeros(batch_size)
+
+        for t in range(self.num_timesteps):
+            noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
+            x_t = self.q_sample(x_start=x_start, t=torch.full((batch_size,), t), noise=noise)
+            vb, _ = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=torch.full((batch_size,), t))
+            total_vb += vb
+
+        prior_b = self.prior_bpd(x_start=x_start)
+        total_b = total_vb + prior_b
+
+        return {
+            'total': total_b,
+            'vbterms': total_vb,
+            'prior': prior_b
+        }
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
+    """
+    Build sinusoidal embeddings (from Fairseq).
+
+    This matches the implementation in tensor2tensor, but differs slightly
+    from the description in Section 3.5 of "Attention Is All You Need".
+
+    Args:
+        timesteps: torch.Tensor: generate embedding vectors at these timesteps
+        embedding_dim: int: dimension of the embeddings to generate
+        max_time: float: largest time input
+
+    Returns:
+        embedding vectors with shape `(len(timesteps), embedding_dim)`
+    """
+    assert timesteps.dim() == 1  # Ensure timesteps is a 1D tensor
+
+    # Scale timesteps by the maximum time
+    timesteps = timesteps.float() * (1000. / max_time)
+
+    half_dim = embedding_dim // 2
+    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = timesteps[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+
+    if embedding_dim % 2 == 1:  # Add zero-padding if embedding dimension is odd
+        zero_pad = torch.zeros((timesteps.shape[0], 1), dtype=torch.float32)
+        emb = torch.cat([emb, zero_pad], dim=1)
+
+    assert emb.shape == (timesteps.shape[0], embedding_dim)
+    return emb
+
+class Edge_Encoder_MLP(nn.Module):
+    def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
+        super(Edge_Encoder_MLP, self).__init__()
+        # Config
+        self.config = model_config
         
+        # Data
+        self.nodes = nodes
+        self.num_nodes = len(nodes)
+        self.edges = edges
+        self.node_features = node_features
+        self.num_node_features = self.node_features.shape[1]
+        self.num_edges = num_edges
+        self.num_edge_features = num_edge_features
+        self.history_len = history_len
+        self.future_len = future_len
+        
+        
+        self.num_classes = num_classes
+        self.model_output = self.config['model_output']
+        
+        # Time embedding
+        self.max_time = 1000.
+        self.time_embedding_dim = self.config['time_embedding_dim']
+        self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
+        self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
+    
+        # Model
+        # GNN layers
+        self.hidden_channels = hidden_channels
+        self.num_layers = self.config['num_layers']
+        self.lin_layers = nn.ModuleList()
+        self.lin_layers.append(nn.Linear(self.num_edges, self.hidden_channels))
+        for _ in range(1, self.num_layers):
+            self.lin_layers.append(nn.Linear(self.hidden_channels, self.hidden_channels))
+        
+        # Output layers for each task
+        self.condition_dim = self.config['condition_dim']
+        self.history_encoder = nn.Linear(self.hidden_channels, self.condition_dim)  # To encode history to c
+        self.future_decoder = nn.Linear(self.hidden_channels + self.condition_dim + self.time_embedding_dim,
+                                        self.num_edges)  # To predict future edges
+        self.adjust_to_class_shape = nn.Conv1d(in_channels=1, out_channels=self.num_classes, kernel_size=3, padding=1)
+
+    def forward(self, t=None, edge_attr=None, condition=None, mode=None):
+        """
+        Forward pass through the model
+        Args:
+            x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices
+            t: torch.Tensor: timestep tensor
+        """    
+        
+        # GNN forward pass
+        
+        # Edge Embedding
+        edge_attr = edge_attr.float()
+        
+        if edge_attr.dim() > 2:
+            edge_attr = edge_attr.squeeze(2)
+            edge_attr = edge_attr.squeeze(2)
+        
+        x = edge_attr   # (bs, hidden_dim)
+        for layer in self.lin_layers:
+            x = F.relu(layer(x))
+            
+        if mode == 'history':
+            c = self.history_encoder(x) # (bs, condition_dim)
+            return c
+        
+        elif mode == 'future':
+            # Time embedding
+            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time)
+            t_emb = self.time_linear0(t_emb)
+            # TODO: Delete first silu function!
+            t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
+            t_emb = self.time_linear1(t_emb)
+            t_emb = F.silu(t_emb)   # (bs, time_embedding_dim)
+            
+            #Concatenation
+            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding
+            x = torch.cat((x, condition), dim=1) # Concatenate with condition c
+            # x.shape = (bs, hidden_dim + time_embedding_dim + condition_dim)
+                        
+            logits = F.relu(self.future_decoder(x)) # (bs, num_edges)
+            logits = logits.unsqueeze(1) # (bs, 1, num_edges)
+            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
+            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
+            # Unsqueeze to get the final shape 
+            logits = logits.unsqueeze(2)    # (bs, num_edges, 1, num_classes=2)
+
+            return logits
+        
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn.conv import GATv2Conv
+
+
+def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
+    """
+    Build sinusoidal embeddings (from Fairseq).
+
+    This matches the implementation in tensor2tensor, but differs slightly
+    from the description in Section 3.5 of "Attention Is All You Need".
+
+    Args:
+        timesteps: torch.Tensor: generate embedding vectors at these timesteps
+        embedding_dim: int: dimension of the embeddings to generate
+        max_time: float: largest time input
+
+    Returns:
+        embedding vectors with shape `(len(timesteps), embedding_dim)`
+    """
+    assert timesteps.dim() == 1  # Ensure timesteps is a 1D tensor
+
+    # Scale timesteps by the maximum time
+    timesteps = timesteps.float() * (1000. / max_time)
+
+    half_dim = embedding_dim // 2
+    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = timesteps[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+
+    if embedding_dim % 2 == 1:  # Add zero-padding if embedding dimension is odd
+        zero_pad = torch.zeros((timesteps.shape[0], 1), dtype=torch.float32)
+        emb = torch.cat([emb, zero_pad], dim=1)
+
+    assert emb.shape == (timesteps.shape[0], embedding_dim)
+    return emb
+
+class Edge_Encoder_Residual(nn.Module):
+    def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
+        super(Edge_Encoder_Residual, self).__init__()
+        # Config
+        self.config = model_config
+        
+        # Data
+        self.nodes = nodes
+        self.num_nodes = len(nodes)
+        self.edges = edges
+        self.node_features = node_features
+        self.num_node_features = self.node_features.shape[1]
+        self.num_edges = num_edges
+        self.num_edge_features = num_edge_features
+        self.history_len = history_len
+        self.future_len = future_len
+        
+        
+        self.num_classes = num_classes
+        self.model_output = self.config['model_output']
+        
+        # Time embedding
+        self.max_time = 1000.
+        self.time_embedding_dim = self.config['time_embedding_dim']
+        self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
+        self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
+    
+        # Model
+        # GNN layers
+        self.hidden_channels = hidden_channels
+        self.num_heads = self.config['num_heads']
+        self.num_layers = self.config['num_layers']
+        '''self.conv1 = GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
+        self.conv2 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
+        self.conv3 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)'''
+        self.convs = nn.ModuleList()
+        self.convs.append(GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
+        for _ in range(1, self.num_layers):
+            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
+        
+        self.res_layer = nn.Linear(self.num_edges, self.hidden_channels)
+
+        # Output layers for each task
+        self.condition_dim = self.config['condition_dim']
+        self.history_encoder = nn.Linear(self.hidden_channels*self.num_heads, self.condition_dim)  # To encode history to c
+        self.future_decoder = nn.Linear(self.hidden_channels, self.num_edges)  # To predict future edges
+        self.adjust_to_class_shape = nn.Conv1d(in_channels=self.num_nodes, out_channels=self.num_classes, kernel_size=1)
+
+    def forward(self, x, edge_index, t=None, edge_attr=None, condition=None, mode=None):
+        """
+        Forward pass through the model
+        Args:
+            x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices
+            t: torch.Tensor: timestep tensor
+        """    
+        
+        # GNN forward pass
+        
+        # Edge Embedding
+        edge_attr_res_layer = edge_attr.float()
+        if edge_attr_res_layer.dim() > 2:
+            edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
+            edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
+                
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))
+        x = x + F.relu(self.res_layer(edge_attr_res_layer))
+        x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
+        if mode == 'history':
+            c = self.history_encoder(x)
+            
+            return c
+        
+        elif mode == 'future':
+            # Time embedding
+            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time)
+            t_emb = self.time_linear0(t_emb)
+            # TODO: Delete first silu function!
+            t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
+            t_emb = self.time_linear1(t_emb)
+            t_emb = F.silu(t_emb)
+            t_emb = t_emb.unsqueeze(1).repeat(1, self.num_nodes, 1)
+            
+            #Concatenation
+            x = torch.cat((x, t_emb), dim=2) # Concatenate with time embedding
+            x = torch.cat((x, condition), dim=2) # Concatenate with condition c
+            x = F.relu(nn.Linear(x.size(2), self.hidden_channels)(x))
+            
+            logits = self.future_decoder(x) # (bs, num_nodes, num_edges)
+            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
+            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
+            # Unsqueeze to get the final shape 
+            logits = logits.unsqueeze(2)    # (batch_size, num_edges, 1, num_classes=2)
+
+            return logits
+
 encoder_model = Edge_Encoder
+encoder_model = Edge_Encoder_MLP
+encoder_model = Edge_Encoder_Residual
 train_data_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5'
 test_data_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_test.h5'
-nodes = [(0, {'pos': (0.1, 0.65)}),
+nodes = [(0, {'pos': (0.1, 0.7)}),
          (1, {'pos': (0.05, 0.05)}), 
          (2, {'pos': (0.2, 0.15)}), 
          (3, {'pos': (0.55, 0.05)}),
@@ -1196,13 +1562,16 @@ nodes = [(0, {'pos': (0.1, 0.65)}),
          (23, {'pos': (0.45, 0.9)}),
          (24, {'pos': (0.95, 0.95)}),
          (25, {'pos': (0.9, 0.4)}),
-         (26, {'pos': (0.95, 0.05)})]
-edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26)]
+         (26, {'pos': (0.95, 0.05)}),
+         (27, {'pos': (0.75, 1.0)}),]
+
+edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26), (23, 27), (24, 27)]
+
 
     
 data_config = {"dataset": "synthetic_graph",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_test.h5',
-    "test_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_test.h5',
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5',
+    "test_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5',
     "history_len": 5,
     "future_len": 2,
     "num_classes": 2,
@@ -1213,30 +1582,31 @@ diffusion_config = {"type": 'linear', # Options: 'linear', 'cosine', 'jsd'
     "stop": 0.02,  # 0.02 gauss, 1. uniform
     "num_timesteps": 1000}
 
-model_config = {"name": "edge_encoder",
+model_config = {"name": "edge_encoder_residual",
     "hidden_channels": 32,
     "time_embedding_dim": 32,
     "condition_dim": 32,
     "out_ch": 1,
     "num_heads": 1,
+    "num_layers": 3,
     "dropout": 0.1,
     "model_output": "logits",
     "model_prediction": "x_start",  # Options: 'x_start','xprev'
     "transition_mat_type": 'gaussian',  # Options: 'gaussian','uniform','absorbing'
     "transition_bands": 0,
-    "loss_type": "kl",  # Options: kl, cross_entropy_x_start, hybrid
+    "loss_type": "cross_entropy_x_start",  # Options: kl, cross_entropy_x_start, hybrid
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     "class_weights": [0.05, 0.95] # = future_len/num_edges and (num_edges - future_len)/num_edges
     }
 
-train_config = {"batch_size": 1,
+train_config = {"batch_size": 8,
     "optimizer": "adam",
-    "lr": 0.00005,
+    "lr": 0.01,
     "gradient_accumulation": True,
-    "gradient_accumulation_steps": 16,
-    "num_epochs": 200,
-    "learning_rate_warmup_steps": 8000, # previously 10000
-    "lr_decay": 0.9999, # previously 0.9999
+    "gradient_accumulation_steps": 8,
+    "num_epochs": 20,
+    "learning_rate_warmup_steps": 500, # previously 10000
+    "lr_decay": 0.999, # previously 0.9999
     "log_loss_every_steps": 10,
     "save_model": False,
     "save_model_every_steps": 1000}
@@ -1249,13 +1619,15 @@ wandb_config = {"exp_name": "synthetic_d3pm_test",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
     "job_type": "test",
-    "notes": "Deleted last relu layer and used torch cross entropy loss",
+    "notes": "MLP edge encoder",
     "tags": ["synthetic_graph", "edge_encoder"]} 
 
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model, nodes, edges)
 model.train()
 sample_list, ground_truth_hist, ground_truth_fut = model.get_samples()
 print(sample_list)
+print("\n")
 print(ground_truth_hist)
+print("\n")
 print(ground_truth_fut)
 

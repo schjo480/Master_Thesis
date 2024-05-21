@@ -12,13 +12,13 @@ slurm:
     gres: gpu:1       # num GPUs
     mem: 16G          # memory
     cpus-per-task: 1  # num cores
-    time: 0-23:00     # max time, D-HH:MM
+    time: 0-01:00     # max time, D-HH:MM
 
 fixed:
   data:
     dataset: synthetic_graph
-    train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5'
-    test_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5'
+    train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5'
+    test_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5'
     history_len: 5
     future_len: 2
     num_classes: 2
@@ -34,18 +34,18 @@ fixed:
   model:
     name: edge_encoder
     hidden_channels: 128
-    time_embedding_dim: 128
-    condition_dim: 128
+    time_embedding_dim: 32
+    condition_dim: 32
     out_ch: 1
     num_heads: 3  # 1
-    num_layers: 2
+    num_layers: 3
     dropout: 0.1
     model_output: logits
     model_prediction: x_start  # Options: 'x_start','xprev'
     transition_mat_type: 'gaussian'  # Options: 'gaussian','uniform','absorbing'
     transition_bands: null
     loss_type: cross_entropy_x_start  # Options: kl, cross_entropy_x_start, hybrid
-    hybrid_coeff: 0.001  # Only used for hybrid loss type.
+    hybrid_coeff: 0.01  # Only used for hybrid loss type.
     class_weights: [0.05, 0.95] # = future_len/num_edges and (num_edges - future_len)/num_edges
   
   training:
@@ -53,7 +53,7 @@ fixed:
     optimizer: adam
     lr: 0.001  # 0.00001
     gradient_accumulation: True
-    gradient_accumulation_steps: 16
+    gradient_accumulation_steps: 4
     num_epochs: 50000
     learning_rate_warmup_steps: 5000 # previously 10000
     lr_decay: 0.9999 # previously 0.9999
@@ -63,10 +63,10 @@ fixed:
 
   testing:
     batch_size: 1
-    model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_without_last_two_relu_multi_head/synthetic_d3pm_without_last_two_relu_multi_head.pth'
+    model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_new_data_2_long/synthetic_d3pm_new_data_2_long_hidden_dim_128_lr_0_001_ce_weight_0.05.pth'
   
   wandb:
-    exp_name: "synthetic_d3pm_without_last_two_relu_multi_head_sample"
+    exp_name: "synthetic_d3pm_new_data_2"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "eval"

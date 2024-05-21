@@ -37,9 +37,9 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
     assert emb.shape == (timesteps.shape[0], embedding_dim)
     return emb
 
-class Edge_Encoder(nn.Module):
+class Edge_Encoder_Residual(nn.Module):
     def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
-        super(Edge_Encoder, self).__init__()
+        super(Edge_Encoder_Residual, self).__init__()
         # Config
         self.config = model_config
         
@@ -69,15 +69,17 @@ class Edge_Encoder(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_heads = self.config['num_heads']
         self.num_layers = self.config['num_layers']
-        self.conv1 = GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv2 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv3 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        '''self.convs = nn.ModuleList()
+        self.hidden_channels = hidden_channels
+        self.num_heads = self.config['num_heads']
+        self.num_layers = self.config['num_layers']
+        
+        self.convs = nn.ModuleList()
         self.convs.append(GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
         for _ in range(1, self.num_layers):
             self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
-        '''
         
+        self.res_layer = nn.Linear(self.num_edges, self.hidden_channels)
+
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels*self.num_heads, self.condition_dim)  # To encode history to c
@@ -95,13 +97,15 @@ class Edge_Encoder(nn.Module):
         # GNN forward pass
         
         # Edge Embedding
-        x = F.relu(self.conv1(x, edge_index, edge_attr.squeeze(0)))
-        x = F.relu(self.conv2(x, edge_index, edge_attr.squeeze(0)))
-        x = F.relu(self.conv3(x, edge_index, edge_attr.squeeze(0)))
-        '''for conv in self.convs:
-            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))'''
-        x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
-        
+        edge_attr_res_layer = edge_attr.float()
+        if edge_attr_res_layer.dim() > 2:
+            edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
+            edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
+                
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))
+        x = x + F.relu(self.res_layer(edge_attr_res_layer))
+        x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, hidden_dim]
         if mode == 'history':
             c = self.history_encoder(x)
             

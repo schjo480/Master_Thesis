@@ -153,7 +153,7 @@ def collate_fn(batch):
             "future_edge_features": future_edge_features
         }
     
-nodes = [(0, {'pos': (0.1, 0.65)}),
+"""nodes = [(0, {'pos': (0.1, 0.65)}),
          (1, {'pos': (0.05, 0.05)}), 
          (2, {'pos': (0.2, 0.15)}), 
          (3, {'pos': (0.55, 0.05)}),
@@ -180,3 +180,13 @@ nodes = [(0, {'pos': (0.1, 0.65)}),
          (24, {'pos': (0.95, 0.95)}),
          (25, {'pos': (0.9, 0.4)}),
          (26, {'pos': (0.95, 0.05)})]
+
+edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26)]
+
+file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5'
+history_len = 5
+future_len = 2
+edge_features = ['edge_one_hot', 'edge_orientations']
+dataset = TrajectoryDataset(file_path, history_len, nodes, edges, future_len, edge_features=edge_features)
+
+print(dataset[2])"""

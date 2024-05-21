@@ -1,6 +1,8 @@
 from seml.experiment import Experiment
 from models.d3pm_graph_diffusion_model import Graph_Diffusion_Model
 from models.d3pm_edge_encoder import Edge_Encoder
+from models.d3pm_edge_encoder_mlp import Edge_Encoder_MLP
+from models.d3pm_edge_encoder_residual import Edge_Encoder_Residual
 
 
 experiment = Experiment()
@@ -21,7 +23,15 @@ def main(
 @experiment.automain
 def main(data, wandb, diffusion_config, model, training, testing, eval):
     
-    edge_encoder = Edge_Encoder
+    if model['name'] == 'edge_encoder':
+        edge_encoder = Edge_Encoder
+    elif model['name'] == 'edge_encoder_residual':
+        edge_encoder = Edge_Encoder_Residual
+    elif model['name'] == 'edge_encoder_mlp':
+        edge_encoder = Edge_Encoder_MLP
+    else:
+        raise NotImplementedError(f"Model {model['name']} not implemented")
+    
     nodes = [(0, {'pos': (0.1, 0.65)}),
          (1, {'pos': (0.05, 0.05)}), 
          (2, {'pos': (0.2, 0.15)}), 
@@ -48,10 +58,12 @@ def main(data, wandb, diffusion_config, model, training, testing, eval):
          (23, {'pos': (0.45, 0.9)}),
          (24, {'pos': (0.95, 0.95)}),
          (25, {'pos': (0.9, 0.4)}),
-         (26, {'pos': (0.95, 0.05)})]
-    edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26)]
+         (26, {'pos': (0.95, 0.05)}),
+         (27, {'pos': (0.75, 1.0)})]
+    edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26), (23, 27), (24, 27)]
 
     model = Graph_Diffusion_Model(data_config=data, wandb_config=wandb, diffusion_config=diffusion_config, model_config=model, train_config=training, test_config=testing, model=edge_encoder, nodes=nodes, edges=edges)
+    
     if eval:
         sample_list, ground_truth_hist, ground_truth_fut = model.get_samples(load_model=True, model_path=testing['model_path'])
         return {

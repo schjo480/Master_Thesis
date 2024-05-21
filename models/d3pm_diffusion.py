@@ -32,7 +32,8 @@ def make_diffusion(diffusion_config, model_config, num_edges):
         loss_type=model_config['loss_type'],
         hybrid_coeff=model_config['hybrid_coeff'],
         num_edges=num_edges,
-        class_weights=model_config['class_weights']
+        class_weights=model_config['class_weights'],
+        model_name=model_config['name']
 )
 
 
@@ -73,7 +74,7 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, class_weights, torch_dtype=torch.float32):
+               num_edges, class_weights, torch_dtype=torch.float32, model_name=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
@@ -81,6 +82,7 @@ class CategoricalDiffusion:
         self.hybrid_coeff = hybrid_coeff
         self.class_weights = torch.tensor(class_weights)
         self.torch_dtype = torch_dtype
+        self.model_name = model_name
 
         # Data \in {0, ..., num_edges-1}
         self.num_classes = 2 # 0 or 1
@@ -475,6 +477,7 @@ class CategoricalDiffusion:
 
     def p_sample(self, model_fn, x, t, noise, node_features=None, edge_index=None, edge_attr=None, condition=None):
         """Sample one timestep from the model p(x_{t-1} | x_t)."""
+        # Get model logits
         model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
         assert noise.shape == model_logits.shape, noise.shape
 
@@ -594,7 +597,8 @@ class CategoricalDiffusion:
     def training_losses(self, model_fn, node_features=None, edge_index=None, data=None, condition=None, *, x_start):
         """Training loss calculation."""
         # Add noise to data
-        x_start = x_start.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
+        if self.model_name != 'edge_encoder_mlp':
+            x_start = x_start.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],))
 
@@ -611,7 +615,7 @@ class CategoricalDiffusion:
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
             # NOTE: Currently only works for batch size of 1
             pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            pred = pred_x_start_logits.argmax(dim=1)                # (num_edges, classes) -> (num_edges,)
             
             return losses, pred
             
@@ -621,9 +625,12 @@ class CategoricalDiffusion:
             losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-            # NOTE: Currently only works for batch size of 1
-            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            if (self.model_name == 'edge_encoder') | (self.model_name == 'edge_encoder_residual'):
+                # NOTE: Currently only works for batch size of 1
+                pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
+                pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            elif self.model_name == 'edge_encoder_mlp':
+                pred = pred_x_start_logits.argmax(dim=2)
             
             return losses, pred
             
@@ -632,6 +639,13 @@ class CategoricalDiffusion:
                                                                node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
             ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             losses = vb_losses + self.hybrid_coeff * ce_losses
+            
+            pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
+            # NOTE: Currently only works for batch size of 1
+            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
+            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+            
+            return losses, pred
             
         else:
             raise NotImplementedError(self.loss_type)
