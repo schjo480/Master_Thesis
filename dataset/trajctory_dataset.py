@@ -4,6 +4,7 @@ import h5py
 import networkx as nx
 import numpy as np
 
+
 class TrajectoryDataset(Dataset):
     def __init__(self, file_path, history_len, nodes, edges, future_len, edge_features=None):
         self.file_path = file_path
