@@ -3,7 +3,6 @@ from torch.utils.data import DataLoader, Dataset
 import h5py
 import networkx as nx
 import numpy as np
-# from torch_geometric.data import Data, Batch
 
 class TrajectoryDataset(Dataset):
     def __init__(self, file_path, history_len, nodes, edges, future_len, edge_features=None):
@@ -25,11 +24,17 @@ class TrajectoryDataset(Dataset):
         trajectory = self.trajectories[trajectory_name]
         edge_idxs = torch.tensor(trajectory['edge_idxs'][:], dtype=torch.long)
         edge_orientations = torch.tensor(trajectory['edge_orientations'][:], dtype=torch.long)
-        edge_coordinates = torch.tensor(trajectory.get('edge_coordinates', []), dtype=torch.float)
+        
+        edge_coordinates_data = trajectory.get('edge_coordinates', [])
+        if len(edge_coordinates_data) > 0:
+            edge_coordinates_np = np.array(edge_coordinates_data)
+            edge_coordinates = torch.tensor(edge_coordinates_np, dtype=torch.float)
+        else:
+            edge_coordinates = torch.tensor([], dtype=torch.float)
 
         # Reverse coordinates if orientation is -1
         edge_coordinates[edge_orientations == -1] = edge_coordinates[edge_orientations == -1][:, [1, 0]]
-
+        
         # Calculate the required padding length
         total_len = self.history_len + self.future_len
         padding_length = max(total_len - len(edge_idxs), 0)
@@ -76,6 +81,13 @@ class TrajectoryDataset(Dataset):
             history_edge_features = history_one_hot_edges
             future_edge_features = future_one_hot_edges
         
+        # Generate the tensor indicating nodes in history
+        node_in_history = torch.zeros((len(self.nodes), 1), dtype=torch.float)
+        history_edges = [self.edges[i] for i in history_indices if i >= 0]
+        history_nodes = set(node for edge in history_edges for node in edge)
+        for node in history_nodes:
+            node_in_history[node] = 1
+        
         return {
             "history_indices": history_indices,
             "future_indices": future_indices,
@@ -86,7 +98,8 @@ class TrajectoryDataset(Dataset):
             "history_edge_orientations": history_edge_orientations,
             "future_edge_orientations": future_edge_orientations,
             "history_edge_features": history_edge_features,
-            "future_edge_features": future_edge_features
+            "future_edge_features": future_edge_features,
+            "node_in_history": node_in_history
         }
         
     def __len__(self):
@@ -134,6 +147,8 @@ def collate_fn(batch):
     history_edge_features = torch.stack([item['history_edge_features'] for item in batch])
     future_edge_features = torch.stack([item['future_edge_features'] for item in batch])
     
+    history_one_hot_nodes = torch.stack([item['node_in_history'] for item in batch])
+    
     # Stack coordinates if not empty
     if history_coordinates:
         history_coordinates = torch.stack(history_coordinates)
@@ -150,7 +165,8 @@ def collate_fn(batch):
             "history_edge_orientations": history_edge_orientations,
             "future_edge_orientations": future_edge_orientations,
             "history_edge_features": history_edge_features,
-            "future_edge_features": future_edge_features
+            "future_edge_features": future_edge_features,
+            "history_one_hot_nodes": history_one_hot_nodes
         }
     
 """nodes = [(0, {'pos': (0.1, 0.65)}),

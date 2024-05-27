@@ -27,8 +27,8 @@ fixed:
 
   diffusion_config:
     type: 'linear' # Options: 'linear', 'cosine', 'jsd'
-    start: 0.0001  # 1e-4 gauss, 0.02 uniform
-    stop: 0.02  # 0.02 gauss, 1. uniform
+    start: 0.9  # 1e-4 gauss, 0.02 uniform
+    stop: 1.  # 0.02 gauss, 1. uniform
     num_timesteps: 1000
   
   model:

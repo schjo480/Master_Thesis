@@ -92,12 +92,12 @@ class CategoricalDiffusion:
         self.eps = 1.e-6
 
         if not isinstance(betas, torch.Tensor):
-            raise ValueError('expected betas to be a numpy array')
+            raise ValueError('expected betas to be a torch tensor')
         if not ((betas > 0).all() and (betas <= 1).all()):
             raise ValueError('betas must be in (0, 1]')
 
         # Computations here in float64 for accuracy
-        self.betas = betas = betas.to(dtype=torch.float64)
+        self.betas = betas.to(dtype=torch.float64)
         self.num_timesteps, = betas.shape
 
         # Construct transition matrices for q(x_t|x_{t-1})
@@ -351,7 +351,7 @@ class CategoricalDiffusion:
         x_start: torch.tensor: tensor of shape (bs, ...) of int32 or int64 type.
             Should not be of one hot representation, but have integer values
             representing the class values.
-        t: torch.tensor: jax array of shape (bs,).
+        t: torch.tensor: torch tensor of shape (bs,).
 
         Returns:
         probs: torch.tensor: shape (bs, x_start.shape[1:],
@@ -415,6 +415,8 @@ class CategoricalDiffusion:
     def q_posterior_logits(self, x_start, x_t, t, x_start_logits):
         """Compute logits of q(x_{t-1} | x_t, x_start) in PyTorch."""
         
+        if (self.model_name == 'edge_encoder_mlp') & (x_t.dim() == 2):
+            x_t = x_t.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.num_classes,), (x_start.shape, x_t.shape)
         else:
@@ -469,7 +471,7 @@ class CategoricalDiffusion:
         elif self.model_prediction == 'xprev':
             pred_x_start_logits = model_logits
             raise NotImplementedError(self.model_prediction)
-
+        
         assert (model_logits.shape == pred_x_start_logits.shape == x.shape + (self.num_classes,))
         return model_logits, pred_x_start_logits
     
@@ -507,10 +509,13 @@ class CategoricalDiffusion:
             raise ValueError(f"Invalid transition_mat_type {self.transition_mat_type}")
 
         x = x_init.clone()
+        edge_attr = x_init.unsqueeze(-1).type(torch.float32)
+        
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
-            noise = torch.rand(x.shape + (self.num_classes,), device=device)
+            noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
             x, _ = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
+            edge_attr = x.unsqueeze(-1).type(torch.float32)
 
         if return_x_init:
             return x_init, x
@@ -589,7 +594,8 @@ class CategoricalDiffusion:
         # Calculate binary cross-entropy with logits
         pred_x_start_logits = pred_x_start_logits.squeeze(2) # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
         pred_x_start_logits = pred_x_start_logits.permute(0, 2, 1) # (bs, num_edges, classes) -> (bs, classes, num_edges)
-        x_start = x_start.squeeze(2) # (bs, num_edges, channels) -> (bs, num_edges)
+        if x_start.dim() == 3:
+            x_start = x_start.squeeze(2) # (bs, num_edges, channels) -> (bs, num_edges)
         ce = F.cross_entropy(pred_x_start_logits, x_start, weight=class_weights, reduction='mean')
 
         return ce
@@ -604,6 +610,9 @@ class CategoricalDiffusion:
 
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
+        
+        if (self.model_name == 'edge_encoder_mlp') & (x_t.dim() == 2):
+            x_t = x_t.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         
         edge_attr_t = x_t.unsqueeze(-1).type(torch.float32)
 
@@ -620,11 +629,12 @@ class CategoricalDiffusion:
             return losses, pred
             
         elif self.loss_type == 'cross_entropy_x_start':
-            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
             
+            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
             losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
+            
             if (self.model_name == 'edge_encoder') | (self.model_name == 'edge_encoder_residual'):
                 # NOTE: Currently only works for batch size of 1
                 pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)

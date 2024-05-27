@@ -27,8 +27,8 @@ fixed:
 
   diffusion_config:
     type: 'linear' # Options: 'linear', 'cosine', 'jsd'
-    start: 0.0001  # 1e-4 gauss, 0.02 uniform
-    stop: 0.02  # 0.02 gauss, 1. uniform
+    start: 0.9  # 1e-4 gauss, 0.02 uniform
+    stop: 1.  # 0.02 gauss, 1. uniform
     num_timesteps: 1000
   
   model:
@@ -46,8 +46,8 @@ fixed:
     batch_size: 1
     optimizer: adam
     gradient_accumulation: True
-    gradient_accumulation_steps: 8
-    num_epochs: 20000
+    gradient_accumulation_steps: 4
+    num_epochs: 100000
     learning_rate_warmup_steps: 5000 # previously 10000
     lr_decay: 0.9999 # previously 0.9999
     log_loss_every_steps: 20
@@ -60,7 +60,7 @@ fixed:
     number_samples: 10
     
   wandb:
-    exp_name: "synthetic_d3pm_residual"
+    exp_name: "synthetic_d3pm_residual_fixed"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
@@ -74,10 +74,12 @@ grid:
     type: choice
     options:
       - [0.05, 0.95]
+      - [0.1, 0.9]
+      - [0.3, 0.7]
+      - [0.5, 0.5]
   model.hidden_channels:
     type: choice
     options:
-      - 16
       - 32
       - 64
   model.time_embedding_dim: 
@@ -92,11 +94,9 @@ grid:
     type: choice
     options:
       - 2
-      - 3
   model.num_heads:
     type: choice
     options:
-      - 1
       - 2
   training.lr:
     type: choice

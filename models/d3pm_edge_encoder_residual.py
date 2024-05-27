@@ -78,7 +78,7 @@ class Edge_Encoder_Residual(nn.Module):
         for _ in range(1, self.num_layers):
             self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
         
-        self.res_layer = nn.Linear(self.num_edges, self.hidden_channels)
+        self.res_layer = nn.Linear(self.num_edges, self.hidden_channels * self.num_heads)
 
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']

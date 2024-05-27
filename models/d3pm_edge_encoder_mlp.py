@@ -93,7 +93,8 @@ class Edge_Encoder_MLP(nn.Module):
         edge_attr = edge_attr.float()
         if edge_attr.dim() > 2:
             edge_attr = edge_attr.squeeze(2)
-            edge_attr = edge_attr.squeeze(2)
+            if edge_attr.dim() > 2:
+                edge_attr = edge_attr.squeeze(2)
         
         x = edge_attr   # (bs, hidden_dim)
         for layer in self.lin_layers:
@@ -124,3 +125,4 @@ class Edge_Encoder_MLP(nn.Module):
             logits = logits.unsqueeze(2)    # (bs, num_edges, 1, num_classes=2)
 
             return logits
+        

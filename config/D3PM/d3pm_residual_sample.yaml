@@ -11,8 +11,8 @@ slurm:
     # partition: gpu_large
     gres: gpu:1       # num GPUs
     mem: 16G          # memory
-    cpus-per-task: 12  # num cores
-    time: 0-23:00     # max time, D-HH:MM
+    cpus-per-task: 1  # num cores
+    time: 0-01:00     # max time, D-HH:MM
 
 fixed:
   data:
@@ -32,22 +32,30 @@ fixed:
     num_timesteps: 1000
   
   model:
-    name: edge_encoder_mlp
+    name: edge_encoder_residual
+    hidden_channels: 64
+    time_embedding_dim: 16
+    condition_dim: 16
+    out_ch: 1
+    num_heads: 1  # 1
+    num_layers: 3
     dropout: 0.1
     model_output: logits
     model_prediction: x_start  # Options: 'x_start','xprev'
     transition_mat_type: 'gaussian'  # Options: 'gaussian','uniform','absorbing'
     transition_bands: null
     loss_type: cross_entropy_x_start  # Options: kl, cross_entropy_x_start, hybrid
-    hybrid_coeff: 0.001  # Only used for hybrid loss type.
+    hybrid_coeff: 0.01  # Only used for hybrid loss type.
+    class_weights: [0.05, 0.95] # = future_len/num_edges and (num_edges - future_len)/num_edges
   
   training:
-    batch_size: 4
+    batch_size: 1
     optimizer: adam
-    gradient_accumulation: False
+    lr: 0.01  # 0.00001
+    gradient_accumulation: True
     gradient_accumulation_steps: 8
+    num_epochs: 20000
     learning_rate_warmup_steps: 5000 # previously 10000
-    num_epochs: 100000
     lr_decay: 0.9999 # previously 0.9999
     log_loss_every_steps: 20
     save_model: True
@@ -55,47 +63,25 @@ fixed:
 
   testing:
     batch_size: 1
-    model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_without_last_two_relu_longer_training/synthetic_d3pm_without_last_two_relu_longer_training.pth'
-    number_samples: 10
-    
+    model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_residual/synthetic_d3pm_residual_hidden_dim_64_time_dim_16_condition_dim_16_layers_3.pth'
+
   wandb:
-    exp_name: "synthetic_d3pm_mlp_fixed"
+    exp_name: "synthetic_d3pm_residual"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
-    job_type: "train"
+    job_type: "eval"
     notes: ""
     tags: ["synthetic_graph", "edge_encoder"]
 
-  eval: False
+  eval: True
 
 grid:
-  model.class_weights:
+  testing.number_samples:
     type: choice
     options:
-      - [0.05, 0.95]
-      - [0.1, 0.9]
-      - [0.3, 0.7]
-      - [0.5, 0.5]
-  model.hidden_channels:
-    type: choice
-    options:
-      - 32
-  model.time_embedding_dim: 
-    type: choice
-    options:
-      - 16
-  model.condition_dim: 
-    type: choice
-    options:
-      - 16
-  model.num_layers: 
-    type: choice
-    options:
-      - 2
-  training.lr:
-    type: choice
-    options:
-      - 0.01
+      - 1
+      - 10
+      - 20
 
 random:
   samples: 1
