@@ -163,7 +163,7 @@ def split_cycle_in_paths(paths):
     return split_paths
 
 
-def load_new_format(new_file_path):
+'''def load_new_format(new_file_path):
     paths = []
 
     with h5py.File(new_file_path, 'r') as new_hf:
@@ -178,7 +178,30 @@ def load_new_format(new_file_path):
                     path['edge_orientations'] = path.pop('edge_orientation')
                 paths.append(path)
 
-    return paths, nodes, edges
+    return paths, nodes, edges'''
+
+def load_new_format(new_file_path):
+    paths = []
+    from tqdm import tqdm
+
+    with h5py.File(new_file_path, 'r') as new_hf:
+        node_coordinates = new_hf['graph']['node_coordinates'][:]
+        edges = new_hf['graph']['edges'][:]
+        edge_coordinates = node_coordinates[edges]
+        nodes = [(i, {'pos': tuple(pos)}) for i, pos in enumerate(node_coordinates)]
+        
+        
+        # Convert edges to a list of tuples
+        edges = [tuple(edge) for edge in edges]
+
+        for i in tqdm(new_hf['trajectories'].keys()):
+            path_group = new_hf['trajectories'][i]
+            path = {attr: path_group[attr][()] for attr in path_group.keys()}
+            if 'edge_orientation' in path:
+                path['edge_orientations'] = path.pop('edge_orientation')
+            paths.append(path)
+
+    return paths, nodes, edges, edge_coordinates
 
 
 def plot_histograms_before_after_split(paths_before_split, paths_after_split):
@@ -299,3 +322,24 @@ def remove_bad_matches(paths, threshold_percentile: int = 95, mode: str = 'max')
                         bad_matches.append(path)
                 
     return new_paths, bad_matches
+
+def save_small_dataset(input_file_path, output_file_path, num_trajectories):
+    # Load the original dataset
+    paths, nodes, edges, edge_coordinates = load_new_format(input_file_path)
+
+    # Select the first num_trajectories
+    small_paths = paths[:num_trajectories]
+
+    with h5py.File(output_file_path, 'w') as f:
+        # Save graph structure
+        grp_graph = f.create_group('graph')
+        grp_graph.create_dataset('node_coordinates', data=[list(pos['pos']) for _, pos in nodes])
+        grp_graph.create_dataset('edges', data=np.array(edges))
+
+        # Save the selected trajectories
+        grp_trajectories = f.create_group('trajectories')
+        for i, path in enumerate(small_paths):
+            grp = grp_trajectories.create_group(f'trajectory_{i}')
+            for key, value in path.items():
+                grp.create_dataset(key, data=value)
+                

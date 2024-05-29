@@ -4,6 +4,28 @@ import h5py
 import networkx as nx
 import numpy as np
 
+def load_new_format(new_file_path):
+    paths = []
+    from tqdm import tqdm
+
+    with h5py.File(new_file_path, 'r') as new_hf:
+        node_coordinates = new_hf['graph']['node_coordinates'][:]
+        edges = new_hf['graph']['edges'][:]
+        edge_coordinates = node_coordinates[edges]
+        nodes = [(i, {'pos': tuple(pos)}) for i, pos in enumerate(node_coordinates)]
+        
+        
+        # Convert edges to a list of tuples
+        edges = [tuple(edge) for edge in edges]
+
+        for i in tqdm(new_hf['trajectories'].keys()):
+            path_group = new_hf['trajectories'][i]
+            path = {attr: path_group[attr][()] for attr in path_group.keys()}
+            if 'edge_orientation' in path:
+                path['edge_orientations'] = path.pop('edge_orientation')
+            paths.append(path)
+
+    return paths, nodes, edges, edge_coordinates
 
 class TrajectoryDataset(Dataset):
     def __init__(self, file_path, history_len, nodes, edges, future_len, edge_features=None):
@@ -11,27 +33,29 @@ class TrajectoryDataset(Dataset):
         self.history_len = history_len
         self.future_len = future_len
         self.edge_features = edge_features
-        self.trajectories = h5py.File(file_path, 'r')
-        self.keys = list(self.trajectories.keys())
+        # self.trajectories = h5py.File(file_path, 'r')
+        self.trajectories, self.nodes, self.edges, self.edge_coordinates = load_new_format(file_path)
         
-        self.nodes = nodes
-        self.edges = edges
+        '''self.nodes = nodes
+        self.edges = edges'''
         self.graph = nx.Graph()
         self.graph.add_nodes_from(self.nodes)
         self.graph.add_edges_from(self.edges)
 
     def __getitem__(self, idx):
-        trajectory_name = self.keys[idx]
-        trajectory = self.trajectories[trajectory_name]
+        # trajectory_name = self.keys[idx]
+        trajectory = self.trajectories[idx]
         edge_idxs = torch.tensor(trajectory['edge_idxs'][:], dtype=torch.long)
         edge_orientations = torch.tensor(trajectory['edge_orientations'][:], dtype=torch.long)
         
-        edge_coordinates_data = trajectory.get('edge_coordinates', [])
+        # edge_coordinates_data = trajectory.get('coordinates', [])
+        edge_coordinates_data = self.edge_coordinates[edge_idxs]
+
         if len(edge_coordinates_data) > 0:
             edge_coordinates_np = np.array(edge_coordinates_data)
-            edge_coordinates = torch.tensor(edge_coordinates_np, dtype=torch.float)
+            edge_coordinates = torch.tensor(edge_coordinates_np, dtype=torch.float64)
         else:
-            edge_coordinates = torch.tensor([], dtype=torch.float)
+            edge_coordinates = torch.tensor([], dtype=torch.float64)
 
         # Reverse coordinates if orientation is -1
         edge_coordinates[edge_orientations == -1] = edge_coordinates[edge_orientations == -1][:, [1, 0]]
@@ -104,10 +128,10 @@ class TrajectoryDataset(Dataset):
         }
         
     def __len__(self):
-        return len(self.keys)
+        return len(self.trajectories)
 
-    def __del__(self):
-        self.trajectories.close()
+    '''def __del__(self):
+        self.trajectories.close()'''
 
     def get_n_edges(self):
         return self.graph.number_of_edges()
@@ -170,7 +194,7 @@ def collate_fn(batch):
             "history_one_hot_nodes": history_one_hot_nodes
         }
     
-"""nodes = [(0, {'pos': (0.1, 0.65)}),
+nodes = [(0, {'pos': (0.1, 0.65)}),
          (1, {'pos': (0.05, 0.05)}), 
          (2, {'pos': (0.2, 0.15)}), 
          (3, {'pos': (0.55, 0.05)}),
@@ -200,10 +224,30 @@ def collate_fn(batch):
 
 edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26)]
 
-file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5'
+"""file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5'
 history_len = 5
 future_len = 2
 edge_features = ['edge_one_hot', 'edge_orientations']
 dataset = TrajectoryDataset(file_path, history_len, nodes, edges, future_len, edge_features=edge_features)
 
 print(dataset[2])"""
+
+
+
+'''file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_tester.h5'
+# paths, nodes, edges = load_new_format(file_path)
+history_len = 5
+future_len = 2
+edge_features = ['edge_one_hot']
+batch_size = 1
+dataset = TrajectoryDataset(file_path, history_len, nodes, edges, future_len, edge_features=edge_features)
+node_features = dataset.node_coordinates()
+edge_tensor = dataset.get_all_edges_tensor()
+# trajectory_edge_tensor = dataset.get_trajectory_edges_tensor(0)
+num_edges = dataset.get_n_edges()
+train_data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+for i, data in enumerate(train_data_loader):
+    print(data)
+    if i == 0:
+        break'''

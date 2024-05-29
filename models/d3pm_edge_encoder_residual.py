@@ -79,6 +79,8 @@ class Edge_Encoder_Residual(nn.Module):
             self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
         
         self.res_layer = nn.Linear(self.num_edges, self.hidden_channels * self.num_heads)
+        # self.res_layer = nn.Linear(self.num_node_features, self.hidden_channels * self.num_heads)
+
 
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
@@ -101,10 +103,12 @@ class Edge_Encoder_Residual(nn.Module):
         if edge_attr_res_layer.dim() > 2:
             edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
             edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
-                
+        # x_res = x
         for conv in self.convs:
             x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))
-        x = x + F.relu(self.res_layer(edge_attr_res_layer))
+            x = x + F.relu(self.res_layer(edge_attr_res_layer))
+            # x = x + F.relu(self.res_layer(x_res))
+            
         x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, hidden_dim]
         if mode == 'history':
             c = self.history_encoder(x)
