@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def make_diffusion(diffusion_config, model_config, num_edges):
+def make_diffusion(diffusion_config, model_config, num_edges, future_len):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
         betas=get_diffusion_betas(diffusion_config),
@@ -33,7 +33,8 @@ def make_diffusion(diffusion_config, model_config, num_edges):
         hybrid_coeff=model_config['hybrid_coeff'],
         num_edges=num_edges,
         class_weights=model_config['class_weights'],
-        model_name=model_config['name']
+        model_name=model_config['name'],
+        future_len=future_len
 )
 
 
@@ -74,7 +75,7 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, class_weights, torch_dtype=torch.float32, model_name=None):
+               num_edges, class_weights, torch_dtype=torch.float32, model_name=None, future_len=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
@@ -87,6 +88,8 @@ class CategoricalDiffusion:
         # Data \in {0, ..., num_edges-1}
         self.num_classes = 2 # 0 or 1
         self.num_edges = num_edges
+        self.future_len = future_len
+        self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
         self.transition_bands = transition_bands
         self.transition_mat_type = transition_mat_type
         self.eps = 1.e-6
@@ -111,6 +114,9 @@ class CategoricalDiffusion:
         elif self.transition_mat_type == 'absorbing':
             q_one_step_mats = [self._get_absorbing_transition_mat(t)
                             for t in range(0, self.num_timesteps)]
+        elif self.transition_mat_type == 'marginal_prior':
+            q_one_step_mats = [self._get_prior_distribution_transition_mat(t)
+                               for t in range(0, self.num_timesteps)]
         else:
             raise ValueError(
                 f"transition_mat_type must be 'gaussian', 'uniform', 'absorbing' "
@@ -279,6 +285,28 @@ class CategoricalDiffusion:
         # Add beta_t to the num_classes/2-th column for the absorbing state
         mat[:, self.num_classes // 2] += beta_t
 
+        return mat
+    
+    def _get_prior_distribution_transition_mat(self, t):
+        """Computes transition matrix for q(x_t|x_{t-1}).
+        Use cosine schedule for these transition matrices.
+
+        Args:
+        t: timestep. integer scalar.
+
+        Returns:
+        Q_t: transition matrix. shape = (num_classes, num_classes).
+        """
+        beta_t = self.betas[t]
+        mat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.float64)
+
+        for i in range(self.num_classes):
+            for j in range(self.num_classes):
+                if i != j:
+                    mat[i, j] = beta_t * self.class_probs[j]
+                else:
+                    mat[i, j] = 1 - beta_t + beta_t * self.class_probs[j]
+        
         return mat
 
     def _at(self, a, t, x):

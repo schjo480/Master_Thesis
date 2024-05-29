@@ -12,7 +12,7 @@ slurm:
     gres: gpu:1       # num GPUs
     mem: 16G          # memory
     cpus-per-task: 1  # num cores
-    time: 0-01:00     # max time, D-HH:MM
+    time: 0-03:00     # max time, D-HH:MM
 
 fixed:
   data:
@@ -33,12 +33,12 @@ fixed:
   
   model:
     name: edge_encoder_residual
-    hidden_channels: 64
+    hidden_channels: 32
     time_embedding_dim: 16
     condition_dim: 16
     out_ch: 1
-    num_heads: 1  # 1
-    num_layers: 3
+    num_heads: 2  # 1
+    num_layers: 2
     dropout: 0.1
     model_output: logits
     model_prediction: x_start  # Options: 'x_start','xprev'
@@ -46,7 +46,7 @@ fixed:
     transition_bands: null
     loss_type: cross_entropy_x_start  # Options: kl, cross_entropy_x_start, hybrid
     hybrid_coeff: 0.01  # Only used for hybrid loss type.
-    class_weights: [0.05, 0.95] # = future_len/num_edges and (num_edges - future_len)/num_edges
+    class_weights: [0.1, 0.9] # = future_len/num_edges and (num_edges - future_len)/num_edges
   
   training:
     batch_size: 1
@@ -63,10 +63,10 @@ fixed:
 
   testing:
     batch_size: 1
-    model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_residual/synthetic_d3pm_residual_hidden_dim_64_time_dim_16_condition_dim_16_layers_3.pth'
+    model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_residual_fixed_more_residual/synthetic_d3pm_residual_fixed_more_residual_hidden_dim_32_time_dim_16_condition_dim_16_layers_2_weights_0.1.pth'
 
   wandb:
-    exp_name: "synthetic_d3pm_residual"
+    exp_name: "synthetic_d3pm_residual_fixed_more_residual"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "eval"
@@ -80,8 +80,7 @@ grid:
     type: choice
     options:
       - 1
-      - 10
-      - 20
+      - 50
 
 random:
   samples: 1

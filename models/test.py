@@ -13,6 +13,19 @@ import os
 import time
 import wandb
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchmetrics import F1Score
+import yaml
+from tqdm import tqdm
+import logging
+import os
+import time
+import wandb
+
+
 class Graph_Diffusion_Model(nn.Module):
     def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model, nodes, edges):
         super(Graph_Diffusion_Model, self).__init__()
@@ -28,7 +41,6 @@ class Graph_Diffusion_Model(nn.Module):
         self.edges = edges
         self.edge_features = self.data_config['edge_features']
         self.num_edge_features = len(self.edge_features)
-        self.one_hot_nodes = self.data_config['one_hot_nodes']
         
         # Diffusion
         self.diffusion_config = diffusion_config
@@ -103,8 +115,8 @@ class Graph_Diffusion_Model(nn.Module):
             None
         """
         
-        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges)
-        def model_fn(x, edge_index, t, edge_attr, condition=None): #takes in noised future trajectory (and diffusion timestep)
+        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len)
+        def model_fn(x, edge_index, t, edge_attr, condition=None):
             if self.model_config['name'] == 'edge_encoder':
                 return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
             elif self.model_config['name'] == 'edge_encoder_residual':
@@ -113,40 +125,26 @@ class Graph_Diffusion_Model(nn.Module):
                 return self.model.forward(t=t, edge_attr=edge_attr, condition=condition, mode='future')
                 
         for epoch in tqdm(range(self.num_epochs)):
-            
             current_lr = self.scheduler.get_last_lr()[0]
             wandb.log({"epoch": epoch, "learning_rate": current_lr})
+            
             total_loss = 0
             ground_truth_fut = []
             pred_fut = []
-            
-            self.optimizer.zero_grad()  # Zero the gradients at the start of each epoch
             if self.gradient_accumulation:
-                for step, data in enumerate(self.train_data_loader):
+                for data in self.train_data_loader:
                     history_edge_features = data["history_edge_features"]
                     future_edge_indices_one_hot = data['future_one_hot_edges']
                     # Check if any entry in future_edge_indices_one_hot is not 0 or 1
                     if not torch.all((future_edge_indices_one_hot == 0) | (future_edge_indices_one_hot == 1)):
                         continue  # Skip this datapoint if the condition is not met
-                    # future_trajectory_indices = data["future_indices"]
+                    
                     node_features = self.node_features
                     edge_index = self.edge_tensor
-                    # self.optimizer.zero_grad()
-                    loss = 0
+                    
+                    self.optimizer.zero_grad()
                     for i in range(min(self.gradient_accumulation_steps, history_edge_features.size(0))):
-                        if self.one_hot_nodes:
-                            # Ensure data['history_one_hot_nodes'][i] has the shape [28] or reshape it accordingly
-                            history_one_hot_nodes = data['history_one_hot_nodes'][i]
-                            
-                            if history_one_hot_nodes.dim() == 2 and history_one_hot_nodes.shape[1] == 1:
-                                history_one_hot_nodes = history_one_hot_nodes.squeeze(1)  # Squeeze to shape [28]
-
-                            # Clone node_features to avoid in-place operations
-                            modified_node_features = node_features.clone()
-                            modified_node_features[:, -1] = history_one_hot_nodes
-                            
-                        node_features = modified_node_features if self.one_hot_nodes else node_features
-                            
+                        # Calculate history condition c
                         if self.model_config['name'] == 'edge_encoder':
                             c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features[i].unsqueeze(0), mode='history')
                         elif self.model_config['name'] == 'edge_encoder_residual':
@@ -154,64 +152,68 @@ class Graph_Diffusion_Model(nn.Module):
                         elif self.model_config['name'] == 'edge_encoder_mlp':
                             c = self.model.forward(edge_attr=history_edge_features[i].unsqueeze(0), mode='history')
                         
-                        x_start = future_edge_indices_one_hot[i].unsqueeze(0)  # (batch_size, num_edges)
-                        batch_loss, preds = dif.training_losses(model_fn, node_features, edge_index, data, c, x_start=x_start)  # preds are of shape (num_edges,)
+                        x_start = future_edge_indices_one_hot[i].unsqueeze(0)   # (batch_size, num_edges)
+                        # Get loss and predictions
+                        loss, preds = dif.training_losses(model_fn, node_features, edge_index, data, c, x_start=x_start)   # preds are of shape (num_edges,)
+                        
                         ground_truth_fut.append(x_start)
                         pred_fut.append(preds)
-                        loss += batch_loss / self.gradient_accumulation_steps
-                    
-                        loss.backward(retain_graph=True)  # Accumulate gradients
-
-                        if (i + 1) % self.gradient_accumulation_steps == 0:
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()  # Reset gradients after updating
-                            total_loss += loss.item()
+                        
+                        total_loss += loss / self.gradient_accumulation_steps
+                        (loss / self.gradient_accumulation_steps).backward() # Gradient accumulation
+                    self.optimizer.step()
                     
             else:
-                for step, data in enumerate(self.train_data_loader):
+                for data in self.train_data_loader:
                     history_edge_features = data["history_edge_features"]
                     future_edge_indices_one_hot = data['future_one_hot_edges']
                     # Check if any entry in future_edge_indices_one_hot is not 0 or 1
                     if not torch.all((future_edge_indices_one_hot == 0) | (future_edge_indices_one_hot == 1)):
                         continue
+                    
                     batch_size = future_edge_indices_one_hot.size(0)
                     if self.model_config['name'] == 'edge_encoder_mlp':
                         if batch_size == self.batch_size:
                             future_edge_indices_one_hot = future_edge_indices_one_hot.view(self.batch_size, self.num_edges, 1)
                         else:
                             future_edge_indices_one_hot = future_edge_indices_one_hot.view(batch_size, self.num_edges, 1)
-                    # future_trajectory_indices = data["future_indices"]
+                            
                     node_features = self.node_features
                     edge_index = self.edge_tensor
                     
                     self.optimizer.zero_grad()
+                    # Calculate history condition c
                     if self.model_config['name'] == 'edge_encoder':
                         c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
                     elif self.model_config['name'] == 'edge_encoder_residual':
                         c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
                     elif self.model_config['name'] == 'edge_encoder_mlp':
                         c = self.model.forward(edge_attr=history_edge_features, mode='history')
+                    
                     x_start = future_edge_indices_one_hot
+                    # Get loss and predictions
                     loss, preds = dif.training_losses(model_fn, node_features, edge_index, data, c, x_start=x_start)
+                    
                     x_start = x_start.squeeze(-1)   # (bs, num_edges, 1) -> (bs, num_edges)
                     ground_truth_fut.append(x_start)
                     pred_fut.append(preds)
+                    
                     total_loss += loss
                     loss.backward()
                     self.optimizer.step()
             
-            # Update learning rate via scheduler and log it
             self.scheduler.step()
             
-            avg_loss = total_loss# / len(self.train_data_loader)
+            avg_loss = total_loss / len(self.train_data_loader)
             f1_score = F1Score(task='binary', average='macro', num_classes=2)
             f1_epoch = f1_score(torch.flatten(torch.cat(pred_fut)).detach(), torch.flatten(torch.cat(ground_truth_fut)).detach())
+            # Logging
             if epoch % self.log_loss_every_steps == 0:
-                wandb.log({"epoch": epoch, "average_loss": avg_loss})
+                wandb.log({"epoch": epoch, "average_loss": avg_loss.item()})
                 wandb.log({"epoch": epoch, "average_F1_score": f1_epoch.item()})
-                self.log.info(f"Epoch {epoch} Average Loss: {avg_loss}")
+                self.log.info(f"Epoch {epoch} Average Loss: {avg_loss.item()}")
                 print("Epoch:", epoch)
-                print("Loss:", avg_loss)
+                print("Loss:", avg_loss.item())
                 print("F1:", f1_epoch.item())
                         
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
@@ -299,9 +301,10 @@ class Graph_Diffusion_Model(nn.Module):
                     raise ValueError("Number of samples must be greater than 0.")
                 ground_truth_hist.append(history_edge_indices)
                 ground_truth_fut.append(future_trajectory_indices)
+            
             if number_samples == 1:
                 fut_ratio, f1, avg_sample_length = self.eval(sample_list, ground_truth_hist, ground_truth_fut)
-                wandb.log({"F1 Score": f1})
+                wandb.log({"F1 Score": f1.item()})
                 wandb.log({"Future ratio": fut_ratio})
                 wandb.log({"Average sample length": avg_sample_length})
             return sample_list, ground_truth_hist, ground_truth_fut
@@ -386,11 +389,9 @@ class Graph_Diffusion_Model(nn.Module):
         """
         import matplotlib.pyplot as plt
         import networkx as nx
-        import os
         
-        if samples is None:
-            samples, ground_truth_hist, ground_truth_fut = self.get_samples(load_model=True, model_path=self.test_config['model_path'])
-        save_dir = 'visualizations'
+        samples, ground_truth_hist, ground_truth_fut = self.get_samples(load_model=True, model_path=self.test_config['model_path'])
+        save_dir = f'{os.path.join(self.model_dir, f'{self.exp_name}', 'plots')}'
         os.makedirs(save_dir, exist_ok=True)
         
         G = nx.Graph()
@@ -485,7 +486,6 @@ class Graph_Diffusion_Model(nn.Module):
             f1 = metric(torch.cat(one_hot_samples), torch.cat(one_hot_futures))
 
             return f1
-            
         
         def calculate_avg_sample_length(sample_list):
             """
@@ -537,8 +537,6 @@ class Graph_Diffusion_Model(nn.Module):
     def _build_train_dataloader(self):
         self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.nodes, self.edges, self.future_len, self.edge_features)
         self.node_features = self.train_dataset.node_coordinates()
-        if self.one_hot_nodes:
-            self.node_features = torch.cat((self.node_features, torch.eye(len(nodes))[:, :1]), dim=1)
         self.edge_tensor = self.train_dataset.get_all_edges_tensor()
         # self.trajectory_edge_tensor = self.train_dataset.get_trajectory_edges_tensor(0)
         self.num_edges = self.train_dataset.get_n_edges()
@@ -562,7 +560,29 @@ from torch.utils.data import DataLoader, Dataset
 import h5py
 import networkx as nx
 import numpy as np
-# from torch_geometric.data import Data, Batch
+
+def load_new_format(new_file_path):
+    paths = []
+    from tqdm import tqdm
+
+    with h5py.File(new_file_path, 'r') as new_hf:
+        node_coordinates = new_hf['graph']['node_coordinates'][:]
+        edges = new_hf['graph']['edges'][:]
+        edge_coordinates = node_coordinates[edges]
+        nodes = [(i, {'pos': tuple(pos)}) for i, pos in enumerate(node_coordinates)]
+        
+        
+        # Convert edges to a list of tuples
+        edges = [tuple(edge) for edge in edges]
+
+        for i in tqdm(new_hf['trajectories'].keys()):
+            path_group = new_hf['trajectories'][i]
+            path = {attr: path_group[attr][()] for attr in path_group.keys()}
+            if 'edge_orientation' in path:
+                path['edge_orientations'] = path.pop('edge_orientation')
+            paths.append(path)
+
+    return paths, nodes, edges, edge_coordinates
 
 class TrajectoryDataset(Dataset):
     def __init__(self, file_path, history_len, nodes, edges, future_len, edge_features=None):
@@ -570,31 +590,33 @@ class TrajectoryDataset(Dataset):
         self.history_len = history_len
         self.future_len = future_len
         self.edge_features = edge_features
-        self.trajectories = h5py.File(file_path, 'r')
-        self.keys = list(self.trajectories.keys())
+        # self.trajectories = h5py.File(file_path, 'r')
+        self.trajectories, self.nodes, self.edges, self.edge_coordinates = load_new_format(file_path)
         
-        self.nodes = nodes
-        self.edges = edges
+        '''self.nodes = nodes
+        self.edges = edges'''
         self.graph = nx.Graph()
         self.graph.add_nodes_from(self.nodes)
         self.graph.add_edges_from(self.edges)
 
     def __getitem__(self, idx):
-        trajectory_name = self.keys[idx]
-        trajectory = self.trajectories[trajectory_name]
+        # trajectory_name = self.keys[idx]
+        trajectory = self.trajectories[idx]
         edge_idxs = torch.tensor(trajectory['edge_idxs'][:], dtype=torch.long)
         edge_orientations = torch.tensor(trajectory['edge_orientations'][:], dtype=torch.long)
         
-        edge_coordinates_data = trajectory.get('edge_coordinates', [])
+        # edge_coordinates_data = trajectory.get('coordinates', [])
+        edge_coordinates_data = self.edge_coordinates[edge_idxs]
+
         if len(edge_coordinates_data) > 0:
             edge_coordinates_np = np.array(edge_coordinates_data)
-            edge_coordinates = torch.tensor(edge_coordinates_np, dtype=torch.float)
+            edge_coordinates = torch.tensor(edge_coordinates_np, dtype=torch.float64)
         else:
-            edge_coordinates = torch.tensor([], dtype=torch.float)
+            edge_coordinates = torch.tensor([], dtype=torch.float64)
 
         # Reverse coordinates if orientation is -1
         edge_coordinates[edge_orientations == -1] = edge_coordinates[edge_orientations == -1][:, [1, 0]]
-
+        
         # Calculate the required padding length
         total_len = self.history_len + self.future_len
         padding_length = max(total_len - len(edge_idxs), 0)
@@ -640,7 +662,7 @@ class TrajectoryDataset(Dataset):
         else:
             history_edge_features = history_one_hot_edges
             future_edge_features = future_one_hot_edges
-            
+        
         # Generate the tensor indicating nodes in history
         node_in_history = torch.zeros((len(self.nodes), 1), dtype=torch.float)
         history_edges = [self.edges[i] for i in history_indices if i >= 0]
@@ -663,10 +685,10 @@ class TrajectoryDataset(Dataset):
         }
         
     def __len__(self):
-        return len(self.keys)
+        return len(self.trajectories)
 
-    def __del__(self):
-        self.trajectories.close()
+    '''def __del__(self):
+        self.trajectories.close()'''
 
     def get_n_edges(self):
         return self.graph.number_of_edges()
@@ -687,7 +709,8 @@ class TrajectoryDataset(Dataset):
         edges = list(self.graph.edges())
         edge_tensor = torch.tensor(edges, dtype=torch.long).t()
         return edge_tensor
-    
+
+
 def collate_fn(batch):
     # Extract elements for each sample and stack them, handling variable lengths
     history_indices = torch.stack([item['history_indices'] for item in batch])
@@ -713,7 +736,7 @@ def collate_fn(batch):
         history_coordinates = torch.stack(history_coordinates)
     if future_coordinates:
         future_coordinates = torch.stack(future_coordinates)
-    
+
     return {
             "history_indices": history_indices,
             "future_indices": future_indices,
@@ -1070,6 +1093,8 @@ class Edge_Encoder_Residual(nn.Module):
             self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
         
         self.res_layer = nn.Linear(self.num_edges, self.hidden_channels * self.num_heads)
+        # self.res_layer = nn.Linear(self.num_node_features, self.hidden_channels * self.num_heads)
+
 
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
@@ -1092,10 +1117,12 @@ class Edge_Encoder_Residual(nn.Module):
         if edge_attr_res_layer.dim() > 2:
             edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
             edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
-                
+        x_res = x
         for conv in self.convs:
             x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))
-        x = x + F.relu(self.res_layer(edge_attr_res_layer))
+            x = 0.001*x + F.relu(self.res_layer(edge_attr_res_layer))
+            # x = x + F.relu(self.res_layer(x_res))
+            
         x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, hidden_dim]
         if mode == 'history':
             c = self.history_encoder(x)
@@ -1147,7 +1174,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def make_diffusion(diffusion_config, model_config, num_edges):
+def make_diffusion(diffusion_config, model_config, num_edges, future_len):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
         betas=get_diffusion_betas(diffusion_config),
@@ -1159,7 +1186,8 @@ def make_diffusion(diffusion_config, model_config, num_edges):
         hybrid_coeff=model_config['hybrid_coeff'],
         num_edges=num_edges,
         class_weights=model_config['class_weights'],
-        model_name=model_config['name']
+        model_name=model_config['name'],
+        future_len=future_len
 )
 
 
@@ -1200,7 +1228,7 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, class_weights, torch_dtype=torch.float32, model_name=None):
+               num_edges, class_weights, torch_dtype=torch.float32, model_name=None, future_len=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
@@ -1213,6 +1241,8 @@ class CategoricalDiffusion:
         # Data \in {0, ..., num_edges-1}
         self.num_classes = 2 # 0 or 1
         self.num_edges = num_edges
+        self.future_len = future_len
+        self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
         self.transition_bands = transition_bands
         self.transition_mat_type = transition_mat_type
         self.eps = 1.e-6
@@ -1237,11 +1267,14 @@ class CategoricalDiffusion:
         elif self.transition_mat_type == 'absorbing':
             q_one_step_mats = [self._get_absorbing_transition_mat(t)
                             for t in range(0, self.num_timesteps)]
+        elif self.transition_mat_type == 'marginal_prior':
+            q_one_step_mats = [self._get_prior_distribution_transition_mat(t)
+                               for t in range(0, self.num_timesteps)]
         else:
             raise ValueError(
                 f"transition_mat_type must be 'gaussian', 'uniform', 'absorbing' "
                 f", but is {self.transition_mat_type}"
-            )
+                )
 
         self.q_onestep_mats = torch.stack(q_one_step_mats, axis=0)
         assert self.q_onestep_mats.shape == (self.num_timesteps,
@@ -1350,37 +1383,42 @@ class CategoricalDiffusion:
         Returns:
             Q_t: transition matrix. shape = (num_classes, num_classes).
         """
-        transition_bands = self.num_classes - 1
+        transition_bands = self.transition_bands if self.transition_bands else self.num_classes - 1
+
         beta_t = self.betas[t]
 
-        mat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.float64)
+        mat = torch.zeros((self.num_classes, self.num_classes),
+                        dtype=torch.float64)
 
         # Make the values correspond to a similar type of gaussian as in the
         # gaussian diffusion case for continuous state spaces.
-        values = torch.linspace(start=0., end=self.num_classes-1, steps=self.num_classes, dtype=torch.float64)
-        values = values * 2. / (self.num_classes - 1.)
-        values = values[:transition_bands + 1]
+        values = torch.linspace(torch.tensor(0.), torch.tensor(self.num_classes-1), self.num_classes, dtype=torch.float64)
+        values = values * 2./ (self.num_classes - 1.)
+        values = values[:transition_bands+1]
         values = -values * values / beta_t
-
-        # Handle numerical stability for softmax
-        max_val = values.max()
-        values = values - max_val  # Subtract the max for numerical stability
+        
+        # To reverse the tensor 'values' starting from the second element
         reversed_values = values[1:].flip(dims=[0])
+        # Concatenating the reversed values with the original values
         values = torch.cat([reversed_values, values], dim=0)
         values = F.softmax(values, dim=0)
         values = values[transition_bands:]
-
+        
         for k in range(1, transition_bands + 1):
             off_diag = torch.full((self.num_classes - k,), values[k], dtype=torch.float64)
+
             mat += torch.diag(off_diag, k)
             mat += torch.diag(off_diag, -k)
 
         # Add diagonal values such that rows and columns sum to one.
+        # Technically only the ROWS need to sum to one
+        # NOTE: this normalization leads to a doubly stochastic matrix,
+        # which is necessary if we want to have a uniform stationary distribution.
         diag = 1. - mat.sum(dim=1)
         mat += torch.diag_embed(diag)
 
         return mat
-    
+
     def _get_absorbing_transition_mat(self, t):
         """Computes transition matrix for q(x_t|x_{t-1}).
 
@@ -1400,6 +1438,28 @@ class CategoricalDiffusion:
         # Add beta_t to the num_classes/2-th column for the absorbing state
         mat[:, self.num_classes // 2] += beta_t
 
+        return mat
+    
+    def _get_prior_distribution_transition_mat(self, t):
+        """Computes transition matrix for q(x_t|x_{t-1}).
+        Use cosine schedule for these transition matrices.
+
+        Args:
+        t: timestep. integer scalar.
+
+        Returns:
+        Q_t: transition matrix. shape = (num_classes, num_classes).
+        """
+        beta_t = self.betas[t]
+        mat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.float64)
+
+        for i in range(self.num_classes):
+            for j in range(self.num_classes):
+                if i != j:
+                    mat[i, j] = beta_t * self.class_probs[j]
+                else:
+                    mat[i, j] = 1 - beta_t + beta_t * self.class_probs[j]
+        
         return mat
 
     def _at(self, a, t, x):
@@ -1496,7 +1556,7 @@ class CategoricalDiffusion:
         """
         assert noise.shape == x_start.shape + (self.num_classes,)
         logits = torch.log(self.q_probs(x_start, t) + self.eps)
-        #print("q_sample logits", logits)
+
         # To avoid numerical issues, clip the noise to a minimum value
         noise = torch.clamp(noise, min=torch.finfo(noise.dtype).tiny, max=1.)
         gumbel_noise = -torch.log(-torch.log(noise))
@@ -1543,7 +1603,6 @@ class CategoricalDiffusion:
         else:
             assert x_start.shape == x_t.shape, (x_start.shape, x_t.shape)
 
-        #print("x_start", x_start)
         fact1 = self._at(self.transpose_q_onestep_mats, t, x_t)
         if x_start_logits:
             fact2 = self._at_onehot(self.q_mats, t-1, F.softmax(x_start, dim=-1))
@@ -1559,7 +1618,7 @@ class CategoricalDiffusion:
         
         return torch.where(t_broadcast == 0, tzero_logits, out) # (bs, num_edges, channels=1, num_classes)
 
-    def p_logits(self, model_fn, x, t, node_features=None, edge_index=None, edge_attr=None, condition=None, verbose=False):
+    def p_logits(self, model_fn, x, t, node_features=None, edge_index=None, edge_attr=None, condition=None):
         """Compute logits of p(x_{t-1} | x_t) in PyTorch.
 
         Args:
@@ -1582,12 +1641,12 @@ class CategoricalDiffusion:
             model_logits = self._get_logits_from_logistic_pars(loc, log_scale)
         else:
             raise NotImplementedError(self.model_output)
-        
+
         if self.model_prediction == 'x_start':
             pred_x_start_logits = model_logits
             t_broadcast = t.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # Adds new dimensions: [batch_size, 1, 1, 1]
             t_broadcast = t_broadcast.expand(-1, pred_x_start_logits.size(1), 1, pred_x_start_logits.size(-1))   # pred_x_start_logits.size(1) = num_edges, pred_x_start_logits.size(-1) = num_classes
-            
+
             model_logits = torch.where(t_broadcast == 0, pred_x_start_logits,
                                        self.q_posterior_logits(pred_x_start_logits, x, t, x_start_logits=True))
         elif self.model_prediction == 'xprev':
@@ -1604,7 +1663,6 @@ class CategoricalDiffusion:
         # Get model logits
         model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
         assert noise.shape == model_logits.shape, noise.shape
-        # print("model_logits", model_logits)
 
         # No noise when t == 0
         nonzero_mask = (t != 0).float().reshape(x.shape[0], *([1] * (len(x.shape) - 1)))
@@ -1632,16 +1690,13 @@ class CategoricalDiffusion:
             raise ValueError(f"Invalid transition_mat_type {self.transition_mat_type}")
 
         x = x_init.clone()
-        # TODO: Set edge_attr = x_init = x_T
         edge_attr = x_init.unsqueeze(-1).type(torch.float32)
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
-            # print("Edge attr", torch.where(edge_attr == 1)[1])
             x, _ = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
             edge_attr = x.unsqueeze(-1).type(torch.float32)
-            #print(torch.where(x == 1)[1])
 
         if return_x_init:
             return x_init, x
@@ -1736,7 +1791,6 @@ class CategoricalDiffusion:
 
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
-        # print("x_t", torch.where(x_t == 1)[1])
         
         if (self.model_name == 'edge_encoder_mlp') & (x_t.dim() == 2):
             x_t = x_t.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
@@ -1757,8 +1811,9 @@ class CategoricalDiffusion:
             
         elif self.loss_type == 'cross_entropy_x_start':
             
-            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition, verbose=False)
+            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
             losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
+            
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
             
             if (self.model_name == 'edge_encoder') | (self.model_name == 'edge_encoder_residual'):
@@ -1811,7 +1866,7 @@ class CategoricalDiffusion:
 
 encoder_model = Edge_Encoder
 #encoder_model = Edge_Encoder_MLP
-#encoder_model = Edge_Encoder_Residual
+encoder_model = Edge_Encoder_Residual
 
 nodes = [(0, {'pos': (0.1, 0.7)}),
          (1, {'pos': (0.05, 0.05)}), 
@@ -1846,21 +1901,21 @@ edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 
 
 
     
-data_config = {"dataset": "synthetic_graph",
+data_config = {"dataset": "tdrive_1000",
     "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5',
     "test_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5',
     "history_len": 5,
     "future_len": 2,
     "num_classes": 2,
     "edge_features": ['one_hot_edges'],
-    "one_hot_nodes": True}
+    "one_hot_nodes": False}
 
 diffusion_config = {"type": 'linear', # Options: 'linear', 'cosine', 'jsd'
     "start": 0.9,  # 1e-4 gauss, 0.02 uniform
-    "stop": 1.,  # 0.02 gauss, 1. uniform
+    "stop": 1.0,  # 0.02 gauss, 1. uniform
     "num_timesteps": 1000}
 
-model_config = {"name": "edge_encoder",
+model_config = {"name": "edge_encoder_residual",
     "hidden_channels": 32,
     "time_embedding_dim": 16,
     "condition_dim": 16,
@@ -1870,8 +1925,8 @@ model_config = {"name": "edge_encoder",
     "dropout": 0.1,
     "model_output": "logits",
     "model_prediction": "x_start",  # Options: 'x_start','xprev'
-    "transition_mat_type": 'gaussian',  # Options: 'gaussian','uniform','absorbing'
-    "transition_bands": 0,
+    "transition_mat_type": 'gaussian',  # Options: 'gaussian','uniform','absorbing', 'marginal_prior'
+    "transition_bands": 1,
     "loss_type": "cross_entropy_x_start",  # Options: kl, cross_entropy_x_start, hybrid
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     "class_weights": [0.1, 0.9] # = future_len/num_edges and (num_edges - future_len)/num_edges
@@ -1882,7 +1937,7 @@ train_config = {"batch_size": 1,
     "lr": 0.01,
     "gradient_accumulation": True,
     "gradient_accumulation_steps": 4,
-    "num_epochs": 20000,
+    "num_epochs": 10000,
     "learning_rate_warmup_steps": 2000, # previously 10000
     "lr_decay": 0.9999, # previously 0.9999
     "log_loss_every_steps": 10,
@@ -1891,7 +1946,7 @@ train_config = {"batch_size": 1,
 
 test_config = {"batch_size": 1,
     "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_residual_fixed/synthetic_d3pm_residual_fixed_hidden_dim_32_time_dim_16_condition_dim_16_layers_2_weights_0.1.pth',
-    "number_samples": 10
+    "number_samples": 1
   }
 
 wandb_config = {"exp_name": "synthetic_d3pm_test",
@@ -1899,7 +1954,7 @@ wandb_config = {"exp_name": "synthetic_d3pm_test",
     "entity": "joeschmit99",
     "job_type": "test",
     "notes": "",
-    "tags": ["synthetic_graph", "edge_encoder"]} 
+    "tags": ["synthetic", "edge_encoder"]} 
 
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model, nodes, edges)
 model.train()

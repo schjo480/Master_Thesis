@@ -1,7 +1,7 @@
 seml:
   executable: main_seml.py
-  name: synthetic_d3pm
-  output_dir: experiments/synthetic_d3pm
+  name: tdrive_d3pm
+  output_dir: experiments/tdrive_d3pm
   project_root_dir: ../..
   conda_environment: /ceph/hdd/students/schmitj/miniconda3/base
 
@@ -11,14 +11,14 @@ slurm:
     # partition: gpu_large
     gres: gpu:1       # num GPUs
     mem: 16G          # memory
-    cpus-per-task: 12  # num cores
+    cpus-per-task: 6  # num cores
     time: 0-23:00     # max time, D-HH:MM
 
 fixed:
   data:
     dataset: synthetic_graph
-    train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5'
-    test_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5'
+    train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1000.h5'
+    test_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1000.h5'
     history_len: 5
     future_len: 2
     num_classes: 2
@@ -42,12 +42,12 @@ fixed:
     hybrid_coeff: 0.001  # Only used for hybrid loss type.
   
   training:
-    batch_size: 4
+    batch_size: 8
     optimizer: adam
     gradient_accumulation: False
     gradient_accumulation_steps: 8
     learning_rate_warmup_steps: 5000 # previously 10000
-    num_epochs: 100000
+    num_epochs: 10000
     lr_decay: 0.9999 # previously 0.9999
     log_loss_every_steps: 20
     save_model: True
@@ -59,12 +59,12 @@ fixed:
     number_samples: 10
     
   wandb:
-    exp_name: "synthetic_d3pm_mlp_fixed"
+    exp_name: "tdrive_d3pm_mlp_1"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
     notes: ""
-    tags: ["synthetic_graph", "edge_encoder"]
+    tags: ["tdrive", "edge_encoder_mlp"]
 
   eval: False
 
@@ -72,10 +72,7 @@ grid:
   model.class_weights:
     type: choice
     options:
-      - [0.05, 0.95]
-      - [0.1, 0.9]
-      - [0.3, 0.7]
-      - [0.5, 0.5]
+      - [0.001, 0.999]
   model.hidden_channels:
     type: choice
     options:

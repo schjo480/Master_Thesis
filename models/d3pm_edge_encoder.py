@@ -95,11 +95,8 @@ class Edge_Encoder(nn.Module):
         # GNN forward pass
         
         # Edge Embedding
-        x = F.relu(self.conv1(x, edge_index, edge_attr.squeeze(0)))
-        x = F.relu(self.conv2(x, edge_index, edge_attr.squeeze(0)))
-        x = F.relu(self.conv3(x, edge_index, edge_attr.squeeze(0)))
-        '''for conv in self.convs:
-            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))'''
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))
         x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
         
         if mode == 'history':

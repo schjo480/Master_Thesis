@@ -102,7 +102,7 @@ class Graph_Diffusion_Model(nn.Module):
             None
         """
         
-        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges)
+        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len)
         def model_fn(x, edge_index, t, edge_attr, condition=None):
             if self.model_config['name'] == 'edge_encoder':
                 return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
