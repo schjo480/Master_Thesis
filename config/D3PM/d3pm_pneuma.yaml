@@ -1,0 +1,114 @@
+seml:
+  executable: main_seml.py
+  name: pneuma_d3pm_residual
+  output_dir: experiments/pneuma_d3pm_residual
+  project_root_dir: ../..
+  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm
+
+slurm:
+  experiments_per_job: 1
+  sbatch_options:
+    partition: gpu_gtx1080
+    gres: gpu:1     # num GPUs
+    mem: 64G          # memory
+    cpus-per-task: 8  # num cores
+    time: 2-23:00     # max time, D-HH:MM
+
+fixed:
+  data:
+    dataset: pneuma
+    train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_train.h5'
+    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_val.h5'
+    history_len: 5
+    future_len: 2
+    num_classes: 2
+    edge_features: ['one_hot_edges', 'coordinates']
+
+  diffusion_config:
+    start: 0.9  # 1e-4 gauss, 0.02 uniform
+    stop: 1.  # 0.02 gauss, 1. uniform
+    num_timesteps: 100
+  
+  model:
+    dropout: 0.1
+    model_output: logits
+    theta: 1.0 # controls strength of conv layers in residual model
+    model_prediction: x_start  # Options: 'x_start','xprev'
+    transition_bands: null
+    loss_type: cross_entropy_x_start  # Options: kl, cross_entropy_x_start, hybrid
+    hybrid_coeff: 0.001  # Only used for hybrid loss type.
+  
+  training:
+    device: cuda
+    batch_size: 1
+    optimizer: adam
+    gradient_accumulation: True
+    gradient_accumulation_steps: 64
+    learning_rate_warmup_steps: 1000 # previously 10000
+    num_epochs: 500
+    lr_decay: 0.9999 # previously 0.9999
+    log_loss_every_steps: 1
+    save_model: True
+    save_model_every_steps: 10
+
+  testing:
+    batch_size: 1
+    model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_without_last_two_relu_longer_training/synthetic_d3pm_without_last_two_relu_longer_training.pth'
+    number_samples: 1
+    eval_every_steps: 3500
+    
+  wandb:
+    exp_name: "pneuma_residual"
+    project: "trajectory_prediction_using_denoising_diffusion_models"
+    entity: "joeschmit99"
+    job_type: "train"
+    notes: ""
+    tags: ["pneuma", "edge_encoder_residual"]
+
+  eval: False
+
+grid:
+  diffusion_config.type:
+    type: choice
+    options:
+      - 'linear'
+      - 'cosine'
+  model.transition_mat_type:
+    type: choice
+    options:
+      - 'gaussian'
+      - 'marginal_prior'
+  model.name:
+    type: choice
+    options:
+      # - edge_encoder_mlp
+      # - edge_encoder
+      - edge_encoder_residual
+  model.hidden_channels:
+    type: choice
+    options:
+      - 32
+  model.time_embedding_dim: 
+    type: choice
+    options:
+      - 16
+  model.condition_dim: 
+    type: choice
+    options:
+      - 16
+  model.num_layers: 
+    type: choice
+    options:
+      - 2
+  training.lr:
+    type: choice
+    options:
+      - 0.01
+  model.num_heads:
+    type: choice
+    options:
+      - 2
+
+random:
+  samples: 1
+  seed: 7059

@@ -1,8 +1,8 @@
+'''import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 import h5py
 import networkx as nx
-import numpy as np
 
 def load_new_format(new_file_path):
     paths = []
@@ -14,9 +14,14 @@ def load_new_format(new_file_path):
         edge_coordinates = node_coordinates[edges]
         nodes = [(i, {'pos': tuple(pos)}) for i, pos in enumerate(node_coordinates)]
         
-        
-        # Convert edges to a list of tuples
-        edges = [tuple(edge) for edge in edges]
+        if 'edge_indices' in new_hf['graph']:
+            edge_indices = new_hf['graph']['edge_indices'][:]
+            # Convert edges to a list of tuples
+            # Sort edges based on their saved indices
+            indexed_edges = sorted(zip(edges, edge_indices), key=lambda x: x[1])
+            edges = [edge for edge, _ in indexed_edges]
+        else:
+            edges = [tuple(edge) for edge in edges]
 
         for i in tqdm(new_hf['trajectories'].keys()):
             path_group = new_hf['trajectories'][i]
@@ -28,27 +33,32 @@ def load_new_format(new_file_path):
     return paths, nodes, edges, edge_coordinates
 
 class TrajectoryDataset(Dataset):
-    def __init__(self, file_path, history_len, nodes, edges, future_len, edge_features=None):
+    def __init__(self, file_path, history_len, future_len, edge_features=None):
         self.file_path = file_path
         self.history_len = history_len
         self.future_len = future_len
         self.edge_features = edge_features
-        # self.trajectories = h5py.File(file_path, 'r')
+        self.num_edge_features = 1
+        if 'coordinates' in self.edge_features:
+            self.num_edge_features = 5
+        if 'edge_orientations' in self.edge_features:
+            self.num_edge_features = 6
         self.trajectories, self.nodes, self.edges, self.edge_coordinates = load_new_format(file_path)
+        self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64)
         
-        '''self.nodes = nodes
-        self.edges = edges'''
         self.graph = nx.Graph()
+        indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
+
+        # Add edges with index to the graph
+        for (start, end), index in indexed_edges:
+            self.graph.add_edge(start, end, index=index, default_orientation=(start, end))
         self.graph.add_nodes_from(self.nodes)
-        self.graph.add_edges_from(self.edges)
 
     def __getitem__(self, idx):
-        # trajectory_name = self.keys[idx]
         trajectory = self.trajectories[idx]
         edge_idxs = torch.tensor(trajectory['edge_idxs'][:], dtype=torch.long)
         edge_orientations = torch.tensor(trajectory['edge_orientations'][:], dtype=torch.long)
         
-        # edge_coordinates_data = trajectory.get('coordinates', [])
         edge_coordinates_data = self.edge_coordinates[edge_idxs]
 
         if len(edge_coordinates_data) > 0:
@@ -76,8 +86,8 @@ class TrajectoryDataset(Dataset):
         # Split into history and future
         history_indices = edge_idxs[:self.history_len]
         future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
-        history_coordinates = edge_coordinates[:self.history_len] if edge_coordinates.numel() > 0 else None
-        future_coordinates = edge_coordinates[self.history_len:self.history_len + self.future_len] if edge_coordinates.numel() > 0 else None
+        #history_coordinates = edge_coordinates[:self.history_len] if edge_coordinates.numel() > 0 else None
+        #future_coordinates = edge_coordinates[self.history_len:self.history_len + self.future_len] if edge_coordinates.numel() > 0 else None
         
         history_edge_orientations = torch.zeros(self.get_n_edges())
         future_edge_orientations = torch.zeros(self.get_n_edges())
@@ -98,45 +108,45 @@ class TrajectoryDataset(Dataset):
         # Sum across the time dimension to count occurrences of each edge
         history_one_hot_edges = history_one_hot_edges.sum(dim=0)  # (num_edges,)
         future_one_hot_edges = future_one_hot_edges.sum(dim=0)  # (num_edges,)
-
-        if 'edge_orientations' in self.edge_features:
-            history_edge_features = torch.stack((history_one_hot_edges, history_edge_orientations), dim=1)
-            future_edge_features = torch.stack((future_one_hot_edges, future_edge_orientations), dim=1)
-        else:
-            history_edge_features = history_one_hot_edges
-            future_edge_features = future_one_hot_edges
         
         # Generate the tensor indicating nodes in history
-        node_in_history = torch.zeros((len(self.nodes), 1), dtype=torch.float)
+        """node_in_history = torch.zeros((len(self.nodes), 1), dtype=torch.float)
         history_edges = [self.edges[i] for i in history_indices if i >= 0]
         history_nodes = set(node for edge in history_edges for node in edge)
         for node in history_nodes:
-            node_in_history[node] = 1
-        
+            node_in_history[node] = 1"""
+            
+        # Basic History edge features = coordinates, binary encoding
+        history_edge_features = history_one_hot_edges.view(-1, 1).float()
+        future_edge_features = future_one_hot_edges.view(-1, 1).float()
+        if 'coordinates' in self.edge_features:
+            history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            future_edge_features = torch.cat((future_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            self.num_edge_features = 5
+        if 'edge_orientations' in self.edge_features:
+            history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
+            future_edge_features = torch.cat((future_edge_features, future_edge_orientations.float()), dim=1)
         return {
             "history_indices": history_indices,
             "future_indices": future_indices,
-            "history_coordinates": history_coordinates,
-            "future_coordinates": future_coordinates,
-            "history_one_hot_edges": history_one_hot_edges,
-            "future_one_hot_edges": future_one_hot_edges,
-            "history_edge_orientations": history_edge_orientations,
-            "future_edge_orientations": future_edge_orientations,
             "history_edge_features": history_edge_features,
             "future_edge_features": future_edge_features,
-            "node_in_history": node_in_history
-        }
+            #"history_coordinates": history_coordinates,
+            #"future_coordinates": future_coordinates,
+            #"history_one_hot_edges": history_one_hot_edges,
+            #"future_one_hot_edges": future_one_hot_edges,
+            #"history_edge_orientations": history_edge_orientations,
+            #"future_edge_orientations": future_edge_orientations,
+            #"node_in_history": node_in_history,
+        }, self.graph# , self.edges
         
     def __len__(self):
         return len(self.trajectories)
 
-    '''def __del__(self):
-        self.trajectories.close()'''
-
     def get_n_edges(self):
         return self.graph.number_of_edges()
     
-    def node_coordinates(self):
+    """def node_coordinates(self):
         """
         Returns a tensor of shape [#nodes, 2] containing the coordinates of each node.
         """
@@ -151,103 +161,178 @@ class TrajectoryDataset(Dataset):
         """
         edges = list(self.graph.edges())
         edge_tensor = torch.tensor(edges, dtype=torch.long).t()
-        return edge_tensor
+        return edge_tensor"""
 
 
 def collate_fn(batch):
+    graph = [item[1] for item in batch]
+    # edges = [item[2] for item in batch]
     # Extract elements for each sample and stack them, handling variable lengths
-    history_indices = torch.stack([item['history_indices'] for item in batch])
-    future_indices = torch.stack([item['future_indices'] for item in batch])
+    history_indices = torch.stack([item[0]['history_indices'] for item in batch])
+    future_indices = torch.stack([item[0]['future_indices'] for item in batch])
     
-    history_one_hot_edges = torch.stack([item['history_one_hot_edges'] for item in batch])
-    future_one_hot_edges = torch.stack([item['future_one_hot_edges'] for item in batch])
+    #history_one_hot_edges = torch.stack([item[0]['history_one_hot_edges'] for item in batch])
+    #future_one_hot_edges = torch.stack([item[0]['future_one_hot_edges'] for item in batch])
 
     # Coordinates
-    history_coordinates = [item['history_coordinates'] for item in batch if item['history_coordinates'] is not None]
-    future_coordinates = [item['future_coordinates'] for item in batch if item['future_coordinates'] is not None]
+    #history_coordinates = [item[0]['history_coordinates'] for item in batch if item[0]['history_coordinates'] is not None]
+    #future_coordinates = [item[0]['future_coordinates'] for item in batch if item[0]['future_coordinates'] is not None]
     
-    history_edge_orientations = torch.stack([item['history_edge_orientations'] for item in batch])
-    future_edge_orientations = torch.stack([item['future_edge_orientations'] for item in batch])
+    #history_edge_orientations = torch.stack([item[0]['history_edge_orientations'] for item in batch])
+    #future_edge_orientations = torch.stack([item[0]['future_edge_orientations'] for item in batch])
     
-    history_edge_features = torch.stack([item['history_edge_features'] for item in batch])
-    future_edge_features = torch.stack([item['future_edge_features'] for item in batch])
+    history_edge_features = torch.stack([item[0]['history_edge_features'] for item in batch])
+    future_edge_features = torch.stack([item[0]['future_edge_features'] for item in batch])
     
-    history_one_hot_nodes = torch.stack([item['node_in_history'] for item in batch])
+    #history_one_hot_nodes = torch.stack([item[0]['node_in_history'] for item in batch])
     
     # Stack coordinates if not empty
-    if history_coordinates:
+    """if history_coordinates:
         history_coordinates = torch.stack(history_coordinates)
     if future_coordinates:
-        future_coordinates = torch.stack(future_coordinates)
+        future_coordinates = torch.stack(future_coordinates)"""
 
     return {
             "history_indices": history_indices,
             "future_indices": future_indices,
-            "history_coordinates": history_coordinates,
-            "future_coordinates": future_coordinates,
-            "history_one_hot_edges": history_one_hot_edges,
-            "future_one_hot_edges": future_one_hot_edges,
-            "history_edge_orientations": history_edge_orientations,
-            "future_edge_orientations": future_edge_orientations,
+            #"history_coordinates": history_coordinates,
+            #"future_coordinates": future_coordinates,
+            #"history_one_hot_edges": history_one_hot_edges,
+            #"future_one_hot_edges": future_one_hot_edges,
+            #"history_edge_orientations": history_edge_orientations,
+            #"future_edge_orientations": future_edge_orientations,
             "history_edge_features": history_edge_features,
             "future_edge_features": future_edge_features,
-            "history_one_hot_nodes": history_one_hot_nodes
-        }
+            #"history_one_hot_nodes": history_one_hot_nodes,
+            "graph": graph,
+            # "edges": edges,
+        }'''
+        
+import torch
+from torch.utils.data import DataLoader, Dataset
+import h5py
+import networkx as nx
+import numpy as np
+import time
+from tqdm import tqdm
+
+class TrajectoryDataset(Dataset):
+    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None):
+        self.file_path = file_path
+        self.history_len = history_len
+        self.future_len = future_len
+        self.edge_features = edge_features
+        self.device = device
+        self.num_edge_features = 1
+        if 'coordinates' in self.edge_features:
+            self.num_edge_features = 5
+        if 'edge_orientations' in self.edge_features:
+            self.num_edge_features = 6
+        self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
+        
+        self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
+        
+    @staticmethod
+    def load_new_format(file_path, device):
+        paths = []
+        with h5py.File(file_path, 'r') as new_hf:
+            node_coordinates = torch.tensor(new_hf['graph']['node_coordinates'][:], dtype=torch.float, device=device)
+            # Normalize the coordinates to (0, 1) if any of the coordinates is larger than 1
+            if node_coordinates.max() > 1:
+                max_values = node_coordinates.max(0)[0]
+                min_values = node_coordinates.min(0)[0]
+                node_coordinates[:, 0] = (node_coordinates[:, 0] - min_values[0]) / (max_values[0] - min_values[0])
+                node_coordinates[:, 1] = (node_coordinates[:, 1] - min_values[1]) / (max_values[1] - min_values[1])
+            #edges = torch.tensor(new_hf['graph']['edges'][:], dtype=torch.long, device=device)
+            edges = new_hf['graph']['edges'][:]
+            edge_coordinates = node_coordinates[edges]
+            nodes = [(i, {'pos': torch.tensor(pos, device=device)}) for i, pos in enumerate(node_coordinates)]
+            #edges = [(torch.tensor(edge[0], device=device), torch.tensor(edge[1], device=device)) for edge in edges]
+            edges = [tuple(edge) for edge in edges]
+
+            for i in tqdm(new_hf['trajectories'].keys()):
+                path_group = new_hf['trajectories'][i]
+                path = {attr: torch.tensor(path_group[attr][()], device=device) for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
+                paths.append(path)
+            
+        return paths, nodes, edges, edge_coordinates
     
-nodes = [(0, {'pos': (0.1, 0.65)}),
-         (1, {'pos': (0.05, 0.05)}), 
-         (2, {'pos': (0.2, 0.15)}), 
-         (3, {'pos': (0.55, 0.05)}),
-         (4, {'pos': (0.8, 0.05)}),
-         (5, {'pos': (0.9, 0.1)}),
-         (6, {'pos': (0.75, 0.15)}),
-         (7, {'pos': (0.5, 0.2)}),
-         (8, {'pos': (0.3, 0.3)}),
-         (9, {'pos': (0.2, 0.3)}),
-         (10, {'pos': (0.3, 0.4)}),
-         (11, {'pos': (0.65, 0.35)}),
-         (12, {'pos': (0.8, 0.5)}),
-         (13, {'pos': (0.5, 0.5)}),
-         (14, {'pos': (0.4, 0.65)}),
-         (15, {'pos': (0.15, 0.6)}),
-         (16, {'pos': (0.3, 0.7)}),
-         (17, {'pos': (0.5, 0.7)}),
-         (18, {'pos': (0.8, 0.8)}),
-         (19, {'pos': (0.4, 0.8)}),
-         (20, {'pos': (0.25, 0.85)}),
-         (21, {'pos': (0.1, 0.9)}),
-         (22, {'pos': (0.2, 0.95)}),
-         (23, {'pos': (0.45, 0.9)}),
-         (24, {'pos': (0.95, 0.95)}),
-         (25, {'pos': (0.9, 0.4)}),
-         (26, {'pos': (0.95, 0.05)})]
+    # @staticmethod
+    def build_graph(self):
+        graph = nx.Graph()
+        graph.add_nodes_from(self.nodes)
+        indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
+        for (start, end), index in indexed_edges:
+            graph.add_edge(start, end, index=index, default_orientation=(start, end))
+        return graph
 
-edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26)]
+    def __getitem__(self, idx):
+        trajectory = self.trajectories[idx]
+    
+        edge_idxs = trajectory['edge_idxs']
+        if 'edge_orientations' in self.edge_features:
+            edge_orientations = trajectory['edge_orientations']
+        
+        # Calculate the required padding length
+        total_len = self.history_len + self.future_len
+        padding_length = max(total_len - len(edge_idxs), 0)
+        
+        # Pad edge indices, orientations, and coordinates
+        edge_idxs = torch.nn.functional.pad(edge_idxs, (0, padding_length), value=-1)
+        if 'edge_orientations' in self.edge_features:
+            edge_orientations = torch.nn.functional.pad(edge_orientations, (0, padding_length), value=0)
+        
+        # Split into history and future
+        history_indices = edge_idxs[:self.history_len]
+        future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
 
-"""file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic.h5'
-history_len = 5
-future_len = 2
-edge_features = ['edge_one_hot', 'edge_orientations']
-dataset = TrajectoryDataset(file_path, history_len, nodes, edges, future_len, edge_features=edge_features)
+        # Extract and generate features
+        history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
 
-print(dataset[2])"""
+        return {
+            "history_indices": history_indices,
+            "future_indices": future_indices,
+            "history_edge_features": history_edge_features,
+            "future_edge_features": future_edge_features,
+        }
+
+    def generate_edge_features(self, history_indices, future_indices, history_edge_orientations=None, future_edge_orientations=None):
+        # Binary on/off edges
+        valid_history_mask = history_indices >= 0
+        valid_future_mask = future_indices >= 0
+        
+        history_one_hot_edges = torch.nn.functional.one_hot(history_indices[valid_history_mask], num_classes=len(self.edges))
+        future_one_hot_edges = torch.nn.functional.one_hot(future_indices[valid_future_mask], num_classes=len(self.edges))
+        
+        # Sum across the time dimension to count occurrences of each edge
+        history_one_hot_edges = history_one_hot_edges.sum(dim=0)  # (num_edges,)
+        future_one_hot_edges = future_one_hot_edges.sum(dim=0)  # (num_edges,)
+        
+        # Basic History edge features = coordinates, binary encoding
+        history_edge_features = history_one_hot_edges.view(-1, 1).float()
+        future_edge_features = future_one_hot_edges.view(-1, 1).float()
+        if 'coordinates' in self.edge_features:
+            history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            future_edge_features = torch.cat((future_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            pass
+        if 'edge_orientations' in self.edge_features:
+            history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
+            future_edge_features = torch.cat((future_edge_features, future_edge_orientations.float()), dim=1)
+        return history_edge_features, future_edge_features
+        
+    def __len__(self):
+        return len(self.trajectories)
 
 
+def collate_fn(batch):
+    history_indices = torch.stack([item['history_indices'] for item in batch])
+    future_indices = torch.stack([item['future_indices'] for item in batch])
+    history_edge_features = torch.stack([item['history_edge_features'] for item in batch])
+    future_edge_features = torch.stack([item['future_edge_features'] for item in batch])
 
-'''file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_tester.h5'
-# paths, nodes, edges = load_new_format(file_path)
-history_len = 5
-future_len = 2
-edge_features = ['edge_one_hot']
-batch_size = 1
-dataset = TrajectoryDataset(file_path, history_len, nodes, edges, future_len, edge_features=edge_features)
-node_features = dataset.node_coordinates()
-edge_tensor = dataset.get_all_edges_tensor()
-# trajectory_edge_tensor = dataset.get_trajectory_edges_tensor(0)
-num_edges = dataset.get_n_edges()
-train_data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
-for i, data in enumerate(train_data_loader):
-    print(data)
-    if i == 0:
-        break'''
+    return {
+        "history_indices": history_indices,
+        "future_indices": future_indices,
+        "history_edge_features": history_edge_features,
+        "future_edge_features": future_edge_features,
+    }

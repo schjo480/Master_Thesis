@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
+def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None):
     """
     Build sinusoidal embeddings (from Fairseq).
 
@@ -18,14 +18,15 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
     Returns:
         embedding vectors with shape `(len(timesteps), embedding_dim)`
     """
+    timesteps = timesteps.to(device)
     assert timesteps.dim() == 1  # Ensure timesteps is a 1D tensor
 
     # Scale timesteps by the maximum time
     timesteps = timesteps.float() * (1000. / max_time)
 
     half_dim = embedding_dim // 2
-    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=device) * -emb)
     emb = timesteps[:, None] * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
 
@@ -34,31 +35,23 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
         emb = torch.cat([emb, zero_pad], dim=1)
 
     assert emb.shape == (timesteps.shape[0], embedding_dim)
-    return emb
+    return emb.to(device)
 
 class Edge_Encoder_MLP(nn.Module):
-    def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
+    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, num_edge_features, num_timesteps):
         super(Edge_Encoder_MLP, self).__init__()
         # Config
         self.config = model_config
         
         # Data
-        self.nodes = nodes
-        self.num_nodes = len(nodes)
-        self.edges = edges
-        self.node_features = node_features
-        self.num_node_features = self.node_features.shape[1]
         self.num_edges = num_edges
         self.num_edge_features = num_edge_features
         self.history_len = history_len
         self.future_len = future_len
-        
-        
         self.num_classes = num_classes
-        self.model_output = self.config['model_output']
         
         # Time embedding
-        self.max_time = 1000.
+        self.max_time = num_timesteps
         self.time_embedding_dim = self.config['time_embedding_dim']
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
@@ -68,7 +61,7 @@ class Edge_Encoder_MLP(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_layers = self.config['num_layers']
         self.lin_layers = nn.ModuleList()
-        self.lin_layers.append(nn.Linear(self.num_edges, self.hidden_channels))
+        self.lin_layers.append(nn.Linear(self.num_edge_features, self.hidden_channels))
         for _ in range(1, self.num_layers):
             self.lin_layers.append(nn.Linear(self.hidden_channels, self.hidden_channels))
         
@@ -76,10 +69,10 @@ class Edge_Encoder_MLP(nn.Module):
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels, self.condition_dim)  # To encode history to c
         self.future_decoder = nn.Linear(self.hidden_channels + self.condition_dim + self.time_embedding_dim,
-                                        self.num_edges)  # To predict future edges
-        self.adjust_to_class_shape = nn.Conv1d(in_channels=1, out_channels=self.num_classes, kernel_size=3, padding=1)
+                                        self.hidden_channels)  # To predict future edges
+        self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, t=None, edge_attr=None, condition=None, mode=None):
+    def forward(self, x, t=None, condition=None, mode=None):
         """
         Forward pass through the model
         Args:
@@ -89,40 +82,29 @@ class Edge_Encoder_MLP(nn.Module):
         
         # GNN forward pass
         
-        # Edge Embedding
-        edge_attr = edge_attr.float()
-        if edge_attr.dim() > 2:
-            edge_attr = edge_attr.squeeze(2)
-            if edge_attr.dim() > 2:
-                edge_attr = edge_attr.squeeze(2)
-        
-        x = edge_attr   # (bs, hidden_dim)
+        # Edge Embedding        
         for layer in self.lin_layers:
             x = F.relu(layer(x))
 
         if mode == 'history':
-            c = self.history_encoder(x) # (bs, condition_dim)
+            c = self.history_encoder(x) # (bs, num_edges, condition_dim)
             return c
         
         elif mode == 'future':
             # Time embedding
-            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time)
+            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
             t_emb = self.time_linear0(t_emb)
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
             t_emb = F.silu(t_emb)   # (bs, time_embedding_dim)
+            t_emb = t_emb.unsqueeze(1).repeat(1, x.size(1), 1) # (bs, num_edges, time_embedding_dim)
             
             #Concatenation
-            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding
-            x = torch.cat((x, condition), dim=1) # Concatenate with condition c
-            # x has shape (bs, hidden_channels + time_embedding_dim + condition_dim)
+            x = torch.cat((x, t_emb), dim=2) # Concatenate with time embedding
+            x = torch.cat((x, condition), dim=2) # Concatenate with condition c, (bs, num_edges, hidden_channels + condition_dim + time_embedding_dim)
             
-            logits = F.relu(self.future_decoder(x)) # (bs, num_edges)
-            logits = logits.unsqueeze(1) # (bs, 1, num_edges)
-            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
-            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
-            # Unsqueeze to get the final shape 
-            logits = logits.unsqueeze(2)    # (bs, num_edges, 1, num_classes=2)
+            logits = self.future_decoder(x) # (bs, num_edges, hidden_channels)
+            logits = self.adjust_to_class_shape(logits) # (bs, num_edges, num_classes=2)
 
             return logits
         

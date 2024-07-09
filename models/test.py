@@ -1,8 +1,10 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchmetrics import F1Score
+from torch_geometric.utils import from_networkx
 #from dataset.trajctory_dataset import TrajectoryDataset, collate_fn
 #from .d3pm_diffusion import make_diffusion
 #from .d3pm_edge_encoder import Edge_Encoder
@@ -12,22 +14,13 @@ import logging
 import os
 import time
 import wandb
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchmetrics import F1Score
-import yaml
-from tqdm import tqdm
-import logging
-import os
-import time
-import wandb
+import networkx as nx
+from torch_geometric.data import Data
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 class Graph_Diffusion_Model(nn.Module):
-    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model, nodes, edges):
+    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model):
         super(Graph_Diffusion_Model, self).__init__()
         
         # Data
@@ -37,13 +30,11 @@ class Graph_Diffusion_Model(nn.Module):
         self.history_len = self.data_config['history_len']
         self.future_len = self.data_config['future_len']
         self.num_classes = self.data_config['num_classes']
-        self.nodes = nodes
-        self.edges = edges
         self.edge_features = self.data_config['edge_features']
-        self.num_edge_features = len(self.edge_features)
         
         # Diffusion
         self.diffusion_config = diffusion_config
+        self.num_timesteps = self.diffusion_config['num_timesteps']
         
         # Model
         self.model_config = model_config
@@ -52,7 +43,6 @@ class Graph_Diffusion_Model(nn.Module):
         self.time_embedding_dim = self.model_config['time_embedding_dim']
         self.condition_dim = self.model_config['condition_dim']
         self.num_layers = self.model_config['num_layers']
-        self.class_weights = self.model_config['class_weights']
         
         # Training
         self.train_config = train_config
@@ -68,6 +58,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.test_config = test_config
         self.test_batch_size = self.test_config['batch_size']
         self.model_path = self.test_config['model_path']
+        self.eval_every_steps = self.test_config['eval_every_steps']
         
         # WandB
         self.wandb_config = wandb_config
@@ -99,11 +90,18 @@ class Graph_Diffusion_Model(nn.Module):
         
         self.log_loss_every_steps = self.train_config['log_loss_every_steps']        
         
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         # Build Components
         self._build_train_dataloader()
         self._build_test_dataloader()
         self._build_model()
         self._build_optimizer()
+        
+        # Move model to GPU
+        
+        self.model.to(self.device, non_blocking=True)
+        print("device", self.device)
         
     def train(self):
         """
@@ -114,16 +112,18 @@ class Graph_Diffusion_Model(nn.Module):
         Returns:
             None
         """
-        
-        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len)
-        def model_fn(x, edge_index, t, edge_attr, condition=None):
+        torch.autograd.set_detect_anomaly(True)
+        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, device=self.device)
+        def model_fn(x, edge_index, t, condition=None):
             if self.model_config['name'] == 'edge_encoder':
-                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+                return self.model.forward(x, edge_index, t, condition, mode='future')
             elif self.model_config['name'] == 'edge_encoder_residual':
-                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
+                return self.model.forward(x, edge_index, t, condition, mode='future')
             elif self.model_config['name'] == 'edge_encoder_mlp':
-                return self.model.forward(t=t, edge_attr=edge_attr, condition=condition, mode='future')
-                
+                return self.model.forward(x, t=t, condition=condition, mode='future')
+        
+        # Move linegraph to GPU
+        #self.line_graph.to(self.device)
         for epoch in tqdm(range(self.num_epochs)):
             current_lr = self.scheduler.get_last_lr()[0]
             wandb.log({"epoch": epoch, "learning_rate": current_lr})
@@ -131,42 +131,58 @@ class Graph_Diffusion_Model(nn.Module):
             total_loss = 0
             ground_truth_fut = []
             pred_fut = []
+            #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+            #    with record_function("model_training"):
             if self.gradient_accumulation:
                 for data in self.train_data_loader:
                     history_edge_features = data["history_edge_features"]
-                    future_edge_indices_one_hot = data['future_one_hot_edges']
+                    # future_edge_features = data["future_edge_features"]
+                    future_edge_indices_one_hot = data["future_edge_features"][:, :, 0]
                     # Check if any entry in future_edge_indices_one_hot is not 0 or 1
-                    if not torch.all((future_edge_indices_one_hot == 0) | (future_edge_indices_one_hot == 1)):
-                        continue  # Skip this datapoint if the condition is not met
-                    
-                    node_features = self.node_features
-                    edge_index = self.edge_tensor
+                    '''if not torch.all((future_edge_indices_one_hot == 0) | (future_edge_indices_one_hot == 1)):
+                        continue  # Skip this datapoint if the condition is not met'''
                     
                     self.optimizer.zero_grad()
                     for i in range(min(self.gradient_accumulation_steps, history_edge_features.size(0))):
                         # Calculate history condition c
+                        #print("Linegraph edge index device before", self.line_graph.edge_index.device)
+                        # TODO: Look to precompute line_graph.x before the loop
+                        #self.line_graph.x = history_edge_features[i].unsqueeze(0)   # unsqueeze to be able to handle different batch sizes when using Edge Encoders that do not rely on GAT layers
+                        # self.line_graph.x = self.line_graph.x
+                        #print("Linegraph device after", self.line_graph.device)
+                        #print("Linegraph x device", self.line_graph.x.device)
                         if self.model_config['name'] == 'edge_encoder':
-                            c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features[i].unsqueeze(0), mode='history')
+                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, mode='history')
                         elif self.model_config['name'] == 'edge_encoder_residual':
-                            c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features[i].unsqueeze(0), mode='history')
+                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, mode='history')
                         elif self.model_config['name'] == 'edge_encoder_mlp':
-                            c = self.model.forward(edge_attr=history_edge_features[i].unsqueeze(0), mode='history')
+                            #c = self.model.forward(x=self.line_graph.x, mode='history')
+                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), mode='history')
+                        else:
+                            raise NotImplementedError(self.model_config['name'])
                         
-                        x_start = future_edge_indices_one_hot[i].unsqueeze(0)   # (batch_size, num_edges)
+                        x_start = future_edge_indices_one_hot[i].unsqueeze(0)   # (1, num_edges)
                         # Get loss and predictions
-                        loss, preds = dif.training_losses(model_fn, node_features, edge_index, data, c, x_start=x_start)   # preds are of shape (num_edges,)
-                        
-                        ground_truth_fut.append(x_start)
-                        pred_fut.append(preds)
+                        loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, line_graph=None)   # preds are of shape (num_edges,)
                         
                         total_loss += loss / self.gradient_accumulation_steps
                         (loss / self.gradient_accumulation_steps).backward() # Gradient accumulation
+                        
+                        ground_truth_fut.append(x_start.detach().to('cpu'))
+                        pred_fut.append(preds.detach().to('cpu'))
+                        
+                    
                     self.optimizer.step()
+                    #print("Time taken for batch to complete:", stop_time_batch - start_time_batch, "seconds")
+                    #print(torch.cuda.memory_summary(device=self.device, abbreviated=True))
                     
             else:
-                for data in self.train_data_loader:
+                for i, data in enumerate(self.train_data_loader):
+                    #print("Batch:", i, "of", len(self.train_data_loader))
+                    # data = {k: v.to(self.device, non_blocking=True) for k, v in data.items() if type(v) == torch.Tensor}
                     history_edge_features = data["history_edge_features"]
-                    future_edge_indices_one_hot = data['future_one_hot_edges']
+                    future_edge_features = data["future_edge_features"]
+                    future_edge_indices_one_hot = future_edge_features[:, :, 0]
                     # Check if any entry in future_edge_indices_one_hot is not 0 or 1
                     if not torch.all((future_edge_indices_one_hot == 0) | (future_edge_indices_one_hot == 1)):
                         continue
@@ -174,52 +190,81 @@ class Graph_Diffusion_Model(nn.Module):
                     batch_size = future_edge_indices_one_hot.size(0)
                     if self.model_config['name'] == 'edge_encoder_mlp':
                         if batch_size == self.batch_size:
-                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(self.batch_size, self.num_edges, 1)
+                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(self.batch_size, self.num_edges)
                         else:
-                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(batch_size, self.num_edges, 1)
-                            
-                    node_features = self.node_features
-                    edge_index = self.edge_tensor
+                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(batch_size, self.num_edges)
                     
                     self.optimizer.zero_grad()
                     # Calculate history condition c
+                    # self.line_graph.x = history_edge_features
+                    # self.line_graph.x = self.line_graph.x
                     if self.model_config['name'] == 'edge_encoder':
-                        c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+                        c = self.model.forward(x=history_edge_features, edge_index=self.edge_index, mode='history')
                     elif self.model_config['name'] == 'edge_encoder_residual':
-                        c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
+                        c = self.model.forward(x=history_edge_features, edge_index=self.edge_index, mode='history')
                     elif self.model_config['name'] == 'edge_encoder_mlp':
-                        c = self.model.forward(edge_attr=history_edge_features, mode='history')
+                        c = self.model.forward(x=history_edge_features, mode='history')
+                    else:
+                        raise NotImplementedError(self.model_config['name'])
                     
                     x_start = future_edge_indices_one_hot
                     # Get loss and predictions
-                    loss, preds = dif.training_losses(model_fn, node_features, edge_index, data, c, x_start=x_start)
+                    loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=history_edge_features, edge_index=self.edge_index, line_graph=None)
                     
-                    x_start = x_start.squeeze(-1)   # (bs, num_edges, 1) -> (bs, num_edges)
-                    ground_truth_fut.append(x_start)
-                    pred_fut.append(preds)
+                    #x_start = x_start.squeeze(-1)   # (bs, num_edges, 1) -> (bs, num_edges)
                     
                     total_loss += loss
                     loss.backward()
+                    
                     self.optimizer.step()
-            
+                    #print("Time taken for batch to complete:", stop_time_batch - start_time_batch, "seconds")
+                    # print(torch.cuda.memory_summary(device=self.device, abbreviated=True))
+                    
+                    ground_truth_fut.append(x_start.detach().to('cpu'))
+                    pred_fut.append(preds.detach().to('cpu'))
+            start_time = time.time()
             self.scheduler.step()
-            
+            stop_time = time.time()
+            #print("Time taken for scheduler step to complete:", stop_time - start_time, "seconds")
+                    
+            #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+            start_time = time.time()
             avg_loss = total_loss / len(self.train_data_loader)
+            stop_time = time.time()
+            #print("Time taken for avg_loss calculation to complete:", stop_time - start_time, "seconds")
+            start_time = time.time()
             f1_score = F1Score(task='binary', average='macro', num_classes=2)
-            f1_epoch = f1_score(torch.flatten(torch.cat(pred_fut)).detach(), torch.flatten(torch.cat(ground_truth_fut)).detach())
-            # Logging
+            f1_epoch = f1_score(torch.flatten(torch.cat(pred_fut)).detach().to('cpu'), torch.flatten(torch.cat(ground_truth_fut)).detach().to('cpu'))
+            stop_time = time.time()
+            #print("Time taken for f1 score to complete:", stop_time - start_time, "seconds")
+            start_time = time.time()
             if epoch % self.log_loss_every_steps == 0:
                 wandb.log({"epoch": epoch, "average_loss": avg_loss.item()})
                 wandb.log({"epoch": epoch, "average_F1_score": f1_epoch.item()})
                 self.log.info(f"Epoch {epoch} Average Loss: {avg_loss.item()}")
-                print("Epoch:", epoch)
+                print("Epoch:", epoch+1)
                 print("Loss:", avg_loss.item())
                 print("F1:", f1_epoch.item())
+            stop_time = time.time()
+            # print("Time taken for logging to complete:", stop_time - start_time, "seconds")
+                
+            if (epoch + 1) % self.eval_every_steps == 0:
+                print("Evaluating on test set...")
+                sample_list, ground_truth_hist, ground_truth_fut = self.get_samples(task='predict')
+                fut_ratio, f1, avg_sample_length = self.eval(sample_list, ground_truth_hist, ground_truth_fut)
+                print("Samples", sample_list)
+                print("Ground truth", ground_truth_fut)
+                #print("Test F1 Score", f1.item())
+                #print("Average sample length", avg_sample_length)
+                #print("Test Future ratio", fut_ratio)
+                wandb.log({"Test F1 Score": f1.item()})
+                wandb.log({"Test Future ratio": fut_ratio})
+                wandb.log({"Average test sample length": avg_sample_length})
                         
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
             
-    def get_samples(self, load_model=False, model_path=None, task='predict', number_samples=1):
+    def get_samples(self, load_model=False, model_path=None, task='predict', number_samples=1, save=False):
         """
         Retrieves samples from the model.
 
@@ -243,34 +288,35 @@ class Graph_Diffusion_Model(nn.Module):
         if self.test_config['number_samples'] is not None:
             number_samples = self.test_config['number_samples']
         
-        def model_fn(x, edge_index, t, edge_attr, condition=None):
-            if self.model_config['name'] == 'edge_encoder':
-                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
-            elif self.model_config['name'] == 'edge_encoder_residual':
-                return self.model.forward(x, edge_index, t, edge_attr, condition, mode='future')
-            elif self.model_config['name'] == 'edge_encoder_mlp':
-                return self.model.forward(t=t, edge_attr=edge_attr, condition=condition, mode='future')
+        def model_fn(x, edge_index, t, condition=None):
+            with torch.no_grad():
+                if self.model_config['name'] == 'edge_encoder':
+                    return self.model.forward(x, edge_index, t, condition, mode='future')
+                elif self.model_config['name'] == 'edge_encoder_residual':
+                    return self.model.forward(x, edge_index, t, condition, mode='future')
+                elif self.model_config['name'] == 'edge_encoder_mlp':
+                    return self.model.forward(x=x, t=t, condition=condition, mode='future')
         
         sample_list = []
         ground_truth_hist = []
         ground_truth_fut = []
         
         if task == 'predict':
-            for data in tqdm(self.test_data_loader):
+            for data in tqdm(self.val_dataloader):
                 history_edge_features = data["history_edge_features"]
 
                 history_edge_indices = data["history_indices"]
 
                 future_trajectory_indices = data["future_indices"]
-                node_features = self.node_features
-                edge_index = self.edge_tensor
                 # Get condition
-                if self.model_config['name'] == 'edge_encoder':
-                    c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
-                elif self.model_config['name'] == 'edge_encoder_residual':
-                    c = self.model.forward(x=node_features, edge_index=edge_index, edge_attr=history_edge_features, mode='history')
-                elif self.model_config['name'] == 'edge_encoder_mlp':
-                    c = self.model.forward(edge_attr=history_edge_features, mode='history')
+                # self.line_graph.x = history_edge_features
+                with torch.no_grad():
+                    if self.model_config['name'] == 'edge_encoder':
+                        c = self.model.forward(x=history_edge_features, edge_index=self.edge_index, mode='history')
+                    elif self.model_config['name'] == 'edge_encoder_residual':
+                        c = self.model.forward(x=history_edge_features, edge_index=self.edge_index, mode='history')
+                    elif self.model_config['name'] == 'edge_encoder_mlp':
+                        c = self.model.forward(x=history_edge_features, mode='history')
                 
                 if number_samples > 1:
                     new_seed = torch.seed() + torch.randint(0, 100000, (1,)).item()
@@ -278,36 +324,43 @@ class Graph_Diffusion_Model(nn.Module):
                     sample_sublist = []
                     for _ in range(number_samples):
                         samples = make_diffusion(self.diffusion_config, self.model_config, 
-                                                num_edges=self.num_edges).p_sample_loop(model_fn=model_fn,
-                                                                                        shape=(self.test_batch_size, self.num_edges, 1), # before: (self.test_batch_size, self.future_len, 1)
-                                                                                        node_features=node_features,
-                                                                                        edge_index=edge_index,
-                                                                                        edge_attr=history_edge_features,
+                                                num_edges=self.num_edges, future_len=self.future_len).p_sample_loop(model_fn=model_fn,
+                                                                                        shape=(self.test_batch_size, self.num_edges),
+                                                                                        edge_features=history_edge_features,
+                                                                                        edge_index=self.edge_index,
+                                                                                        line_graph=None,
                                                                                         condition=c)
                         samples = torch.where(samples == 1)[1]
-                        sample_sublist.append(samples)
+                        sample_sublist.append(samples.detach().to('cpu'))
                     sample_list.append(sample_sublist)
                 elif number_samples == 1:
                     samples = make_diffusion(self.diffusion_config, self.model_config, 
-                                            num_edges=self.num_edges).p_sample_loop(model_fn=model_fn,
-                                                                                    shape=(self.test_batch_size, self.num_edges, 1), # before: (self.test_batch_size, self.future_len, 1)
-                                                                                    node_features=node_features,
-                                                                                    edge_index=edge_index,
-                                                                                    edge_attr=history_edge_features,
+                                            num_edges=self.num_edges, future_len=self.future_len, device=self.device).p_sample_loop(model_fn=model_fn,
+                                                                                    shape=(self.test_batch_size, self.num_edges), 
+                                                                                    edge_features=history_edge_features,
+                                                                                    edge_index=self.edge_index,
+                                                                                    line_graph=None,
                                                                                     condition=c)
                     samples = torch.where(samples == 1)[1]
-                    sample_list.append(samples)
+                    sample_list.append(samples.detach().to('cpu'))
                 else:
                     raise ValueError("Number of samples must be greater than 0.")
-                ground_truth_hist.append(history_edge_indices)
-                ground_truth_fut.append(future_trajectory_indices)
+                ground_truth_hist.append(history_edge_indices.detach().to('cpu'))
+                ground_truth_fut.append(future_trajectory_indices.detach().to('cpu'))
             
             if number_samples == 1:
                 fut_ratio, f1, avg_sample_length = self.eval(sample_list, ground_truth_hist, ground_truth_fut)
                 wandb.log({"F1 Score": f1.item()})
                 wandb.log({"Future ratio": fut_ratio})
                 wandb.log({"Average sample length": avg_sample_length})
-            return sample_list, ground_truth_hist, ground_truth_fut
+                
+            if save:
+                torch.save(sample_list, os.path.join(self.model_dir, f'{self.exp_name}_samples.pth'))
+                torch.save(ground_truth_hist, os.path.join(self.model_dir, f'{self.exp_name}_ground_truth_hist.pth'))
+                torch.save(ground_truth_fut, os.path.join(self.model_dir, f'{self.exp_name}_ground_truth_fut.pth'))
+                print(f"Samples saved at {os.path.join(self.model_dir, f'{self.exp_name}_samples.pth')}!")
+            else:
+                return sample_list, ground_truth_hist, ground_truth_fut
         
         elif task == 'generate':
             # Generate realistic trajectories without condition
@@ -327,8 +380,6 @@ class Graph_Diffusion_Model(nn.Module):
         :param ground_truth_fut: A list of actual future edge indices.
         """
         import matplotlib.pyplot as plt
-        import networkx as nx
-        import numpy as np
 
         samples, ground_truth_hist, ground_truth_fut = self.get_samples(load_model=True, model_path=self.test_config['model_path'], number_samples=number_samples)
         save_dir = f'{os.path.join(self.model_dir, f'{self.exp_name}', 'plots')}'
@@ -388,9 +439,7 @@ class Graph_Diffusion_Model(nn.Module):
         :param number_plots: Number of samples to visualize.
         """
         import matplotlib.pyplot as plt
-        import networkx as nx
         
-        samples, ground_truth_hist, ground_truth_fut = self.get_samples(load_model=True, model_path=self.test_config['model_path'])
         save_dir = f'{os.path.join(self.model_dir, f'{self.exp_name}', 'plots')}'
         os.makedirs(save_dir, exist_ok=True)
         
@@ -477,11 +526,11 @@ class Graph_Diffusion_Model(nn.Module):
             for i, one_hot_sample in enumerate(one_hot_samples):
                 for edge_index, edge in enumerate(self.edges):
                     if edge_index in sample_list[i]:
-                        one_hot_sample[self.edges.index(edge)] = 1
+                        one_hot_sample[edge_index] = 1
             for i, one_hot_fut in enumerate(one_hot_futures):
                 for edge_index, edge in enumerate(self.edges):
                     if edge_index in ground_truth_fut[i]:
-                        one_hot_fut[self.edges.index(edge)] = 1
+                        one_hot_fut[edge_index] = 1
             metric = F1Score(task='binary', average='macro', num_classes=2)
             f1 = metric(torch.cat(one_hot_samples), torch.cat(one_hot_futures))
 
@@ -507,13 +556,14 @@ class Graph_Diffusion_Model(nn.Module):
     
     def save_model(self):
         save_path = os.path.join(self.model_dir, 
-                                 self.exp_name+
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}_layers_{self.num_layers}_weights_{self.class_weights[0]}.pth')
+                                 self.exp_name + '_' + self.model_config['name'] + '_' +  self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}_layers_{self.num_layers}.pth')
         torch.save(self.model.state_dict(), save_path)
         self.log.info(f"Model saved at {save_path}!")
+        print(f"Model saved at {save_path}")
         
     def load_model(self, model_path):
-        self.model.load_state_dict(torch.load(model_path))
+        self.model.load_state_dict(torch.load(model_path, map_location=torch.device(self.device)))
         self.log.info("Model loaded!")
     
     def _build_optimizer(self):
@@ -535,117 +585,190 @@ class Graph_Diffusion_Model(nn.Module):
                 print(name)"""
         
     def _build_train_dataloader(self):
-        self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.nodes, self.edges, self.future_len, self.edge_features)
-        self.node_features = self.train_dataset.node_coordinates()
-        self.edge_tensor = self.train_dataset.get_all_edges_tensor()
-        # self.trajectory_edge_tensor = self.train_dataset.get_trajectory_edges_tensor(0)
-        self.num_edges = self.train_dataset.get_n_edges()
-        self.train_data_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=collate_fn)
+        print("Loading Training Dataset...")
+        self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        #self.train_dataset.to(self.device)
+        from pympler import asizeof
+        print(f"Total size of dataset in memory: {asizeof.asizeof(self.train_dataset)} bytes")
+        self.G = self.train_dataset.build_graph()
+        self.nodes = self.G.nodes
+        self.edges = self.G.edges(data=True)
+        self.num_edges = self.G.number_of_edges()
+        self.indexed_edges = self.train_dataset.edges
+        self.num_edge_features = self.train_dataset.num_edge_features
+        
+        # Build the line graph and corresponding edge index
+        self.edge_index = self._build_edge_index()
+        print("Edge index device", self.edge_index.device)
+        # self.line_graph = Data(edge_index=edge_index).to(self.device, non_blocking=True)
+        def calculate_tensor_size(edge_index):
+            # Number of elements is product of dimensions of the tensor
+            num_elements = edge_index.nelement()
+            # Each element in a torch.long tensor is 8 bytes
+            size_per_element = edge_index.element_size()
+            # Total size in bytes
+            total_size_in_bytes = num_elements * size_per_element
+            return total_size_in_bytes
+        
+        print("Size of edge_index in bytes:", calculate_tensor_size(self.edge_index))
+        
+        self.train_data_loader = DataLoader(self.train_dataset, 
+                                            batch_size=self.batch_size, 
+                                            shuffle=True, 
+                                            collate_fn=collate_fn, 
+                                            num_workers=0,
+                                            pin_memory=False)
+        
+        profile_dataloader(self.train_data_loader)
                 
-        print("> Training Dataset loaded!")
+        print("> Training Dataset loaded!\n")
+        
+    def _build_edge_index(self):
+        print("Building edge index for line graph...")
+        edge_index = torch.tensor([[e[0], e[1]] for e in self.edges], dtype=torch.long).t().contiguous()
+        edge_to_index = {tuple(e[:2]): e[2]['index'] for e in self.edges}
+        line_graph_edges = []
+        edge_list = edge_index.t().tolist()
+        for i, (u1, v1) in tqdm(enumerate(edge_list), total=len(edge_list), desc="Processing edges"):
+            for j, (u2, v2) in enumerate(edge_list):
+                if i != j and (u1 == u2 or u1 == v2 or v1 == u2 or v1 == v2):
+                    line_graph_edges.append((edge_to_index[(u1, v1)], edge_to_index[(u2, v2)]))
+
+        # Create the edge index for the line graph
+        edge_index = torch.tensor(line_graph_edges, dtype=torch.long).t().contiguous()
+        print("> Edge index built!\n")
+        
+        return edge_index.to(self.device, non_blocking=True)
     
     def _build_test_dataloader(self):
-        self.test_dataset = TrajectoryDataset(self.test_data_path, self.history_len, self.nodes, self.edges, self.future_len, self.edge_features)
-        self.test_data_loader = DataLoader(self.test_dataset, batch_size=self.test_batch_size, shuffle=False, collate_fn=collate_fn)
-        print("> Test Dataset loaded!")
+        self.val_dataset = TrajectoryDataset(self.test_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.test_batch_size, shuffle=False, collate_fn=collate_fn)
+        print("> Val Dataset loaded!")
         
     def _build_model(self):
         self.model = self.model(self.model_config, self.history_len, self.future_len, self.num_classes,
-                                nodes=self.nodes, edges=self.edges, node_features=self.node_features,
-                                num_edges=self.num_edges, hidden_channels=self.hidden_channels, num_edge_features=self.num_edge_features)
+                                num_edges=self.num_edges, hidden_channels=self.hidden_channels, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps)
         print("> Model built!")
         
+            
 import torch
 from torch.utils.data import DataLoader, Dataset
 import h5py
 import networkx as nx
 import numpy as np
+import time
 
-def load_new_format(new_file_path):
-    paths = []
-    from tqdm import tqdm
-
-    with h5py.File(new_file_path, 'r') as new_hf:
-        node_coordinates = new_hf['graph']['node_coordinates'][:]
-        edges = new_hf['graph']['edges'][:]
-        edge_coordinates = node_coordinates[edges]
-        nodes = [(i, {'pos': tuple(pos)}) for i, pos in enumerate(node_coordinates)]
-        
-        
-        # Convert edges to a list of tuples
-        edges = [tuple(edge) for edge in edges]
-
-        for i in tqdm(new_hf['trajectories'].keys()):
-            path_group = new_hf['trajectories'][i]
-            path = {attr: path_group[attr][()] for attr in path_group.keys()}
-            if 'edge_orientation' in path:
-                path['edge_orientations'] = path.pop('edge_orientation')
-            paths.append(path)
-
-    return paths, nodes, edges, edge_coordinates
+# Measure the time to load a few batches
+def profile_dataloader(dataloader, num_batches=100):
+    start_time = time.time()
+    for i, data in enumerate(dataloader):
+        if i >= num_batches:
+            break
+    elapsed_time = time.time() - start_time
+    print(f"Time to process {num_batches} batches: {elapsed_time} seconds")
 
 class TrajectoryDataset(Dataset):
-    def __init__(self, file_path, history_len, nodes, edges, future_len, edge_features=None):
+    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None):
         self.file_path = file_path
         self.history_len = history_len
         self.future_len = future_len
         self.edge_features = edge_features
-        # self.trajectories = h5py.File(file_path, 'r')
-        self.trajectories, self.nodes, self.edges, self.edge_coordinates = load_new_format(file_path)
+        self.device = device
+        self.num_edge_features = 1
+        if 'coordinates' in self.edge_features:
+            self.num_edge_features = 5
+        if 'edge_orientations' in self.edge_features:
+            self.num_edge_features = 6
+        self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
+        '''for key in self.trajectories[0].keys():
+            print(key, type(self.trajectories[0][key]))'''
         
-        '''self.nodes = nodes
-        self.edges = edges'''
-        self.graph = nx.Graph()
-        self.graph.add_nodes_from(self.nodes)
-        self.graph.add_edges_from(self.edges)
+        self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
+        
+    @staticmethod
+    def load_new_format(file_path, device):
+        paths = []
+        with h5py.File(file_path, 'r') as new_hf:
+            node_coordinates = torch.tensor(new_hf['graph']['node_coordinates'][:], dtype=torch.float, device=device)
+            # Normalize the coordinates to (0, 1) if any of the coordinates is larger than 1
+            if node_coordinates.max() > 1:
+                max_values = node_coordinates.max(0)[0]
+                min_values = node_coordinates.min(0)[0]
+                node_coordinates[:, 0] = (node_coordinates[:, 0] - min_values[0]) / (max_values[0] - min_values[0])
+                node_coordinates[:, 1] = (node_coordinates[:, 1] - min_values[1]) / (max_values[1] - min_values[1])
+            #edges = torch.tensor(new_hf['graph']['edges'][:], dtype=torch.long, device=device)
+            edges = new_hf['graph']['edges'][:]
+            edge_coordinates = node_coordinates[edges]
+            nodes = [(i, {'pos': torch.tensor(pos, device=device)}) for i, pos in enumerate(node_coordinates)]
+            #edges = [(torch.tensor(edge[0], device=device), torch.tensor(edge[1], device=device)) for edge in edges]
+            edges = [tuple(edge) for edge in edges]
+
+            '''nodes = [(i, {'pos': tuple(pos)}) for i, pos in enumerate(node_coordinates)]
+            edges = [tuple(edge) for edge in edges]'''
+
+            for i in tqdm(new_hf['trajectories'].keys()):
+                path_group = new_hf['trajectories'][i]
+                path = {attr: torch.tensor(path_group[attr][()], device=device) for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
+                # path = {attr: path_group[attr][()] for attr in path_group.keys()}
+                paths.append(path)
+            
+        return paths, nodes, edges, edge_coordinates
+    
+    # @staticmethod
+    def build_graph(self):
+        graph = nx.Graph()
+        graph.add_nodes_from(self.nodes)
+        indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
+        for (start, end), index in indexed_edges:
+            graph.add_edge(start, end, index=index, default_orientation=(start, end))
+        return graph
+    
+    def to(self, device):
+        """Move all tensor components of the dataset to the specified device."""
+        for attr in dir(self):
+            item = getattr(self, attr)
+            if torch.is_tensor(item):
+                setattr(self, attr, item.to(device))
 
     def __getitem__(self, idx):
-        # trajectory_name = self.keys[idx]
         trajectory = self.trajectories[idx]
-        edge_idxs = torch.tensor(trajectory['edge_idxs'][:], dtype=torch.long)
-        edge_orientations = torch.tensor(trajectory['edge_orientations'][:], dtype=torch.long)
-        
-        # edge_coordinates_data = trajectory.get('coordinates', [])
-        edge_coordinates_data = self.edge_coordinates[edge_idxs]
-
-        if len(edge_coordinates_data) > 0:
-            edge_coordinates_np = np.array(edge_coordinates_data)
-            edge_coordinates = torch.tensor(edge_coordinates_np, dtype=torch.float64)
-        else:
-            edge_coordinates = torch.tensor([], dtype=torch.float64)
-
+        # edge_idxs = torch.tensor(trajectory['edge_idxs'][:], dtype=torch.long)
+        # edge_orientations = torch.tensor(trajectory['edge_orientations'][:], dtype=torch.long)
+        edge_idxs = trajectory['edge_idxs']
+        if 'edge_orientations' in self.edge_features:
+            edge_orientations = trajectory['edge_orientations']
         # Reverse coordinates if orientation is -1
-        edge_coordinates[edge_orientations == -1] = edge_coordinates[edge_orientations == -1][:, [1, 0]]
-        
+        '''reverse_mask = edge_orientations == -1
+        self.edge_coordinates[reverse_mask] = self.edge_coordinates[reverse_mask].flip(dims=[1])'''
+
         # Calculate the required padding length
         total_len = self.history_len + self.future_len
         padding_length = max(total_len - len(edge_idxs), 0)
         
-        # Pad edge indices and orientations
+        # Pad edge indices, orientations, and coordinates
         edge_idxs = torch.nn.functional.pad(edge_idxs, (0, padding_length), value=-1)
-        edge_orientations = torch.nn.functional.pad(edge_orientations, (0, padding_length), value=0)
-        
-        # Pad coordinates
-        if padding_length > 0 and edge_coordinates.numel() > 0:
-            zero_padding = torch.zeros((padding_length, 2, 2), dtype=torch.float)
-            edge_coordinates = torch.cat([edge_coordinates, zero_padding], dim=0)
+        if 'edge_orientations' in self.edge_features:
+            edge_orientations = torch.nn.functional.pad(edge_orientations, (0, padding_length), value=0)
+        '''if padding_length > 0:
+            zero_padding = torch.zeros((padding_length, 2, 2), dtype=torch.float64)
+            edge_coordinates = torch.cat([edge_coordinates, zero_padding], dim=0)'''
         
         # Split into history and future
         history_indices = edge_idxs[:self.history_len]
         future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
-        history_coordinates = edge_coordinates[:self.history_len] if edge_coordinates.numel() > 0 else None
-        future_coordinates = edge_coordinates[self.history_len:self.history_len + self.future_len] if edge_coordinates.numel() > 0 else None
-        
-        history_edge_orientations = torch.zeros(self.get_n_edges())
-        future_edge_orientations = torch.zeros(self.get_n_edges())
 
-        for index, i in enumerate(history_indices):
-            history_edge_orientations[i] = edge_orientations[index]
-        
-        for index, i in enumerate(future_indices):
-            future_edge_orientations[i] = edge_orientations[index]
+        # Extract and generate features
+        history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
 
-        # One-hot encoding of edge indices (ensure valid indices first)
+        return {
+            "history_indices": history_indices,
+            "future_indices": future_indices,
+            "history_edge_features": history_edge_features,
+            "future_edge_features": future_edge_features,
+        }
+
+    def generate_edge_features(self, history_indices, future_indices, history_edge_orientations=None, future_edge_orientations=None):
+        # Binary on/off edges
         valid_history_mask = history_indices >= 0
         valid_future_mask = future_indices >= 0
         
@@ -655,109 +778,68 @@ class TrajectoryDataset(Dataset):
         # Sum across the time dimension to count occurrences of each edge
         history_one_hot_edges = history_one_hot_edges.sum(dim=0)  # (num_edges,)
         future_one_hot_edges = future_one_hot_edges.sum(dim=0)  # (num_edges,)
-
+        
+        # Basic History edge features = coordinates, binary encoding
+        history_edge_features = history_one_hot_edges.view(-1, 1).float()
+        future_edge_features = future_one_hot_edges.view(-1, 1).float()
+        if 'coordinates' in self.edge_features:
+            history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            future_edge_features = torch.cat((future_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            pass
         if 'edge_orientations' in self.edge_features:
-            history_edge_features = torch.stack((history_one_hot_edges, history_edge_orientations), dim=1)
-            future_edge_features = torch.stack((future_one_hot_edges, future_edge_orientations), dim=1)
-        else:
-            history_edge_features = history_one_hot_edges
-            future_edge_features = future_one_hot_edges
-        
-        # Generate the tensor indicating nodes in history
-        node_in_history = torch.zeros((len(self.nodes), 1), dtype=torch.float)
-        history_edges = [self.edges[i] for i in history_indices if i >= 0]
-        history_nodes = set(node for edge in history_edges for node in edge)
-        for node in history_nodes:
-            node_in_history[node] = 1
-        
-        return {
-            "history_indices": history_indices,
-            "future_indices": future_indices,
-            "history_coordinates": history_coordinates,
-            "future_coordinates": future_coordinates,
-            "history_one_hot_edges": history_one_hot_edges,
-            "future_one_hot_edges": future_one_hot_edges,
-            "history_edge_orientations": history_edge_orientations,
-            "future_edge_orientations": future_edge_orientations,
-            "history_edge_features": history_edge_features,
-            "future_edge_features": future_edge_features,
-            "node_in_history": node_in_history
-        }
+            history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
+            future_edge_features = torch.cat((future_edge_features, future_edge_orientations.float()), dim=1)
+        return history_edge_features, future_edge_features
         
     def __len__(self):
         return len(self.trajectories)
 
-    '''def __del__(self):
-        self.trajectories.close()'''
-
-    def get_n_edges(self):
-        return self.graph.number_of_edges()
+    '''def get_n_edges(self):
+        return self.graph.number_of_edges()'''
     
-    def node_coordinates(self):
+    '''def node_coordinates(self):
         """
         Returns a tensor of shape [#nodes, 2] containing the coordinates of each node.
         """
         coords = [attr['pos'] for _, attr in self.nodes]  # List of tuples (x, y)
         coords_tensor = torch.tensor(coords, dtype=torch.float)  # Convert list to tensor
-        return coords_tensor
+        return coords_tensor'''
     
-    def get_all_edges_tensor(self):
+    '''def get_all_edges_tensor(self):
         """
         Returns a tensor of shape [2, num_edges] where each column represents an edge
         and the two entries in each column represent the nodes connected by that edge.
         """
         edges = list(self.graph.edges())
         edge_tensor = torch.tensor(edges, dtype=torch.long).t()
-        return edge_tensor
+        return edge_tensor'''
 
 
 def collate_fn(batch):
-    # Extract elements for each sample and stack them, handling variable lengths
+    # graph = batch[0][1]
+    # Directly stack the necessary items
     history_indices = torch.stack([item['history_indices'] for item in batch])
     future_indices = torch.stack([item['future_indices'] for item in batch])
-    
-    history_one_hot_edges = torch.stack([item['history_one_hot_edges'] for item in batch])
-    future_one_hot_edges = torch.stack([item['future_one_hot_edges'] for item in batch])
-
-    # Coordinates
-    history_coordinates = [item['history_coordinates'] for item in batch if item['history_coordinates'] is not None]
-    future_coordinates = [item['future_coordinates'] for item in batch if item['future_coordinates'] is not None]
-    
-    history_edge_orientations = torch.stack([item['history_edge_orientations'] for item in batch])
-    future_edge_orientations = torch.stack([item['future_edge_orientations'] for item in batch])
-    
     history_edge_features = torch.stack([item['history_edge_features'] for item in batch])
     future_edge_features = torch.stack([item['future_edge_features'] for item in batch])
-    
-    history_one_hot_nodes = torch.stack([item['node_in_history'] for item in batch])
-    
-    # Stack coordinates if not empty
-    if history_coordinates:
-        history_coordinates = torch.stack(history_coordinates)
-    if future_coordinates:
-        future_coordinates = torch.stack(future_coordinates)
 
+    # Return a dictionary of tensors needed for the model
     return {
-            "history_indices": history_indices,
-            "future_indices": future_indices,
-            "history_coordinates": history_coordinates,
-            "future_coordinates": future_coordinates,
-            "history_one_hot_edges": history_one_hot_edges,
-            "future_one_hot_edges": future_one_hot_edges,
-            "history_edge_orientations": history_edge_orientations,
-            "future_edge_orientations": future_edge_orientations,
-            "history_edge_features": history_edge_features,
-            "future_edge_features": future_edge_features,
-            "history_one_hot_nodes": history_one_hot_nodes
-        }
+        "history_indices": history_indices,
+        "future_indices": future_indices,
+        "history_edge_features": history_edge_features,
+        "future_edge_features": future_edge_features,
+        # "graph": graph
+    }
     
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn.conv import GATv2Conv
 
 
-def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
+def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None):
     """
     Build sinusoidal embeddings (from Fairseq).
 
@@ -772,14 +854,15 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
     Returns:
         embedding vectors with shape `(len(timesteps), embedding_dim)`
     """
+    timesteps = timesteps.to(device)
     assert timesteps.dim() == 1  # Ensure timesteps is a 1D tensor
 
     # Scale timesteps by the maximum time
     timesteps = timesteps.float() * (1000. / max_time)
 
     half_dim = embedding_dim // 2
-    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=device) * -emb)
     emb = timesteps[:, None] * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
 
@@ -788,20 +871,15 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
         emb = torch.cat([emb, zero_pad], dim=1)
 
     assert emb.shape == (timesteps.shape[0], embedding_dim)
-    return emb
+    return emb.to(device)
 
 class Edge_Encoder(nn.Module):
-    def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
+    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, num_edge_features, num_timesteps):
         super(Edge_Encoder, self).__init__()
         # Config
         self.config = model_config
         
         # Data
-        self.nodes = nodes
-        self.num_nodes = len(nodes)
-        self.edges = edges
-        self.node_features = node_features
-        self.num_node_features = self.node_features.shape[1]
         self.num_edges = num_edges
         self.num_edge_features = num_edge_features
         self.history_len = history_len
@@ -812,7 +890,7 @@ class Edge_Encoder(nn.Module):
         self.model_output = self.config['model_output']
         
         # Time embedding
-        self.max_time = 1000.
+        self.max_time = num_timesteps
         self.time_embedding_dim = self.config['time_embedding_dim']
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
@@ -822,73 +900,68 @@ class Edge_Encoder(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_heads = self.config['num_heads']
         self.num_layers = self.config['num_layers']
-        self.conv1 = GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv2 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv3 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        '''self.convs = nn.ModuleList()
-        self.convs.append(GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
+        self.convs = nn.ModuleList()
+        self.convs.append(GATv2Conv(self.num_edge_features, self.hidden_channels, heads=self.num_heads))
         for _ in range(1, self.num_layers):
-            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
-        '''
+            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, heads=self.num_heads))
         
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
-        self.history_encoder = nn.Linear(self.hidden_channels*self.num_heads, self.condition_dim)  # To encode history to c
-        self.future_decoder = nn.Linear(self.hidden_channels, self.num_edges)  # To predict future edges
-        self.adjust_to_class_shape = nn.Conv1d(in_channels=self.num_nodes, out_channels=self.num_classes, kernel_size=1)
+        self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
+        self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
+                                        self.hidden_channels)
+        self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, x, edge_index, t=None, edge_attr=None, condition=None, mode=None):
+    def forward(self, x, edge_index, t=None, condition=None, mode=None):
         """
         Forward pass through the model
         Args:
-            x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices
+            x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices and edge features
             t: torch.Tensor: timestep tensor
         """    
         
         # GNN forward pass
-        
         # Edge Embedding
-        x = F.relu(self.conv1(x, edge_index, edge_attr.squeeze(0)))
-        x = F.relu(self.conv2(x, edge_index, edge_attr.squeeze(0)))
-        x = F.relu(self.conv3(x, edge_index, edge_attr.squeeze(0)))
-        '''for conv in self.convs:
-            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))'''
-        x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
-        
+        if x.dim() == 3:
+            x = x.squeeze(0)    # (bs, num_edges, num_edge_features) -> (num_edges, num_edge_features)
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index)) # (num_edges, hidden_channels)
+                    
         if mode == 'history':
-            c = self.history_encoder(x)
+            c = self.history_encoder(x) # (num_edges, condition_dim)
             
             return c
         
         elif mode == 'future':
             # Time embedding
-            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time)
+            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
             t_emb = self.time_linear0(t_emb)
-            # TODO: Delete first silu function!
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
             t_emb = F.silu(t_emb)
-            t_emb = t_emb.unsqueeze(1).repeat(1, self.num_nodes, 1)
+            t_emb = t_emb.repeat(self.num_edges, 1) # (num_edges, time_embedding_dim)
             
             #Concatenation
-            x = torch.cat((x, t_emb), dim=2) # Concatenate with time embedding
-            x = torch.cat((x, condition), dim=2) # Concatenate with condition c
-            x = F.relu(nn.Linear(x.size(2), self.hidden_channels)(x))
+            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding
+            x = torch.cat((x, condition), dim=1) # Concatenate with condition c
+            #print("x size", x.size())
             
-            logits = self.future_decoder(x) # (bs, num_nodes, num_edges)
-            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
-            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
-            # Unsqueeze to get the final shape 
-            logits = logits.unsqueeze(2)    # (batch_size, num_edges, 1, num_classes=2)
+            logits = self.future_decoder(x) # (num_edges, hidden_channels)
+            #print(self.future_decoder)
+            #print("Logits pre size", logits.size())
+            logits = self.adjust_to_class_shape(logits) # (num_edges, num_classes=2)
+            #print(self.adjust_to_class_shape)
+            #print("Logits post size", logits.size())
 
-            return logits
+            return logits.unsqueeze(0)  # (1, num_edges, num_classes=2)
+
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
+def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None):
     """
     Build sinusoidal embeddings (from Fairseq).
 
@@ -903,14 +976,15 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
     Returns:
         embedding vectors with shape `(len(timesteps), embedding_dim)`
     """
+    timesteps = timesteps.to(device)
     assert timesteps.dim() == 1  # Ensure timesteps is a 1D tensor
 
     # Scale timesteps by the maximum time
     timesteps = timesteps.float() * (1000. / max_time)
 
     half_dim = embedding_dim // 2
-    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=device) * -emb)
     emb = timesteps[:, None] * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
 
@@ -919,31 +993,23 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
         emb = torch.cat([emb, zero_pad], dim=1)
 
     assert emb.shape == (timesteps.shape[0], embedding_dim)
-    return emb
+    return emb.to(device)
 
 class Edge_Encoder_MLP(nn.Module):
-    def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
+    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, num_edge_features, num_timesteps):
         super(Edge_Encoder_MLP, self).__init__()
         # Config
         self.config = model_config
         
         # Data
-        self.nodes = nodes
-        self.num_nodes = len(nodes)
-        self.edges = edges
-        self.node_features = node_features
-        self.num_node_features = self.node_features.shape[1]
         self.num_edges = num_edges
         self.num_edge_features = num_edge_features
         self.history_len = history_len
         self.future_len = future_len
-        
-        
         self.num_classes = num_classes
-        self.model_output = self.config['model_output']
         
         # Time embedding
-        self.max_time = 1000.
+        self.max_time = num_timesteps
         self.time_embedding_dim = self.config['time_embedding_dim']
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
@@ -953,7 +1019,7 @@ class Edge_Encoder_MLP(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_layers = self.config['num_layers']
         self.lin_layers = nn.ModuleList()
-        self.lin_layers.append(nn.Linear(self.num_edges, self.hidden_channels))
+        self.lin_layers.append(nn.Linear(self.num_edge_features, self.hidden_channels))
         for _ in range(1, self.num_layers):
             self.lin_layers.append(nn.Linear(self.hidden_channels, self.hidden_channels))
         
@@ -961,10 +1027,10 @@ class Edge_Encoder_MLP(nn.Module):
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels, self.condition_dim)  # To encode history to c
         self.future_decoder = nn.Linear(self.hidden_channels + self.condition_dim + self.time_embedding_dim,
-                                        self.num_edges)  # To predict future edges
-        self.adjust_to_class_shape = nn.Conv1d(in_channels=1, out_channels=self.num_classes, kernel_size=3, padding=1)
+                                        self.hidden_channels)  # To predict future edges
+        self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, t=None, edge_attr=None, condition=None, mode=None):
+    def forward(self, x, t=None, condition=None, mode=None):
         """
         Forward pass through the model
         Args:
@@ -975,50 +1041,41 @@ class Edge_Encoder_MLP(nn.Module):
         # GNN forward pass
         
         # Edge Embedding
-        edge_attr = edge_attr.float()
-        if edge_attr.dim() > 2:
-            edge_attr = edge_attr.squeeze(2)
-            if edge_attr.dim() > 2:
-                edge_attr = edge_attr.squeeze(2)
-        
-        x = edge_attr   # (bs, hidden_dim)
         for layer in self.lin_layers:
             x = F.relu(layer(x))
 
         if mode == 'history':
-            c = self.history_encoder(x) # (bs, condition_dim)
+            c = self.history_encoder(x) # (bs, num_edges, condition_dim)
             return c
         
         elif mode == 'future':
             # Time embedding
-            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time)
+            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
             t_emb = self.time_linear0(t_emb)
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
             t_emb = F.silu(t_emb)   # (bs, time_embedding_dim)
+            t_emb = t_emb.unsqueeze(1).repeat(1, x.size(1), 1) # (bs, num_edges, time_embedding_dim)
+            #print("Time embedding size", t_emb.size())
             
             #Concatenation
-            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding
-            x = torch.cat((x, condition), dim=1) # Concatenate with condition c
-            # x has shape (bs, hidden_channels + time_embedding_dim + condition_dim)
+            x = torch.cat((x, t_emb), dim=2) # Concatenate with time embedding
+            x = torch.cat((x, condition), dim=2) # Concatenate with condition c, (bs, num_edges, hidden_channels + condition_dim + time_embedding_dim)
+            #print("Tensor size of x", x.size())
             
-            logits = F.relu(self.future_decoder(x)) # (bs, num_edges)
-            logits = logits.unsqueeze(1) # (bs, 1, num_edges)
-            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
-            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
-            # Unsqueeze to get the final shape 
-            logits = logits.unsqueeze(2)    # (bs, num_edges, 1, num_classes=2)
+            logits = self.future_decoder(x) # (bs, num_edges, hidden_channels)
+            #print("Tensor size of logits", logits.size())
+            logits = self.adjust_to_class_shape(logits) # (bs, num_edges, num_classes=2)
+            #print("Tensor size of logits", logits.size())
 
             return logits
-        
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn.conv import GATv2Conv
 
 
-def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
+def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None):
     """
     Build sinusoidal embeddings (from Fairseq).
 
@@ -1033,14 +1090,15 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
     Returns:
         embedding vectors with shape `(len(timesteps), embedding_dim)`
     """
+    timesteps = timesteps.to(device)
     assert timesteps.dim() == 1  # Ensure timesteps is a 1D tensor
 
     # Scale timesteps by the maximum time
     timesteps = timesteps.float() * (1000. / max_time)
 
     half_dim = embedding_dim // 2
-    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=device) * -emb)
     emb = timesteps[:, None] * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
 
@@ -1049,31 +1107,25 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
         emb = torch.cat([emb, zero_pad], dim=1)
 
     assert emb.shape == (timesteps.shape[0], embedding_dim)
-    return emb
+    return emb.to(device)
 
 class Edge_Encoder_Residual(nn.Module):
-    def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
+    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, num_edge_features, num_timesteps):
         super(Edge_Encoder_Residual, self).__init__()
         # Config
         self.config = model_config
         
         # Data
-        self.nodes = nodes
-        self.num_nodes = len(nodes)
-        self.edges = edges
-        self.node_features = node_features
-        self.num_node_features = self.node_features.shape[1]
         self.num_edges = num_edges
         self.num_edge_features = num_edge_features
         self.history_len = history_len
         self.future_len = future_len
         
-        
         self.num_classes = num_classes
         self.model_output = self.config['model_output']
         
         # Time embedding
-        self.max_time = 1000.
+        self.max_time = num_timesteps
         self.time_embedding_dim = self.config['time_embedding_dim']
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
@@ -1083,47 +1135,41 @@ class Edge_Encoder_Residual(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_heads = self.config['num_heads']
         self.num_layers = self.config['num_layers']
-        self.hidden_channels = hidden_channels
-        self.num_heads = self.config['num_heads']
-        self.num_layers = self.config['num_layers']
+        self.theta = self.config['theta']
         
         self.convs = nn.ModuleList()
-        self.convs.append(GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
+        self.convs.append(GATv2Conv(self.num_edge_features, self.hidden_channels, heads=self.num_heads))
+        self.res_layers = nn.ModuleList()
+        self.res_layers.append(nn.Linear(self.num_edge_features, self.hidden_channels * self.num_heads))
         for _ in range(1, self.num_layers):
-            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
-        
-        self.res_layer = nn.Linear(self.num_edges, self.hidden_channels * self.num_heads)
-        # self.res_layer = nn.Linear(self.num_node_features, self.hidden_channels * self.num_heads)
-
+            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, heads=self.num_heads, bias=False))
+            self.res_layers.append(nn.Linear(self.hidden_channels * self.num_heads, self.hidden_channels * self.num_heads))
 
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
-        self.history_encoder = nn.Linear(self.hidden_channels*self.num_heads, self.condition_dim)  # To encode history to c
-        self.future_decoder = nn.Linear(self.hidden_channels, self.num_edges)  # To predict future edges
-        self.adjust_to_class_shape = nn.Conv1d(in_channels=self.num_nodes, out_channels=self.num_classes, kernel_size=1)
+        self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
+        self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
+                                        self.hidden_channels)
+        self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, x, edge_index, t=None, edge_attr=None, condition=None, mode=None):
+    def forward(self, x, edge_index, t=None, condition=None, mode=None):
         """
         Forward pass through the model
         Args:
-            x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices
+            x: torch.Tensor: input tensor: edge attributes, including binary encoding fo edges present/absent in trajectory
             t: torch.Tensor: timestep tensor
         """    
         
         # GNN forward pass
-        
         # Edge Embedding
-        edge_attr_res_layer = edge_attr.float()
-        if edge_attr_res_layer.dim() > 2:
-            edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
-            edge_attr_res_layer = edge_attr_res_layer.squeeze(2)
-        x_res = x
-        for conv in self.convs:
-            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))
-            x = 0.001*x + F.relu(self.res_layer(edge_attr_res_layer))
-            # x = x + F.relu(self.res_layer(x_res))
+        if x.dim() == 3:
+            x = x.squeeze(0)    # (bs, num_edges, num_edge_features) -> (num_edges, num_edge_features)
+        
+        for conv, res_layer in zip(self.convs, self.res_layers):
+            res = F.relu(res_layer(x))
+            x = F.relu(conv(x, edge_index)) # (num_edges, hidden_channels)
+            x = self.theta * x + res
             
-        x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, hidden_dim]
         if mode == 'history':
             c = self.history_encoder(x)
             
@@ -1131,27 +1177,22 @@ class Edge_Encoder_Residual(nn.Module):
         
         elif mode == 'future':
             # Time embedding
-            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time)
+            # TODO: Check if time embedding and condition generation are the same for each datapoint in a batch and hence the problems while sampling
+            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
             t_emb = self.time_linear0(t_emb)
-            # TODO: Delete first silu function!
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
             t_emb = F.silu(t_emb)
-            t_emb = t_emb.unsqueeze(1).repeat(1, self.num_nodes, 1)
+            t_emb = t_emb.repeat(self.num_edges, 1) # (num_edges, time_embedding_dim)
             
             #Concatenation
-            x = torch.cat((x, t_emb), dim=2) # Concatenate with time embedding
-            x = torch.cat((x, condition), dim=2) # Concatenate with condition c
-            x = F.relu(nn.Linear(x.size(2), self.hidden_channels)(x))
+            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding
+            x = torch.cat((x, condition), dim=1) # Concatenate with condition c
             
-            logits = self.future_decoder(x) # (bs, num_nodes, num_edges)
-            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
-            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
-            # Unsqueeze to get the final shape 
-            logits = logits.unsqueeze(2)    # (batch_size, num_edges, 1, num_classes=2)
+            logits = self.future_decoder(x) # (num_edges, hidden_channels)
+            logits = self.adjust_to_class_shape(logits) # (num_edges, num_classes=2)
 
-            return logits
-
+            return logits.unsqueeze(0)  # (1, num_edges, num_classes=2)
 # coding=utf-8
 # Copyright 2024 The Google Research Authors.
 #
@@ -1170,14 +1211,15 @@ class Edge_Encoder_Residual(nn.Module):
 """Diffusion for discrete state spaces."""
 
 import torch
+import time
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def make_diffusion(diffusion_config, model_config, num_edges, future_len):
+def make_diffusion(diffusion_config, model_config, num_edges, future_len, device):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
-        betas=get_diffusion_betas(diffusion_config),
+        betas=get_diffusion_betas(diffusion_config, device),
         model_prediction=model_config['model_prediction'],
         model_output=model_config['model_output'],
         transition_mat_type=model_config['transition_mat_type'],
@@ -1185,13 +1227,13 @@ def make_diffusion(diffusion_config, model_config, num_edges, future_len):
         loss_type=model_config['loss_type'],
         hybrid_coeff=model_config['hybrid_coeff'],
         num_edges=num_edges,
-        class_weights=model_config['class_weights'],
         model_name=model_config['name'],
-        future_len=future_len
+        future_len=future_len,
+        device=device
 )
 
 
-def get_diffusion_betas(spec):
+def get_diffusion_betas(spec, device):
     """Get betas from the hyperparameters."""
     
     if spec['type'] == 'linear':
@@ -1199,21 +1241,21 @@ def get_diffusion_betas(spec):
         # To be used with Gaussian diffusion models in continuous and discrete
         # state spaces.
         # To be used with transition_mat_type = 'gaussian'
-        return torch.linspace(spec['start'], spec['stop'], spec['num_timesteps'])
+        return torch.linspace(spec['start'], spec['stop'], spec['num_timesteps']).to(device)
     elif spec['type'] == 'cosine':
         # Schedule proposed by Hoogeboom et al. https://arxiv.org/abs/2102.05379
         # To be used with transition_mat_type = 'uniform'.
         steps = torch.linspace(0, 1, spec['num_timesteps'] + 1, dtype=torch.float64)
         alpha_bar = torch.cos((steps + 0.008) / 1.008 * torch.pi / 2)
         betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], torch.tensor(0.999))
-        return betas
+        return betas.to(device)
     elif spec['type'] == 'jsd':  # 1/T, 1/(T-1), 1/(T-2), ..., 1
         # Proposed by Sohl-Dickstein et al., https://arxiv.org/abs/1503.03585
         # To be used with absorbing state models.
         # ensures that the probability of decaying to the absorbing state
         # increases linearly over time, and is 1 for t = T-1 (the final time).
         # To be used with transition_mat_type = 'absorbing'
-        return 1. / torch.linspace(spec['num_timesteps'], 1, spec['num_timesteps'])
+        return 1. / torch.linspace(spec['num_timesteps'], 1, spec['num_timesteps']).to(device)
     else:
         raise NotImplementedError(spec['type'])
 
@@ -1228,20 +1270,22 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, class_weights, torch_dtype=torch.float32, model_name=None, future_len=None):
+               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, device=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
         self.loss_type = loss_type  # kl, *hybrid*, cross_entropy_x_start
         self.hybrid_coeff = hybrid_coeff
-        self.class_weights = torch.tensor(class_weights)
         self.torch_dtype = torch_dtype
         self.model_name = model_name
+        self.device = device
 
         # Data \in {0, ..., num_edges-1}
         self.num_classes = 2 # 0 or 1
         self.num_edges = num_edges
         self.future_len = future_len
+        # self.class_weights = torch.tensor([self.future_len / self.num_edges, 1 - self.future_len / self.num_edges], dtype=torch.float64)
+        self.class_weights = torch.tensor([0.4, 0.6], dtype=torch.float64)
         self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
         self.transition_bands = transition_bands
         self.transition_mat_type = transition_mat_type
@@ -1253,7 +1297,7 @@ class CategoricalDiffusion:
             raise ValueError('betas must be in (0, 1]')
 
         # Computations here in float64 for accuracy
-        self.betas = betas.to(dtype=torch.float64)
+        self.betas = betas.to(dtype=torch.float64).to(self.device, non_blocking=True)
         self.num_timesteps, = betas.shape
 
         # Construct transition matrices for q(x_t|x_{t-1})
@@ -1276,7 +1320,7 @@ class CategoricalDiffusion:
                 f", but is {self.transition_mat_type}"
                 )
 
-        self.q_onestep_mats = torch.stack(q_one_step_mats, axis=0)
+        self.q_onestep_mats = torch.stack(q_one_step_mats, axis=0).to(self.device, non_blocking=True)
         assert self.q_onestep_mats.shape == (self.num_timesteps,
                                             self.num_classes,
                                             self.num_classes)
@@ -1388,11 +1432,11 @@ class CategoricalDiffusion:
         beta_t = self.betas[t]
 
         mat = torch.zeros((self.num_classes, self.num_classes),
-                        dtype=torch.float64)
+                        dtype=torch.float64).to(self.device, non_blocking=True)
 
         # Make the values correspond to a similar type of gaussian as in the
         # gaussian diffusion case for continuous state spaces.
-        values = torch.linspace(torch.tensor(0.), torch.tensor(self.num_classes-1), self.num_classes, dtype=torch.float64)
+        values = torch.linspace(torch.tensor(0.), torch.tensor(self.num_classes-1), self.num_classes, dtype=torch.float64).to(self.device, non_blocking=True)
         values = values * 2./ (self.num_classes - 1.)
         values = values[:transition_bands+1]
         values = -values * values / beta_t
@@ -1405,7 +1449,7 @@ class CategoricalDiffusion:
         values = values[transition_bands:]
         
         for k in range(1, transition_bands + 1):
-            off_diag = torch.full((self.num_classes - k,), values[k], dtype=torch.float64)
+            off_diag = torch.full((self.num_classes - k,), values[k], dtype=torch.float64).to(self.device, non_blocking=True)
 
             mat += torch.diag(off_diag, k)
             mat += torch.diag(off_diag, -k)
@@ -1417,7 +1461,7 @@ class CategoricalDiffusion:
         diag = 1. - mat.sum(dim=1)
         mat += torch.diag_embed(diag)
 
-        return mat
+        return mat.to(self.device, non_blocking=True)
 
     def _get_absorbing_transition_mat(self, t):
         """Computes transition matrix for q(x_t|x_{t-1}).
@@ -1432,7 +1476,7 @@ class CategoricalDiffusion:
         """
         beta_t = self.betas[t]
 
-        diag = torch.full((self.num_classes,), 1. - beta_t, dtype=torch.float64)
+        diag = torch.full((self.num_classes,), 1. - beta_t, dtype=torch.float64).to(self.device, non_blocking=True)
         mat = torch.diag(diag)
 
         # Add beta_t to the num_classes/2-th column for the absorbing state
@@ -1451,7 +1495,7 @@ class CategoricalDiffusion:
         Q_t: transition matrix. shape = (num_classes, num_classes).
         """
         beta_t = self.betas[t]
-        mat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.float64)
+        mat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.float64).to(self.device, non_blocking=True)
 
         for i in range(self.num_classes):
             for j in range(self.num_classes):
@@ -1493,10 +1537,10 @@ class CategoricalDiffusion:
         a = a.type(self.torch_dtype)
 
         # Prepare t for broadcasting by adding necessary singleton dimensions
-        t_broadcast = t.view(-1, *((1,) * (x.ndim - 1)))
+        t_broadcast = t.view(-1, *((1,) * (x.ndim - 1))).to(self.device, non_blocking=True)
 
         # Advanced indexing in PyTorch to select elements
-        return a[t_broadcast, x]
+        return a[t_broadcast, x.long()].to(self.device, non_blocking=True)
 
     def _at_onehot(self, a, t, x):
         """Extract coefficients at specified timesteps t and conditioning data x.
@@ -1508,22 +1552,21 @@ class CategoricalDiffusion:
             (Noisy) data. Should be of one-hot-type representation.
 
         Returns:
-        out: torch.tensor: Jax array. output of dot(x, a[t], axis=[[-1], [1]]).
+        out: torch.tensor: output of dot(x, a[t], axis=[[-1], [1]]).
             shape = (bs, num_edges, channels=1, num_classes)
         """
         a = a.type(self.torch_dtype)
-
-        ### New ###
+        
+        ### Final ###
         # t.shape = (bs)
-        # x.shape = (bs, num_edges, channels=1, num_classes)
-        # a[t].hape = (bs, num_classes, num_classes)
-        # out.shape = (bs, num_edges, channels=1, num_classes)
+        # x.shape = (bs, num_edges, num_classes)
+        # a[t].shape = (bs, num_classes, num_classes)
+        # out.shape = (bs, num_edges, num_classes)
 
         a_t = a[t]
-        out = torch.einsum('bijc,bjk->bik', x, a_t) # Multiply last dimension of x with last 2 dimensions of a_t
-        out = out.unsqueeze(2) # Add channel dimension
+        out = torch.einsum('bik,bkj->bij', x, a_t).to(self.device, non_blocking=True)
         
-        return out
+        return out.to(self.device, non_blocking=True)
 
     def q_probs(self, x_start, t):
         """Compute probabilities of q(x_t | x_start).
@@ -1546,7 +1589,7 @@ class CategoricalDiffusion:
 
         Args:
         x_start: torch.tensor: original clean data, in integer form (not onehot).
-            shape = (bs, ...).
+            shape = (bs, num_edges).
         t: torch.tensor: timestep of the diffusion process, shape (bs,).
         noise: torch.tensor: uniform noise on [0, 1) used to sample noisy data.
             shape should match (*x_start.shape, num_classes).
@@ -1559,7 +1602,7 @@ class CategoricalDiffusion:
 
         # To avoid numerical issues, clip the noise to a minimum value
         noise = torch.clamp(noise, min=torch.finfo(noise.dtype).tiny, max=1.)
-        gumbel_noise = -torch.log(-torch.log(noise))
+        gumbel_noise = -torch.log(-torch.log(noise)).to(self.device, non_blocking=True)
         return torch.argmax(logits + gumbel_noise, dim=-1)
     
     def _get_logits_from_logistic_pars(self, loc, log_scale):
@@ -1596,13 +1639,11 @@ class CategoricalDiffusion:
     def q_posterior_logits(self, x_start, x_t, t, x_start_logits):
         """Compute logits of q(x_{t-1} | x_t, x_start) in PyTorch."""
         
-        if (self.model_name == 'edge_encoder_mlp') & (x_t.dim() == 2):
-            x_t = x_t.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.num_classes,), (x_start.shape, x_t.shape)
         else:
             assert x_start.shape == x_t.shape, (x_start.shape, x_t.shape)
-
+            
         fact1 = self._at(self.transpose_q_onestep_mats, t, x_t)
         if x_start_logits:
             fact2 = self._at_onehot(self.q_mats, t-1, F.softmax(x_start, dim=-1))
@@ -1613,12 +1654,12 @@ class CategoricalDiffusion:
 
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
 
-        t_broadcast = t.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # Adds new dimensions: [batch_size, 1, 1, 1]
-        t_broadcast = t_broadcast.expand(-1, tzero_logits.size(1), 1, tzero_logits.size(-1))   # tzero_logits.size(1) = num_edges, tzero_logits.size(-1) = num_classes
-        
-        return torch.where(t_broadcast == 0, tzero_logits, out) # (bs, num_edges, channels=1, num_classes)
+        t_broadcast = t.unsqueeze(1).unsqueeze(2)  # Adds new dimensions: [batch_size, 1, 1]
+        t_broadcast = t_broadcast.expand(-1, tzero_logits.size(1), tzero_logits.size(-1)).to(self.device, non_blocking=True)   # tzero_logits.size(1) = num_edges, tzero_logits.size(-1) = num_classes
 
-    def p_logits(self, model_fn, x, t, node_features=None, edge_index=None, edge_attr=None, condition=None):
+        return torch.where(t_broadcast == 0, tzero_logits, out) # (bs, num_edges, num_classes)
+
+    def p_logits(self, model_fn, x, t, edge_features=None, edge_index=None, condition=None):
         """Compute logits of p(x_{t-1} | x_t) in PyTorch.
 
         Args:
@@ -1632,7 +1673,7 @@ class CategoricalDiffusion:
                 - pred_x_start_logits (torch.Tensor): The logits of p(x_{t-1} | x_start) of shape (batch_size, input_size, num_classes).
         """
         assert t.shape == (x.shape[0],)
-        model_output = model_fn(node_features, edge_index, t, edge_attr, condition=condition)
+        model_output = model_fn(edge_features, edge_index, t, condition=condition)
 
         if self.model_output == 'logits':
             model_logits = model_output
@@ -1644,24 +1685,24 @@ class CategoricalDiffusion:
 
         if self.model_prediction == 'x_start':
             pred_x_start_logits = model_logits
-            t_broadcast = t.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # Adds new dimensions: [batch_size, 1, 1, 1]
-            t_broadcast = t_broadcast.expand(-1, pred_x_start_logits.size(1), 1, pred_x_start_logits.size(-1))   # pred_x_start_logits.size(1) = num_edges, pred_x_start_logits.size(-1) = num_classes
-
+            t_broadcast = t.unsqueeze(1).unsqueeze(2)  # Adds new dimensions: [batch_size, 1, 1]
+            t_broadcast = t_broadcast.expand(-1, pred_x_start_logits.size(1), pred_x_start_logits.size(-1)).to(self.device, non_blocking=True)   # pred_x_start_logits.size(1) = num_edges, pred_x_start_logits.size(-1) = num_classes
             model_logits = torch.where(t_broadcast == 0, pred_x_start_logits,
-                                       self.q_posterior_logits(pred_x_start_logits, x, t, x_start_logits=True))
+                                       self.q_posterior_logits(x_start=pred_x_start_logits, x_t=x, t=t, x_start_logits=True))
+            
         elif self.model_prediction == 'xprev':
             pred_x_start_logits = model_logits
             raise NotImplementedError(self.model_prediction)
         
         assert (model_logits.shape == pred_x_start_logits.shape == x.shape + (self.num_classes,))
-        return model_logits, pred_x_start_logits
+        return model_logits, pred_x_start_logits    # (bs, num_eedges, 2)
     
     # === Sampling ===
 
-    def p_sample(self, model_fn, x, t, noise, node_features=None, edge_index=None, edge_attr=None, condition=None):
+    def p_sample(self, model_fn, x, t, noise, edge_features=None, edge_index=None, condition=None):
         """Sample one timestep from the model p(x_{t-1} | x_t)."""
         # Get model logits
-        model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
+        model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, edge_features=edge_features, edge_index=edge_index, condition=condition)
         assert noise.shape == model_logits.shape, noise.shape
 
         # No noise when t == 0
@@ -1676,27 +1717,31 @@ class CategoricalDiffusion:
         assert pred_x_start_logits.shape == model_logits.shape
         return sample, F.softmax(pred_x_start_logits, dim=-1)
 
-    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, node_features=None, edge_index=None, edge_attr=None, condition=None):
+    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, edge_features=None, edge_index=None, line_graph=None, condition=None):
         """Ancestral sampling."""
         if num_timesteps is None:
             num_timesteps = self.num_timesteps
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.transition_mat_type in ['gaussian', 'uniform']:
+        if self.transition_mat_type in ['gaussian', 'uniform', 'marginal_prior']:
             x_init = torch.randint(0, self.num_classes, size=shape, device=device)
         elif self.transition_mat_type == 'absorbing':
             x_init = torch.full(shape, fill_value=self.num_classes // 2, dtype=torch.int32, device=device)
         else:
             raise ValueError(f"Invalid transition_mat_type {self.transition_mat_type}")
 
-        x = x_init.clone()
-        edge_attr = x_init.unsqueeze(-1).type(torch.float32)
+        x = x_init.clone()  # (bs, num_edges)
+        edge_attr = x_init.float()
+        #new_line_graph_x = line_graph.x.clone()
+        #new_line_graph_x[:, :, 0] = edge_attr
+        new_edge_features = edge_features.clone()
+        new_edge_features[:, :, 0] = edge_attr
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
-            x, _ = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
-            edge_attr = x.unsqueeze(-1).type(torch.float32)
+            x, _ = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
+            new_edge_features[:, :, 0] = x.float()
 
         if return_x_init:
             return x_init, x
@@ -1704,103 +1749,46 @@ class CategoricalDiffusion:
             return x
 
   # === Log likelihood / loss calculation ===
-
-    def vb_terms_bpd(self, model_fn, *, x_start, x_t, t, node_features=None, edge_index=None, edge_attr=None, condition=None):
-        """Calculate specified terms of the variational bound.
-
-        Args:
-        model_fn: the denoising network
-        x_start: original clean data
-        x_t: noisy data
-        t: timestep of the noisy data (and the corresponding term of the bound
-            to return)
-
-        Returns:
-        a pair `(kl, pred_start_logits)`, where `kl` are the requested bound terms
-        (specified by `t`), and `pred_x_start_logits` is logits of
-        the denoised image.
-        """
-        true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
-        model_logits, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
-
-        kl = categorical_kl_logits(input_logits=model_logits, target_logits=true_logits)
-        assert kl.shape == x_start.shape
-        kl = kl / torch.log(torch.tensor(2.0))
-
-        decoder_nll = F.cross_entropy(model_logits, x_start, weight=self.class_weights, reduction='mean')
-        # decoder_nll = -categorical_log_likelihood(x_start, model_logits)
-        #assert decoder_nll.shape == x_start.shape
-
-        # At the first timestep return the decoder NLL,
-        # otherwise return KL(q(x_{t-1}|x_t,x_start) || p(x_{t-1}|x_t))
-        assert kl.shape == decoder_nll.shape == t.shape == (x_start.shape[0],)
-        result = torch.where(t == 0, decoder_nll, kl)
-        return result, pred_x_start_logits
-
-    def prior_bpd(self, x_start):
-        """KL(q(x_{T-1}|x_start)|| U(x_{T-1}|0, num_edges-1))."""
-        q_probs = self.q_probs(
-            x_start=x_start,
-            t=torch.full((x_start.shape[0],), self.num_timesteps - 1, dtype=torch.long))
-
-        if self.transition_mat_type in ['gaussian', 'uniform']:
-            # Stationary distribution is a uniform distribution over all pixel values.
-            prior_probs = torch.ones_like(q_probs) / self.num_classes
-        elif self.transition_mat_type == 'absorbing':
-            absorbing_int = torch.full(x_start.shape[:-1], self.num_classes // 2, dtype=torch.int32)
-            prior_probs = F.one_hot(absorbing_int, num_classes=self.num_classes).to(dtype=self.torch_dtype)
-        else:
-            raise ValueError("Invalid transition_mat_type")
-
-
-        assert prior_probs.shape == q_probs.shape
-
-        kl_prior = categorical_kl_probs(
-            q_probs, prior_probs)
-        assert kl_prior.shape == x_start.shape
-        return meanflat(kl_prior) / torch.log(torch.tensor(2.0))
         
     def cross_entropy_x_start(self, x_start, pred_x_start_logits, class_weights):
         """Calculate binary weighted cross entropy between x_start and predicted x_start logits.
 
         Args:
-            x_start (torch.Tensor): original clean data, expected binary labels (0 or 1)
+            x_start (torch.Tensor): original clean data, expected binary labels (0 or 1), shape (bs, num_edges)
             pred_x_start_logits (torch.Tensor): logits as predicted by the model
             class_weights (torch.Tensor): tensor with weights for class 0 and class 1
 
         Returns:
             torch.Tensor: scalar tensor representing the mean binary weighted cross entropy loss.
         """
-        
         # Calculate binary cross-entropy with logits
-        pred_x_start_logits = pred_x_start_logits.squeeze(2) # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-        pred_x_start_logits = pred_x_start_logits.permute(0, 2, 1) # (bs, num_edges, classes) -> (bs, classes, num_edges)
-        if x_start.dim() == 3:
-            x_start = x_start.squeeze(2) # (bs, num_edges, channels) -> (bs, num_edges)
-        ce = F.cross_entropy(pred_x_start_logits, x_start, weight=class_weights, reduction='mean')
+        x_start = x_start.long().to(self.device, non_blocking=True)
+        pred_x_start_logits = pred_x_start_logits.permute(0, 2, 1).float() # (bs, num_edges, num_classes) -> (bs, num_classes, num_edges)
+        ce = F.cross_entropy(pred_x_start_logits, x_start, weight=class_weights.float().to(self.device, non_blocking=True), reduction='mean')
 
         return ce
 
-    def training_losses(self, model_fn, node_features=None, edge_index=None, data=None, condition=None, *, x_start):
+    def training_losses(self, model_fn, condition=None, *, x_start, edge_features, edge_index, line_graph=None):
         """Training loss calculation."""
         # Add noise to data
-        if self.model_name != 'edge_encoder_mlp':
-            x_start = x_start.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],))
 
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
-        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)  # (bs, num_edges)
         
-        if (self.model_name == 'edge_encoder_mlp') & (x_t.dim() == 2):
-            x_t = x_t.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
-        
-        edge_attr_t = x_t.unsqueeze(-1).type(torch.float32)
+        edge_attr_t = x_t.float()
+        # new_line_graph_x = line_graph.x.clone()
+        new_edge_features = edge_features.clone()
+        for i in range(edge_attr_t.shape[0]):
+            # new_line_graph_x[i, :, 0] = edge_attr_t[i]  # Update the edge attributes in the line graph with the noised trajectory x_t
+            new_edge_features[i, :, 0] = edge_attr_t[i]
+
 
         # Calculate the loss
         if self.loss_type == 'kl':
             losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
-                                                               node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
+                                                               edge_features=new_edge_features, edge_index=edge_index, condition=condition)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
             # NOTE: Currently only works for batch size of 1
@@ -1811,7 +1799,7 @@ class CategoricalDiffusion:
             
         elif self.loss_type == 'cross_entropy_x_start':
             
-            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
+            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
             losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
@@ -1825,95 +1813,29 @@ class CategoricalDiffusion:
             
             return losses, pred
             
-        elif self.loss_type == 'hybrid':
-            vb_losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
-                                                               node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
-            ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
-            losses = vb_losses + self.hybrid_coeff * ce_losses
-            
-            pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-            # NOTE: Currently only works for batch size of 1
-            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
-            
-            return losses, pred
-            
         else:
             raise NotImplementedError(self.loss_type)
 
         return losses
 
-    def calc_bpd_loop(self, model_fn, *, x_start, rng):
-        """Calculate variational bound (loop over all timesteps and sum)."""
-        batch_size = x_start.shape[0]
-        total_vb = torch.zeros(batch_size)
 
-        for t in range(self.num_timesteps):
-            noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
-            x_t = self.q_sample(x_start=x_start, t=torch.full((batch_size,), t), noise=noise)
-            vb, _ = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=torch.full((batch_size,), t))
-            total_vb += vb
-
-        prior_b = self.prior_bpd(x_start=x_start)
-        total_b = total_vb + prior_b
-
-        return {
-            'total': total_b,
-            'vbterms': total_vb,
-            'prior': prior_b
-        }
-
-
-encoder_model = Edge_Encoder
-#encoder_model = Edge_Encoder_MLP
-encoder_model = Edge_Encoder_Residual
-
-nodes = [(0, {'pos': (0.1, 0.7)}),
-         (1, {'pos': (0.05, 0.05)}), 
-         (2, {'pos': (0.2, 0.15)}), 
-         (3, {'pos': (0.55, 0.05)}),
-         (4, {'pos': (0.8, 0.05)}),
-         (5, {'pos': (0.9, 0.1)}),
-         (6, {'pos': (0.75, 0.15)}),
-         (7, {'pos': (0.5, 0.2)}),
-         (8, {'pos': (0.3, 0.3)}),
-         (9, {'pos': (0.2, 0.3)}),
-         (10, {'pos': (0.3, 0.4)}),
-         (11, {'pos': (0.65, 0.35)}),
-         (12, {'pos': (0.8, 0.5)}),
-         (13, {'pos': (0.5, 0.5)}),
-         (14, {'pos': (0.4, 0.65)}),
-         (15, {'pos': (0.15, 0.6)}),
-         (16, {'pos': (0.3, 0.7)}),
-         (17, {'pos': (0.5, 0.7)}),
-         (18, {'pos': (0.8, 0.8)}),
-         (19, {'pos': (0.4, 0.8)}),
-         (20, {'pos': (0.25, 0.85)}),
-         (21, {'pos': (0.1, 0.9)}),
-         (22, {'pos': (0.2, 0.95)}),
-         (23, {'pos': (0.45, 0.9)}),
-         (24, {'pos': (0.95, 0.95)}),
-         (25, {'pos': (0.9, 0.4)}),
-         (26, {'pos': (0.95, 0.05)}),
-         (27, {'pos': (0.75, 1.0)}),]
-
-edges = [(0, 21), (0, 1), (0, 15), (21, 22), (22, 20), (20, 23), (23, 24), (24, 18), (19, 14), (14, 15), (15, 16), (16, 20), (19, 20), (19, 17), (14, 17), (14, 16), (17, 18), (12, 18), (12, 13), (13, 14), (10, 14), (1, 15), (9, 15), (1, 9), (1, 2), (11, 12), (9, 10), (3, 7), (2, 3), (7, 8), (8, 9), (8, 10), (10, 11), (8, 11), (6, 11), (3, 4), (4, 5), (4, 6), (5, 6), (24, 25), (12, 25), (5, 25), (11, 25), (5, 26), (23, 27), (24, 27)]
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
 
     
-data_config = {"dataset": "tdrive_1000",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5',
-    "test_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_small.h5',
+data_config = {"dataset": "synthetic_20_traj",
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_train.h5',
+    "test_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_val.h5',
     "history_len": 5,
     "future_len": 2,
     "num_classes": 2,
-    "edge_features": ['one_hot_edges'],
-    "one_hot_nodes": False}
+    "edge_features": ['one_hot_edges', 'coordinates']
+    }
 
 diffusion_config = {"type": 'linear', # Options: 'linear', 'cosine', 'jsd'
     "start": 0.9,  # 1e-4 gauss, 0.02 uniform
     "stop": 1.0,  # 0.02 gauss, 1. uniform
-    "num_timesteps": 1000}
+    "num_timesteps": 100}
 
 model_config = {"name": "edge_encoder_residual",
     "hidden_channels": 32,
@@ -1922,31 +1844,32 @@ model_config = {"name": "edge_encoder_residual",
     "out_ch": 1,
     "num_heads": 2,
     "num_layers": 2,
+    "theta": 1.0, # controls strength of conv layers in residual model
     "dropout": 0.1,
     "model_output": "logits",
     "model_prediction": "x_start",  # Options: 'x_start','xprev'
-    "transition_mat_type": 'gaussian',  # Options: 'gaussian','uniform','absorbing', 'marginal_prior'
-    "transition_bands": 1,
+    "transition_mat_type": 'gaussian',  # Options: 'gaussian', 'uniform', 'absorbing', 'marginal_prior'
+    "transition_bands": 0,
     "loss_type": "cross_entropy_x_start",  # Options: kl, cross_entropy_x_start, hybrid
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
-    "class_weights": [0.1, 0.9] # = future_len/num_edges and (num_edges - future_len)/num_edges
     }
 
 train_config = {"batch_size": 1,
     "optimizer": "adam",
     "lr": 0.01,
     "gradient_accumulation": True,
-    "gradient_accumulation_steps": 4,
-    "num_epochs": 10000,
-    "learning_rate_warmup_steps": 2000, # previously 10000
-    "lr_decay": 0.9999, # previously 0.9999
-    "log_loss_every_steps": 10,
+    "gradient_accumulation_steps": 32,
+    "num_epochs": 1000,
+    "learning_rate_warmup_steps": 200, # previously 10000
+    "lr_decay": 0.9995, # previously 0.9999
+    "log_loss_every_steps": 20,
     "save_model": False,
-    "save_model_every_steps": 1000}
+    "save_model_every_steps": 200}
 
-test_config = {"batch_size": 1,
-    "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_residual_fixed/synthetic_d3pm_residual_fixed_hidden_dim_32_time_dim_16_condition_dim_16_layers_2_weights_0.1.pth',
-    "number_samples": 1
+test_config = {"batch_size": 1, # currently only 1 works
+    "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/tdrive_gat_edge_encoder_residual_gaussian_linear_hidden_dim_32_time_dim_16_condition_dim_16_layers_2.pth',
+    "number_samples": 1,
+    "eval_every_steps": 1000
   }
 
 wandb_config = {"exp_name": "synthetic_d3pm_test",
@@ -1956,13 +1879,30 @@ wandb_config = {"exp_name": "synthetic_d3pm_test",
     "notes": "",
     "tags": ["synthetic", "edge_encoder"]} 
 
-model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model, nodes, edges)
-model.train()
+if model_config["name"] == 'edge_encoder':
+    encoder_model = Edge_Encoder
+elif model_config["name"] == 'edge_encoder_mlp':
+    encoder_model = Edge_Encoder_MLP
+elif model_config["name"] == 'edge_encoder_residual':
+    encoder_model = Edge_Encoder_Residual
+
+model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model).to(device)
+#model.train()
 model_path = test_config["model_path"]
-sample_list, ground_truth_hist, ground_truth_fut = model.get_samples(load_model=True, model_path=model_path, task='predict', number_samples=20)
-print(sample_list)
+sample_list, ground_truth_hist, ground_truth_fut = model.get_samples(load_model=True, model_path=model_path, task='predict', number_samples=1)
+fut_ratio, f1, avg_sample_length = model.eval(sample_list, ground_truth_hist, ground_truth_fut)
+print("History", ground_truth_hist)
 print("\n")
-print(ground_truth_hist)
+print("Samples", sample_list)
 print("\n")
-print(ground_truth_fut)
-model.visualize_predictions(sample_list, ground_truth_hist, ground_truth_fut)
+print("Ground truth", ground_truth_fut)
+print("\n")
+print("Test F1 Score", f1.item())
+print("\n")
+print("Average sample length", avg_sample_length)
+print("\n")
+print("Test Future ratio", fut_ratio)
+print("\n")
+
+
+# model.visualize_predictions(sample_list, ground_truth_hist, ground_truth_fut)
