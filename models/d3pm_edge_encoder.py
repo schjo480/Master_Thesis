@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn.conv import GATv2Conv
 
 
-def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
+def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None):
     """
     Build sinusoidal embeddings (from Fairseq).
 
@@ -19,14 +19,15 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
     Returns:
         embedding vectors with shape `(len(timesteps), embedding_dim)`
     """
+    timesteps = timesteps.to(device)
     assert timesteps.dim() == 1  # Ensure timesteps is a 1D tensor
 
     # Scale timesteps by the maximum time
     timesteps = timesteps.float() * (1000. / max_time)
 
     half_dim = embedding_dim // 2
-    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=device) * -emb)
     emb = timesteps[:, None] * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
 
@@ -35,20 +36,15 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000.):
         emb = torch.cat([emb, zero_pad], dim=1)
 
     assert emb.shape == (timesteps.shape[0], embedding_dim)
-    return emb
+    return emb.to(device)
 
 class Edge_Encoder(nn.Module):
-    def __init__(self, model_config, history_len, future_len, num_classes, nodes, edges, node_features, num_edges, hidden_channels, num_edge_features):
+    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, num_edge_features, num_timesteps):
         super(Edge_Encoder, self).__init__()
         # Config
         self.config = model_config
         
         # Data
-        self.nodes = nodes
-        self.num_nodes = len(nodes)
-        self.edges = edges
-        self.node_features = node_features
-        self.num_node_features = self.node_features.shape[1]
         self.num_edges = num_edges
         self.num_edge_features = num_edge_features
         self.history_len = history_len
@@ -59,7 +55,7 @@ class Edge_Encoder(nn.Module):
         self.model_output = self.config['model_output']
         
         # Time embedding
-        self.max_time = 1000.
+        self.max_time = num_timesteps
         self.time_embedding_dim = self.config['time_embedding_dim']
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
@@ -69,60 +65,58 @@ class Edge_Encoder(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_heads = self.config['num_heads']
         self.num_layers = self.config['num_layers']
-        self.conv1 = GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv2 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        self.conv3 = GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads)
-        '''self.convs = nn.ModuleList()
-        self.convs.append(GATv2Conv(self.num_node_features, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
+        self.convs = nn.ModuleList()
+        self.convs.append(GATv2Conv(self.num_edge_features, self.hidden_channels, heads=self.num_heads))
         for _ in range(1, self.num_layers):
-            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, edge_dim=self.num_edge_features, heads=self.num_heads))
-        '''
+            self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, heads=self.num_heads))
         
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
-        self.history_encoder = nn.Linear(self.hidden_channels*self.num_heads, self.condition_dim)  # To encode history to c
-        self.future_decoder = nn.Linear(self.hidden_channels, self.num_edges)  # To predict future edges
-        self.adjust_to_class_shape = nn.Conv1d(in_channels=self.num_nodes, out_channels=self.num_classes, kernel_size=1)
+        self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
+        self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
+                                        self.hidden_channels)
+        self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, x, edge_index, t=None, edge_attr=None, condition=None, mode=None):
+    def forward(self, x, edge_index, t=None, condition=None, mode=None):
         """
         Forward pass through the model
         Args:
-            x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices
+            x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices and edge features
             t: torch.Tensor: timestep tensor
         """    
         
         # GNN forward pass
-        
         # Edge Embedding
+        if x.dim() == 3:
+            x = x.squeeze(0)    # (bs, num_edges, num_edge_features) -> (num_edges, num_edge_features)
         for conv in self.convs:
-            x = F.relu(conv(x, edge_index, edge_attr.squeeze(0)))
-        x = x.unsqueeze(0).repeat(edge_attr.size(0), 1, 1) # Reshape x to [batch_size, num_nodes, feature_size]
-        
+            # print("Conv size", conv)
+            x = F.relu(conv(x, edge_index)) # (num_edges, hidden_channels)
+                    
         if mode == 'history':
-            c = self.history_encoder(x)
+            c = self.history_encoder(x) # (num_edges, condition_dim)
             
             return c
         
         elif mode == 'future':
             # Time embedding
-            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time)
+            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
             t_emb = self.time_linear0(t_emb)
-            # TODO: Delete first silu function!
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
             t_emb = F.silu(t_emb)
-            t_emb = t_emb.unsqueeze(1).repeat(1, self.num_nodes, 1)
+            t_emb = t_emb.repeat(self.num_edges, 1) # (num_edges, time_embedding_dim)
             
             #Concatenation
-            x = torch.cat((x, t_emb), dim=2) # Concatenate with time embedding
-            x = torch.cat((x, condition), dim=2) # Concatenate with condition c
-            x = F.relu(nn.Linear(x.size(2), self.hidden_channels)(x))
+            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding
+            x = torch.cat((x, condition), dim=1) # Concatenate with condition c
+            #print("x size", x.size())
             
-            logits = self.future_decoder(x) # (bs, num_nodes, num_edges)
-            logits = self.adjust_to_class_shape(logits) # (bs, num_classes=2, num_edges)
-            logits = logits.permute(0, 2, 1)  # (bs, num_edges, num_classes=2)
-            # Unsqueeze to get the final shape 
-            logits = logits.unsqueeze(2)    # (batch_size, num_edges, 1, num_classes=2)
+            logits = self.future_decoder(x) # (num_edges, hidden_channels)
+            #print(self.future_decoder)
+            #print("Logits pre size", logits.size())
+            logits = self.adjust_to_class_shape(logits) # (num_edges, num_classes=2)
+            #print(self.adjust_to_class_shape)
+            #print("Logits post size", logits.size())
 
-            return logits
+            return logits.unsqueeze(0)  # (1, num_edges, num_classes=2)

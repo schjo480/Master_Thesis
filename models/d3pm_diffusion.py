@@ -15,16 +15,16 @@
 
 """Diffusion for discrete state spaces."""
 
-from utils.d3pm_utils import categorical_kl_logits, meanflat, categorical_log_likelihood, categorical_kl_probs
 import torch
+import time
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def make_diffusion(diffusion_config, model_config, num_edges, future_len):
+def make_diffusion(diffusion_config, model_config, num_edges, future_len, device):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
-        betas=get_diffusion_betas(diffusion_config),
+        betas=get_diffusion_betas(diffusion_config, device),
         model_prediction=model_config['model_prediction'],
         model_output=model_config['model_output'],
         transition_mat_type=model_config['transition_mat_type'],
@@ -32,13 +32,13 @@ def make_diffusion(diffusion_config, model_config, num_edges, future_len):
         loss_type=model_config['loss_type'],
         hybrid_coeff=model_config['hybrid_coeff'],
         num_edges=num_edges,
-        class_weights=model_config['class_weights'],
         model_name=model_config['name'],
-        future_len=future_len
+        future_len=future_len,
+        device=device
 )
 
 
-def get_diffusion_betas(spec):
+def get_diffusion_betas(spec, device):
     """Get betas from the hyperparameters."""
     
     if spec['type'] == 'linear':
@@ -46,21 +46,21 @@ def get_diffusion_betas(spec):
         # To be used with Gaussian diffusion models in continuous and discrete
         # state spaces.
         # To be used with transition_mat_type = 'gaussian'
-        return torch.linspace(spec['start'], spec['stop'], spec['num_timesteps'])
+        return torch.linspace(spec['start'], spec['stop'], spec['num_timesteps']).to(device)
     elif spec['type'] == 'cosine':
         # Schedule proposed by Hoogeboom et al. https://arxiv.org/abs/2102.05379
         # To be used with transition_mat_type = 'uniform'.
         steps = torch.linspace(0, 1, spec['num_timesteps'] + 1, dtype=torch.float64)
         alpha_bar = torch.cos((steps + 0.008) / 1.008 * torch.pi / 2)
         betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], torch.tensor(0.999))
-        return betas
+        return betas.to(device)
     elif spec['type'] == 'jsd':  # 1/T, 1/(T-1), 1/(T-2), ..., 1
         # Proposed by Sohl-Dickstein et al., https://arxiv.org/abs/1503.03585
         # To be used with absorbing state models.
         # ensures that the probability of decaying to the absorbing state
         # increases linearly over time, and is 1 for t = T-1 (the final time).
         # To be used with transition_mat_type = 'absorbing'
-        return 1. / torch.linspace(spec['num_timesteps'], 1, spec['num_timesteps'])
+        return 1. / torch.linspace(spec['num_timesteps'], 1, spec['num_timesteps']).to(device)
     else:
         raise NotImplementedError(spec['type'])
 
@@ -75,20 +75,22 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, class_weights, torch_dtype=torch.float32, model_name=None, future_len=None):
+               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, device=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
         self.loss_type = loss_type  # kl, *hybrid*, cross_entropy_x_start
         self.hybrid_coeff = hybrid_coeff
-        self.class_weights = torch.tensor(class_weights)
         self.torch_dtype = torch_dtype
         self.model_name = model_name
+        self.device = device
 
         # Data \in {0, ..., num_edges-1}
         self.num_classes = 2 # 0 or 1
         self.num_edges = num_edges
         self.future_len = future_len
+        # self.class_weights = torch.tensor([self.future_len / self.num_edges, 1 - self.future_len / self.num_edges], dtype=torch.float64)
+        self.class_weights = torch.tensor([0.4, 0.6], dtype=torch.float64)
         self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
         self.transition_bands = transition_bands
         self.transition_mat_type = transition_mat_type
@@ -100,7 +102,7 @@ class CategoricalDiffusion:
             raise ValueError('betas must be in (0, 1]')
 
         # Computations here in float64 for accuracy
-        self.betas = betas.to(dtype=torch.float64)
+        self.betas = betas.to(dtype=torch.float64).to(self.device, non_blocking=True)
         self.num_timesteps, = betas.shape
 
         # Construct transition matrices for q(x_t|x_{t-1})
@@ -119,11 +121,11 @@ class CategoricalDiffusion:
                                for t in range(0, self.num_timesteps)]
         else:
             raise ValueError(
-                f"transition_mat_type must be 'gaussian', 'uniform', 'absorbing' "
+                f"transition_mat_type must be 'gaussian', 'uniform', 'absorbing', 'marginal_prior'"
                 f", but is {self.transition_mat_type}"
                 )
 
-        self.q_onestep_mats = torch.stack(q_one_step_mats, axis=0)
+        self.q_onestep_mats = torch.stack(q_one_step_mats, axis=0).to(self.device, non_blocking=True)
         assert self.q_onestep_mats.shape == (self.num_timesteps,
                                             self.num_classes,
                                             self.num_classes)
@@ -235,11 +237,11 @@ class CategoricalDiffusion:
         beta_t = self.betas[t]
 
         mat = torch.zeros((self.num_classes, self.num_classes),
-                        dtype=torch.float64)
+                        dtype=torch.float64).to(self.device, non_blocking=True)
 
         # Make the values correspond to a similar type of gaussian as in the
         # gaussian diffusion case for continuous state spaces.
-        values = torch.linspace(torch.tensor(0.), torch.tensor(self.num_classes-1), self.num_classes, dtype=torch.float64)
+        values = torch.linspace(torch.tensor(0.), torch.tensor(self.num_classes-1), self.num_classes, dtype=torch.float64).to(self.device, non_blocking=True)
         values = values * 2./ (self.num_classes - 1.)
         values = values[:transition_bands+1]
         values = -values * values / beta_t
@@ -252,7 +254,7 @@ class CategoricalDiffusion:
         values = values[transition_bands:]
         
         for k in range(1, transition_bands + 1):
-            off_diag = torch.full((self.num_classes - k,), values[k], dtype=torch.float64)
+            off_diag = torch.full((self.num_classes - k,), values[k], dtype=torch.float64).to(self.device, non_blocking=True)
 
             mat += torch.diag(off_diag, k)
             mat += torch.diag(off_diag, -k)
@@ -264,7 +266,7 @@ class CategoricalDiffusion:
         diag = 1. - mat.sum(dim=1)
         mat += torch.diag_embed(diag)
 
-        return mat
+        return mat.to(self.device, non_blocking=True)
 
     def _get_absorbing_transition_mat(self, t):
         """Computes transition matrix for q(x_t|x_{t-1}).
@@ -279,7 +281,7 @@ class CategoricalDiffusion:
         """
         beta_t = self.betas[t]
 
-        diag = torch.full((self.num_classes,), 1. - beta_t, dtype=torch.float64)
+        diag = torch.full((self.num_classes,), 1. - beta_t, dtype=torch.float64).to(self.device, non_blocking=True)
         mat = torch.diag(diag)
 
         # Add beta_t to the num_classes/2-th column for the absorbing state
@@ -298,7 +300,7 @@ class CategoricalDiffusion:
         Q_t: transition matrix. shape = (num_classes, num_classes).
         """
         beta_t = self.betas[t]
-        mat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.float64)
+        mat = torch.zeros((self.num_classes, self.num_classes), dtype=torch.float64).to(self.device, non_blocking=True)
 
         for i in range(self.num_classes):
             for j in range(self.num_classes):
@@ -340,10 +342,10 @@ class CategoricalDiffusion:
         a = a.type(self.torch_dtype)
 
         # Prepare t for broadcasting by adding necessary singleton dimensions
-        t_broadcast = t.view(-1, *((1,) * (x.ndim - 1)))
+        t_broadcast = t.view(-1, *((1,) * (x.ndim - 1))).to(self.device, non_blocking=True)
 
         # Advanced indexing in PyTorch to select elements
-        return a[t_broadcast, x]
+        return a[t_broadcast, x.long()].to(self.device, non_blocking=True)
 
     def _at_onehot(self, a, t, x):
         """Extract coefficients at specified timesteps t and conditioning data x.
@@ -355,22 +357,21 @@ class CategoricalDiffusion:
             (Noisy) data. Should be of one-hot-type representation.
 
         Returns:
-        out: torch.tensor: Jax array. output of dot(x, a[t], axis=[[-1], [1]]).
+        out: torch.tensor: output of dot(x, a[t], axis=[[-1], [1]]).
             shape = (bs, num_edges, channels=1, num_classes)
         """
         a = a.type(self.torch_dtype)
-
-        ### New ###
+        
+        ### Final ###
         # t.shape = (bs)
-        # x.shape = (bs, num_edges, channels=1, num_classes)
-        # a[t].hape = (bs, num_classes, num_classes)
-        # out.shape = (bs, num_edges, channels=1, num_classes)
+        # x.shape = (bs, num_edges, num_classes)
+        # a[t].shape = (bs, num_classes, num_classes)
+        # out.shape = (bs, num_edges, num_classes)
 
         a_t = a[t]
-        out = torch.einsum('bijc,bjk->bik', x, a_t) # Multiply last dimension of x with last 2 dimensions of a_t
-        out = out.unsqueeze(2) # Add channel dimension
+        out = torch.einsum('bik,bkj->bij', x, a_t).to(self.device, non_blocking=True)
         
-        return out
+        return out.to(self.device, non_blocking=True)
 
     def q_probs(self, x_start, t):
         """Compute probabilities of q(x_t | x_start).
@@ -393,7 +394,7 @@ class CategoricalDiffusion:
 
         Args:
         x_start: torch.tensor: original clean data, in integer form (not onehot).
-            shape = (bs, ...).
+            shape = (bs, num_edges).
         t: torch.tensor: timestep of the diffusion process, shape (bs,).
         noise: torch.tensor: uniform noise on [0, 1) used to sample noisy data.
             shape should match (*x_start.shape, num_classes).
@@ -406,7 +407,7 @@ class CategoricalDiffusion:
 
         # To avoid numerical issues, clip the noise to a minimum value
         noise = torch.clamp(noise, min=torch.finfo(noise.dtype).tiny, max=1.)
-        gumbel_noise = -torch.log(-torch.log(noise))
+        gumbel_noise = -torch.log(-torch.log(noise)).to(self.device, non_blocking=True)
         return torch.argmax(logits + gumbel_noise, dim=-1)
     
     def _get_logits_from_logistic_pars(self, loc, log_scale):
@@ -443,13 +444,11 @@ class CategoricalDiffusion:
     def q_posterior_logits(self, x_start, x_t, t, x_start_logits):
         """Compute logits of q(x_{t-1} | x_t, x_start) in PyTorch."""
         
-        if (self.model_name == 'edge_encoder_mlp') & (x_t.dim() == 2):
-            x_t = x_t.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.num_classes,), (x_start.shape, x_t.shape)
         else:
             assert x_start.shape == x_t.shape, (x_start.shape, x_t.shape)
-
+            
         fact1 = self._at(self.transpose_q_onestep_mats, t, x_t)
         if x_start_logits:
             fact2 = self._at_onehot(self.q_mats, t-1, F.softmax(x_start, dim=-1))
@@ -460,12 +459,12 @@ class CategoricalDiffusion:
 
         out = torch.log(fact1 + self.eps) + torch.log(fact2 + self.eps)
 
-        t_broadcast = t.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # Adds new dimensions: [batch_size, 1, 1, 1]
-        t_broadcast = t_broadcast.expand(-1, tzero_logits.size(1), 1, tzero_logits.size(-1))   # tzero_logits.size(1) = num_edges, tzero_logits.size(-1) = num_classes
-        
-        return torch.where(t_broadcast == 0, tzero_logits, out) # (bs, num_edges, channels=1, num_classes)
+        t_broadcast = t.unsqueeze(1).unsqueeze(2)  # Adds new dimensions: [batch_size, 1, 1]
+        t_broadcast = t_broadcast.expand(-1, tzero_logits.size(1), tzero_logits.size(-1)).to(self.device, non_blocking=True)   # tzero_logits.size(1) = num_edges, tzero_logits.size(-1) = num_classes
 
-    def p_logits(self, model_fn, x, t, node_features=None, edge_index=None, edge_attr=None, condition=None):
+        return torch.where(t_broadcast == 0, tzero_logits, out) # (bs, num_edges, num_classes)
+
+    def p_logits(self, model_fn, x, t, edge_features=None, edge_index=None, condition=None):
         """Compute logits of p(x_{t-1} | x_t) in PyTorch.
 
         Args:
@@ -479,7 +478,7 @@ class CategoricalDiffusion:
                 - pred_x_start_logits (torch.Tensor): The logits of p(x_{t-1} | x_start) of shape (batch_size, input_size, num_classes).
         """
         assert t.shape == (x.shape[0],)
-        model_output = model_fn(node_features, edge_index, t, edge_attr, condition=condition)
+        model_output = model_fn(edge_features, edge_index, t, condition=condition)
 
         if self.model_output == 'logits':
             model_logits = model_output
@@ -491,24 +490,24 @@ class CategoricalDiffusion:
 
         if self.model_prediction == 'x_start':
             pred_x_start_logits = model_logits
-            t_broadcast = t.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # Adds new dimensions: [batch_size, 1, 1, 1]
-            t_broadcast = t_broadcast.expand(-1, pred_x_start_logits.size(1), 1, pred_x_start_logits.size(-1))   # pred_x_start_logits.size(1) = num_edges, pred_x_start_logits.size(-1) = num_classes
-
+            t_broadcast = t.unsqueeze(1).unsqueeze(2)  # Adds new dimensions: [batch_size, 1, 1]
+            t_broadcast = t_broadcast.expand(-1, pred_x_start_logits.size(1), pred_x_start_logits.size(-1)).to(self.device, non_blocking=True)   # pred_x_start_logits.size(1) = num_edges, pred_x_start_logits.size(-1) = num_classes
             model_logits = torch.where(t_broadcast == 0, pred_x_start_logits,
-                                       self.q_posterior_logits(pred_x_start_logits, x, t, x_start_logits=True))
+                                       self.q_posterior_logits(x_start=pred_x_start_logits, x_t=x, t=t, x_start_logits=True))
+            
         elif self.model_prediction == 'xprev':
             pred_x_start_logits = model_logits
             raise NotImplementedError(self.model_prediction)
         
         assert (model_logits.shape == pred_x_start_logits.shape == x.shape + (self.num_classes,))
-        return model_logits, pred_x_start_logits
+        return model_logits, pred_x_start_logits    # (bs, num_eedges, 2)
     
     # === Sampling ===
 
-    def p_sample(self, model_fn, x, t, noise, node_features=None, edge_index=None, edge_attr=None, condition=None):
+    def p_sample(self, model_fn, x, t, noise, edge_features=None, edge_index=None, condition=None):
         """Sample one timestep from the model p(x_{t-1} | x_t)."""
         # Get model logits
-        model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
+        model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, edge_features=edge_features, edge_index=edge_index, condition=condition)
         assert noise.shape == model_logits.shape, noise.shape
 
         # No noise when t == 0
@@ -523,27 +522,31 @@ class CategoricalDiffusion:
         assert pred_x_start_logits.shape == model_logits.shape
         return sample, F.softmax(pred_x_start_logits, dim=-1)
 
-    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, node_features=None, edge_index=None, edge_attr=None, condition=None):
+    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, edge_features=None, edge_index=None, line_graph=None, condition=None):
         """Ancestral sampling."""
         if num_timesteps is None:
             num_timesteps = self.num_timesteps
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.transition_mat_type in ['gaussian', 'uniform']:
+        if self.transition_mat_type in ['gaussian', 'uniform', 'marginal_prior']:
             x_init = torch.randint(0, self.num_classes, size=shape, device=device)
         elif self.transition_mat_type == 'absorbing':
             x_init = torch.full(shape, fill_value=self.num_classes // 2, dtype=torch.int32, device=device)
         else:
             raise ValueError(f"Invalid transition_mat_type {self.transition_mat_type}")
 
-        x = x_init.clone()
-        edge_attr = x_init.unsqueeze(-1).type(torch.float32)
+        x = x_init.clone()  # (bs, num_edges)
+        edge_attr = x_init.float()
+        #new_line_graph_x = line_graph.x.clone()
+        #new_line_graph_x[:, :, 0] = edge_attr
+        new_edge_features = edge_features.clone()
+        new_edge_features[:, :, 0] = edge_attr
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
-            x, _ = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
-            edge_attr = x.unsqueeze(-1).type(torch.float32)
+            x, _ = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
+            new_edge_features[:, :, 0] = x.float()
 
         if return_x_init:
             return x_init, x
@@ -551,103 +554,46 @@ class CategoricalDiffusion:
             return x
 
   # === Log likelihood / loss calculation ===
-
-    def vb_terms_bpd(self, model_fn, *, x_start, x_t, t, node_features=None, edge_index=None, edge_attr=None, condition=None):
-        """Calculate specified terms of the variational bound.
-
-        Args:
-        model_fn: the denoising network
-        x_start: original clean data
-        x_t: noisy data
-        t: timestep of the noisy data (and the corresponding term of the bound
-            to return)
-
-        Returns:
-        a pair `(kl, pred_start_logits)`, where `kl` are the requested bound terms
-        (specified by `t`), and `pred_x_start_logits` is logits of
-        the denoised image.
-        """
-        true_logits = self.q_posterior_logits(x_start, x_t, t, x_start_logits=False)
-        model_logits, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr, condition=condition)
-
-        kl = categorical_kl_logits(input_logits=model_logits, target_logits=true_logits)
-        assert kl.shape == x_start.shape
-        kl = kl / torch.log(torch.tensor(2.0))
-
-        decoder_nll = F.cross_entropy(model_logits, x_start, weight=self.class_weights, reduction='mean')
-        # decoder_nll = -categorical_log_likelihood(x_start, model_logits)
-        #assert decoder_nll.shape == x_start.shape
-
-        # At the first timestep return the decoder NLL,
-        # otherwise return KL(q(x_{t-1}|x_t,x_start) || p(x_{t-1}|x_t))
-        assert kl.shape == decoder_nll.shape == t.shape == (x_start.shape[0],)
-        result = torch.where(t == 0, decoder_nll, kl)
-        return result, pred_x_start_logits
-
-    def prior_bpd(self, x_start):
-        """KL(q(x_{T-1}|x_start)|| U(x_{T-1}|0, num_edges-1))."""
-        q_probs = self.q_probs(
-            x_start=x_start,
-            t=torch.full((x_start.shape[0],), self.num_timesteps - 1, dtype=torch.long))
-
-        if self.transition_mat_type in ['gaussian', 'uniform']:
-            # Stationary distribution is a uniform distribution over all pixel values.
-            prior_probs = torch.ones_like(q_probs) / self.num_classes
-        elif self.transition_mat_type == 'absorbing':
-            absorbing_int = torch.full(x_start.shape[:-1], self.num_classes // 2, dtype=torch.int32)
-            prior_probs = F.one_hot(absorbing_int, num_classes=self.num_classes).to(dtype=self.torch_dtype)
-        else:
-            raise ValueError("Invalid transition_mat_type")
-
-
-        assert prior_probs.shape == q_probs.shape
-
-        kl_prior = categorical_kl_probs(
-            q_probs, prior_probs)
-        assert kl_prior.shape == x_start.shape
-        return meanflat(kl_prior) / torch.log(torch.tensor(2.0))
         
     def cross_entropy_x_start(self, x_start, pred_x_start_logits, class_weights):
         """Calculate binary weighted cross entropy between x_start and predicted x_start logits.
 
         Args:
-            x_start (torch.Tensor): original clean data, expected binary labels (0 or 1)
+            x_start (torch.Tensor): original clean data, expected binary labels (0 or 1), shape (bs, num_edges)
             pred_x_start_logits (torch.Tensor): logits as predicted by the model
             class_weights (torch.Tensor): tensor with weights for class 0 and class 1
 
         Returns:
             torch.Tensor: scalar tensor representing the mean binary weighted cross entropy loss.
         """
-        
         # Calculate binary cross-entropy with logits
-        pred_x_start_logits = pred_x_start_logits.squeeze(2) # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-        pred_x_start_logits = pred_x_start_logits.permute(0, 2, 1) # (bs, num_edges, classes) -> (bs, classes, num_edges)
-        if x_start.dim() == 3:
-            x_start = x_start.squeeze(2) # (bs, num_edges, channels) -> (bs, num_edges)
-        ce = F.cross_entropy(pred_x_start_logits, x_start, weight=class_weights, reduction='mean')
+        x_start = x_start.long().to(self.device, non_blocking=True)
+        pred_x_start_logits = pred_x_start_logits.permute(0, 2, 1).float() # (bs, num_edges, num_classes) -> (bs, num_classes, num_edges)
+        ce = F.cross_entropy(pred_x_start_logits, x_start, weight=class_weights.float().to(self.device, non_blocking=True), reduction='mean')
 
         return ce
 
-    def training_losses(self, model_fn, node_features=None, edge_index=None, data=None, condition=None, *, x_start):
+    def training_losses(self, model_fn, condition=None, *, x_start, edge_features, edge_index, line_graph=None):
         """Training loss calculation."""
         # Add noise to data
-        if self.model_name != 'edge_encoder_mlp':
-            x_start = x_start.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
         noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],))
 
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
-        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x_t = self.q_sample(x_start=x_start, t=t, noise=noise)  # (bs, num_edges)
         
-        if (self.model_name == 'edge_encoder_mlp') & (x_t.dim() == 2):
-            x_t = x_t.unsqueeze(-1)  # [batch_size, num_edges] --> [batch_size, num_edges, channels=1]
-        
-        edge_attr_t = x_t.unsqueeze(-1).type(torch.float32)
+        edge_attr_t = x_t.float()
+        # new_line_graph_x = line_graph.x.clone()
+        new_edge_features = edge_features.clone()
+        for i in range(edge_attr_t.shape[0]):
+            # new_line_graph_x[i, :, 0] = edge_attr_t[i]  # Update the edge attributes in the line graph with the noised trajectory x_t
+            new_edge_features[i, :, 0] = edge_attr_t[i]
+
 
         # Calculate the loss
         if self.loss_type == 'kl':
             losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
-                                                               node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
+                                                               edge_features=new_edge_features, edge_index=edge_index, condition=condition)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
             # NOTE: Currently only works for batch size of 1
@@ -658,7 +604,7 @@ class CategoricalDiffusion:
             
         elif self.loss_type == 'cross_entropy_x_start':
             
-            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
+            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
             losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
@@ -672,40 +618,7 @@ class CategoricalDiffusion:
             
             return losses, pred
             
-        elif self.loss_type == 'hybrid':
-            vb_losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
-                                                               node_features=node_features, edge_index=edge_index, edge_attr=edge_attr_t, condition=condition)
-            ce_losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
-            losses = vb_losses + self.hybrid_coeff * ce_losses
-            
-            pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-            # NOTE: Currently only works for batch size of 1
-            pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-            pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
-            
-            return losses, pred
-            
         else:
             raise NotImplementedError(self.loss_type)
 
         return losses
-
-    def calc_bpd_loop(self, model_fn, *, x_start, rng):
-        """Calculate variational bound (loop over all timesteps and sum)."""
-        batch_size = x_start.shape[0]
-        total_vb = torch.zeros(batch_size)
-
-        for t in range(self.num_timesteps):
-            noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
-            x_t = self.q_sample(x_start=x_start, t=torch.full((batch_size,), t), noise=noise)
-            vb, _ = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=torch.full((batch_size,), t))
-            total_vb += vb
-
-        prior_b = self.prior_bpd(x_start=x_start)
-        total_b = total_vb + prior_b
-
-        return {
-            'total': total_b,
-            'vbterms': total_vb,
-            'prior': prior_b
-        }
