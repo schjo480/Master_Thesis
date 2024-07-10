@@ -1824,15 +1824,15 @@ print(device)
 
     
 data_config = {"dataset": "synthetic_20_traj",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_train.h5',
-    "test_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_val.h5',
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/geolife_train.h5',
+    "test_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/geolife_val.h5',
     "history_len": 5,
     "future_len": 2,
     "num_classes": 2,
     "edge_features": ['one_hot_edges', 'coordinates']
     }
 
-diffusion_config = {"type": 'linear', # Options: 'linear', 'cosine', 'jsd'
+diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
     "start": 0.9,  # 1e-4 gauss, 0.02 uniform
     "stop": 1.0,  # 0.02 gauss, 1. uniform
     "num_timesteps": 100}
@@ -1848,7 +1848,7 @@ model_config = {"name": "edge_encoder_residual",
     "dropout": 0.1,
     "model_output": "logits",
     "model_prediction": "x_start",  # Options: 'x_start','xprev'
-    "transition_mat_type": 'gaussian',  # Options: 'gaussian', 'uniform', 'absorbing', 'marginal_prior'
+    "transition_mat_type": 'marginal_prior',  # Options: 'gaussian', 'uniform', 'absorbing', 'marginal_prior'
     "transition_bands": 0,
     "loss_type": "cross_entropy_x_start",  # Options: kl, cross_entropy_x_start, hybrid
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
@@ -1867,7 +1867,7 @@ train_config = {"batch_size": 1,
     "save_model_every_steps": 200}
 
 test_config = {"batch_size": 1, # currently only 1 works
-    "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/tdrive_gat_edge_encoder_residual_gaussian_linear_hidden_dim_32_time_dim_16_condition_dim_16_layers_2.pth',
+    "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/geolife_residual/geolife_residual_edge_encoder_residual_marginal_prior_cosine_hidden_dim_32_time_dim_16_condition_dim_16_layers_2.pth',
     "number_samples": 1,
     "eval_every_steps": 1000
   }
@@ -1890,6 +1890,9 @@ model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train
 #model.train()
 model_path = test_config["model_path"]
 sample_list, ground_truth_hist, ground_truth_fut = model.get_samples(load_model=True, model_path=model_path, task='predict', number_samples=1)
+torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/geolife_residual/samples_marginal_prior_cosine.pth')
+torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/geolife_residual/ground_truth_hist_marginal_prior_cosine.pth')
+torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/geolife_residual/ground_truth_fut_marginal_prior_cosine.pth')
 fut_ratio, f1, avg_sample_length = model.eval(sample_list, ground_truth_hist, ground_truth_fut)
 print("History", ground_truth_hist)
 print("\n")

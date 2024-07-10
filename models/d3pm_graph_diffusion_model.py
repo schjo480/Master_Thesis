@@ -206,7 +206,7 @@ class Graph_Diffusion_Model(nn.Module):
                 self.log.info(f"Epoch {epoch} Average Loss: {avg_loss.item()}")
                 print("Epoch:", epoch+1)
                 print("Loss:", avg_loss.item())
-                if epoch % 20 == 0:
+                if epoch % 10 == 0:
                     f1_score = F1Score(task='binary', average='macro', num_classes=2)
                     f1_epoch = f1_score(torch.flatten(torch.cat(pred_fut)).detach().to('cpu'), torch.flatten(torch.cat(ground_truth_fut)).detach().to('cpu'))
                     print("F1:", f1_epoch.item())

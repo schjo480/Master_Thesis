@@ -1,7 +1,7 @@
 seml:
   executable: main_seml.py
-  name: geolife_d3pm_residual
-  output_dir: experiments/geolife_d3pm_residual
+  name: geolife_d3pm_gat
+  output_dir: experiments/geolife_d3pm_gat
   project_root_dir: ../..
   conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm
 
@@ -49,7 +49,7 @@ fixed:
     lr_decay: 0.9999 # previously 0.9999
     log_loss_every_steps: 1
     save_model: True
-    save_model_every_steps: 100
+    save_model_every_steps: 10
 
   testing:
     batch_size: 1
@@ -58,7 +58,7 @@ fixed:
     eval_every_steps: 3500
     
   wandb:
-    exp_name: "geolife_residual"
+    exp_name: "geolife_gat_gaussian_linear"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
@@ -72,18 +72,18 @@ grid:
     type: choice
     options:
       - 'linear'
-      - 'cosine'
+      # - 'cosine'
   model.transition_mat_type:
     type: choice
     options:
       - 'gaussian'
-      - 'marginal_prior'
+      # - 'marginal_prior'
   model.name:
     type: choice
     options:
       # - edge_encoder_mlp
-      # - edge_encoder
-      - edge_encoder_residual
+      - edge_encoder
+      # - edge_encoder_residual
   model.hidden_channels:
     type: choice
     options:
