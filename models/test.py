@@ -1037,6 +1037,14 @@ class Edge_Encoder_MLP(nn.Module):
             x: torch.Tensor: input tensor: noised future trajectory indices / history trajectory indices
             t: torch.Tensor: timestep tensor
         """    
+        # Positional Encoding
+        # The first column indicates if the edge is in the trajectory
+        '''trajectory_mask = x[:,:,0].bool()  # Get the mask of edges in the trajectory
+        pos_encoding = self.generate_positional_encodings().to(x.device)
+
+        # Mask positional encoding
+        masked_pos_encoding = pos_encoding.unsqueeze(0) * trajectory_mask.unsqueeze(2).float()
+        x = torch.cat([x, masked_pos_encoding], dim=-1)'''
         
         # GNN forward pass
         
@@ -1069,6 +1077,15 @@ class Edge_Encoder_MLP(nn.Module):
             #print("Tensor size of logits", logits.size())
 
             return logits
+        
+    def generate_positional_encodings(self):
+        """ Generate sinusoidal positional encoding for a fixed length. """
+        position = torch.arange(self.history_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.num_edge_features, 2).float() * -(np.log(10000.0) / self.num_edge_features))
+        pe = torch.zeros(self.history_len, self.num_edge_features)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
