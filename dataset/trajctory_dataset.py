@@ -217,20 +217,24 @@ import time
 from tqdm import tqdm
 
 class TrajectoryDataset(Dataset):
-    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None):
+    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None):
         self.file_path = file_path
         self.history_len = history_len
         self.future_len = future_len
         self.edge_features = edge_features
+        self.embedding_dim = embedding_dim
         self.device = device
         self.num_edge_features = 1
         if 'coordinates' in self.edge_features:
-            self.num_edge_features = 5
+            self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:
-            self.num_edge_features = 6
+            self.num_edge_features += 1
+        if 'pos_encoding' in self.edge_features:
+            self.num_edge_features += self.embedding_dim
         self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
         
         self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
+        self.positional_encoding = self.generate_positional_encodings().float()
         
     @staticmethod
     def load_new_format(file_path, device):
@@ -314,11 +318,25 @@ class TrajectoryDataset(Dataset):
         if 'coordinates' in self.edge_features:
             history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
             future_edge_features = torch.cat((future_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
-            pass
         if 'edge_orientations' in self.edge_features:
             history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
             future_edge_features = torch.cat((future_edge_features, future_edge_orientations.float()), dim=1)
+        if 'pos_encoding' in self.edge_features:
+            encoding_tensor = torch.zeros((len(self.edges), self.embedding_dim), dtype=torch.float64, device=self.device)
+            for i, index in enumerate(history_indices):
+                encoding_tensor[index] = self.positional_encoding[i]
+            history_edge_features = torch.cat((history_edge_features, encoding_tensor.float()), dim=1)    
+        
         return history_edge_features, future_edge_features
+    
+    def generate_positional_encodings(self):
+        position = torch.arange(self.history_len)
+        angle_rates = 1 / torch.pow(10000, (2 * (torch.arange(self.embedding_dim) // 2)) / self.embedding_dim)
+        angle_rads = position.float().unsqueeze(1) * angle_rates.unsqueeze(0)
+        sines = torch.sin(angle_rads[:, 0::2])
+        cosines = torch.cos(angle_rads[:, 1::2])
+        
+        return torch.cat((sines.float(), cosines.float()), dim=-1).to(self.device, non_blocking=True)
         
     def __len__(self):
         return len(self.trajectories)

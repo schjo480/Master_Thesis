@@ -31,6 +31,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.future_len = self.data_config['future_len']
         self.num_classes = self.data_config['num_classes']
         self.edge_features = self.data_config['edge_features']
+        self.pos_encoding_dim = self.data_config['pos_encoding_dim']
         
         # Diffusion
         self.diffusion_config = diffusion_config
@@ -548,7 +549,7 @@ class Graph_Diffusion_Model(nn.Module):
         
     def _build_train_dataloader(self):
         print("Loading Training Dataset...")
-        self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device, embedding_dim=self.pos_encoding_dim)
         self.G = self.train_dataset.build_graph()
         self.nodes = self.G.nodes
         self.edges = self.G.edges(data=True)
@@ -586,7 +587,7 @@ class Graph_Diffusion_Model(nn.Module):
         return edge_index.to(self.device, non_blocking=True)
     
     def _build_val_dataloader(self):
-        self.val_dataset = TrajectoryDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.val_dataset = TrajectoryDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device, embedding_dim=self.pos_encoding_dim)
         self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.test_batch_size, shuffle=False, collate_fn=collate_fn)
         print("> Test Dataset loaded!")
         
