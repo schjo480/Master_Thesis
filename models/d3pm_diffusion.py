@@ -51,7 +51,7 @@ def get_diffusion_betas(spec, device):
         # Schedule proposed by Hoogeboom et al. https://arxiv.org/abs/2102.05379
         # To be used with transition_mat_type = 'uniform'.
         steps = torch.linspace(0, 1, spec['num_timesteps'] + 1, dtype=torch.float64)
-        alpha_bar = torch.cos((steps + 0.008) / 1.008 * torch.pi / 2)
+        alpha_bar = torch.square(torch.cos(((steps + 0.008) / 1.008) * torch.pi / 2))
         betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], torch.tensor(0.999))
         return betas.to(device)
     elif spec['type'] == 'jsd':  # 1/T, 1/(T-1), 1/(T-2), ..., 1
@@ -310,6 +310,10 @@ class CategoricalDiffusion:
                     mat[i, j] = 1 - beta_t + beta_t * self.class_probs[j]
         
         return mat
+    
+    def _get_custom_transition_mat(self, t):
+        # TODO: return a matrix [[1 - a_t a_t], [a_t, 1 - a_t]], with a_t = t/T
+        pass
 
     def _at(self, a, t, x):
         """

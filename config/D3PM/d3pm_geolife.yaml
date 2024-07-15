@@ -22,6 +22,7 @@ fixed:
     history_len: 5
     future_len: 2
     num_classes: 2
+    pos_encoding_dim: 4
     edge_features: ['one_hot_edges', 'coordinates']
 
   diffusion_config:

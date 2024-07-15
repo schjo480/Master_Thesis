@@ -1,7 +1,7 @@
 seml:
   executable: main_seml.py
-  name: munich_d3pm_mlp
-  output_dir: experiments/munich_d3pm_mlp
+  name: munich_d3pm_residual
+  output_dir: experiments/munich_d3pm_residual
   project_root_dir: ../..
   conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm
 
@@ -22,6 +22,7 @@ fixed:
     history_len: 5
     future_len: 2
     num_classes: 2
+    pos_encoding_dim: 4
     edge_features: ['one_hot_edges', 'coordinates']
 
   diffusion_config:
@@ -58,12 +59,12 @@ fixed:
     eval_every_steps: 3500
     
   wandb:
-    exp_name: "munich_mlp"
+    exp_name: "munich_residual"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
     notes: ""
-    tags: ["munich", "edge_encoder_mlp"]
+    tags: ["munich", "edge_encoder_residual"]
 
   eval: False
 
@@ -81,9 +82,9 @@ grid:
   model.name:
     type: choice
     options:
-      - edge_encoder_mlp
+      # - edge_encoder_mlp
       # - edge_encoder
-      # - edge_encoder_residual
+      - edge_encoder_residual
   model.hidden_channels:
     type: choice
     options:

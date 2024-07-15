@@ -157,7 +157,7 @@ class Graph_Diffusion_Model(nn.Module):
                         total_loss += loss / self.gradient_accumulation_steps
                         (loss / self.gradient_accumulation_steps).backward() # Gradient accumulation
                         
-                        if epoch % 20 == 0:
+                        if epoch % 10 == 0:
                             ground_truth_fut.append(x_start.detach().to('cpu'))
                             pred_fut.append(preds.detach().to('cpu'))
                         
@@ -195,7 +195,7 @@ class Graph_Diffusion_Model(nn.Module):
                     loss.backward()
                     
                     self.optimizer.step()
-                    if epoch % 20 == 0:
+                    if epoch % 10 == 0:
                         ground_truth_fut.append(x_start.detach().to('cpu'))
                         pred_fut.append(preds.detach().to('cpu'))
             

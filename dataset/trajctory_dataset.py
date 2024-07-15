@@ -209,7 +209,7 @@ def collate_fn(batch):
         }'''
         
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 import h5py
 import networkx as nx
 import numpy as np
