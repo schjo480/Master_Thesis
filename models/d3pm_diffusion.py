@@ -47,13 +47,36 @@ def get_diffusion_betas(spec, device):
         # state spaces.
         # To be used with transition_mat_type = 'gaussian'
         return torch.linspace(spec['start'], spec['stop'], spec['num_timesteps']).to(device)
+    
     elif spec['type'] == 'cosine':
         # Schedule proposed by Hoogeboom et al. https://arxiv.org/abs/2102.05379
         # To be used with transition_mat_type = 'uniform'.
-        steps = torch.linspace(0, 1, spec['num_timesteps'] + 1, dtype=torch.float64)
-        alpha_bar = torch.square(torch.cos(((steps + 0.008) / 1.008) * torch.pi / 2))
-        betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], torch.tensor(0.999))
+        def cosine_beta_schedule(timesteps, s=0.008):
+            """
+            Cosine schedule as described in https://arxiv.org/abs/2102.09672.
+
+            Parameters:
+            - timesteps: int, the number of timesteps for the schedule.
+            - s: float, small constant to prevent numerical issues.
+
+            Returns:
+            - betas: torch.Tensor, beta values for each timestep.
+            - alphas: torch.Tensor, alpha values for each timestep.
+            - alpha_bars: torch.Tensor, cumulative product of alphas for each timestep.
+            """
+            steps = timesteps + 1
+            x = torch.linspace(0, timesteps, steps)
+            alphas_cumprod = torch.cos((x / timesteps + s) / (1 + s) * torch.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+
+            betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
+            alphas = 1 - betas
+            alpha_bars = torch.cumprod(alphas, dim=0)
+
+            return betas, alphas, alpha_bars
+        betas, alphas, alpha_bars = cosine_beta_schedule(spec['num_timesteps'])
         return betas.to(device)
+    
     elif spec['type'] == 'jsd':  # 1/T, 1/(T-1), 1/(T-2), ..., 1
         # Proposed by Sohl-Dickstein et al., https://arxiv.org/abs/1503.03585
         # To be used with absorbing state models.
@@ -90,7 +113,7 @@ class CategoricalDiffusion:
         self.num_edges = num_edges
         self.future_len = future_len
         # self.class_weights = torch.tensor([self.future_len / self.num_edges, 1 - self.future_len / self.num_edges], dtype=torch.float64)
-        self.class_weights = torch.tensor([0.4, 0.6], dtype=torch.float64)
+        self.class_weights = torch.tensor([0.5, 0.5], dtype=torch.float64)
         self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
         self.transition_bands = transition_bands
         self.transition_mat_type = transition_mat_type
@@ -118,6 +141,9 @@ class CategoricalDiffusion:
                             for t in range(0, self.num_timesteps)]
         elif self.transition_mat_type == 'marginal_prior':
             q_one_step_mats = [self._get_prior_distribution_transition_mat(t)
+                               for t in range(0, self.num_timesteps)]
+        elif self.transition_mat_type == 'custom':
+            q_one_step_mats = [self._get_custom_transition_mat(t)
                                for t in range(0, self.num_timesteps)]
         else:
             raise ValueError(
@@ -312,8 +338,25 @@ class CategoricalDiffusion:
         return mat
     
     def _get_custom_transition_mat(self, t):
-        # TODO: return a matrix [[1 - a_t a_t], [a_t, 1 - a_t]], with a_t = t/T
-        pass
+        """
+        Generates a 2x2 transition matrix for a discrete diffusion process at timestep t.
+
+        Parameters:
+        - t: int, current timestep.
+        - device: torch.device, the device to place the tensor on.
+
+        Returns:
+        - transition_matrix: torch.Tensor, a 2x2 transition matrix.
+        """
+        alphas = 1 - self.betas
+        alpha_bars = torch.cumprod(alphas, dim=0)
+        alpha_bar_t = alpha_bars[t].to(self.device)
+        
+        # Compute the transition probabilities
+        transition_matrix = torch.tensor([[alpha_bar_t, 1 - alpha_bar_t],
+                                        [1 - alpha_bar_t, alpha_bar_t]], device=self.device)
+        
+        return transition_matrix
 
     def _at(self, a, t, x):
         """
@@ -344,12 +387,16 @@ class CategoricalDiffusion:
         
         # Convert `a` to the desired dtype if not already
         a = a.type(self.torch_dtype)
+        #print("A", a.shape)
+        
 
         # Prepare t for broadcasting by adding necessary singleton dimensions
         t_broadcast = t.view(-1, *((1,) * (x.ndim - 1))).to(self.device, non_blocking=True)
 
         # Advanced indexing in PyTorch to select elements
-        return a[t_broadcast, x.long()].to(self.device, non_blocking=True)
+        #print("_at output", a[t_broadcast, x.long()].shape)
+        #print(a[t_broadcast, x.long()])
+        return a[t_broadcast, x.long()].to(self.device, non_blocking=True)  # (batch_size, num_edges, 2)
 
     def _at_onehot(self, a, t, x):
         """Extract coefficients at specified timesteps t and conditioning data x.
@@ -473,16 +520,17 @@ class CategoricalDiffusion:
 
         Args:
             model_fn (function): The model function that takes input `x` and `t` and returns the model output.
-            x (torch.Tensor): The input tensor of shape (batch_size, input_size) representing the noised input at time t.
+            x (torch.Tensor): The input tensor of shape (batch_size, num_edges) representing the noised input at time t.
             t (torch.Tensor): The time tensor of shape (batch_size,) representing the time step.
 
         Returns:
             tuple: A tuple containing two tensors:
-                - model_logits (torch.Tensor): The logits of p(x_{t-1} | x_t) of shape (batch_size, input_size, num_classes).
-                - pred_x_start_logits (torch.Tensor): The logits of p(x_{t-1} | x_start) of shape (batch_size, input_size, num_classes).
+                - model_logits (torch.Tensor): The logits of p(x_{t-1} | x_t) of shape (batch_size, num_edges, num_classes).
+                - pred_x_start_logits (torch.Tensor): The logits of p(x_{t-1} | x_start) of shape (batch_size, num_edges, num_classes).
         """
         assert t.shape == (x.shape[0],)
         model_output = model_fn(edge_features, edge_index, t, condition=condition)
+        #print("Output", model_output.size())
 
         if self.model_output == 'logits':
             model_logits = model_output
@@ -494,17 +542,18 @@ class CategoricalDiffusion:
 
         if self.model_prediction == 'x_start':
             pred_x_start_logits = model_logits
+            #print("Pred_x_start_logits", pred_x_start_logits.shape)
+            # print(pred_x_start_logits)
             t_broadcast = t.unsqueeze(1).unsqueeze(2)  # Adds new dimensions: [batch_size, 1, 1]
             t_broadcast = t_broadcast.expand(-1, pred_x_start_logits.size(1), pred_x_start_logits.size(-1)).to(self.device, non_blocking=True)   # pred_x_start_logits.size(1) = num_edges, pred_x_start_logits.size(-1) = num_classes
             model_logits = torch.where(t_broadcast == 0, pred_x_start_logits,
                                        self.q_posterior_logits(x_start=pred_x_start_logits, x_t=x, t=t, x_start_logits=True))
-            
         elif self.model_prediction == 'xprev':
             pred_x_start_logits = model_logits
             raise NotImplementedError(self.model_prediction)
         
         assert (model_logits.shape == pred_x_start_logits.shape == x.shape + (self.num_classes,))
-        return model_logits, pred_x_start_logits    # (bs, num_eedges, 2)
+        return model_logits, pred_x_start_logits    # (bs, num_edges, 2)
     
     # === Sampling ===
 
@@ -512,6 +561,7 @@ class CategoricalDiffusion:
         """Sample one timestep from the model p(x_{t-1} | x_t)."""
         # Get model logits
         model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, edge_features=edge_features, edge_index=edge_index, condition=condition)
+
         assert noise.shape == model_logits.shape, noise.shape
 
         # No noise when t == 0
@@ -524,16 +574,19 @@ class CategoricalDiffusion:
 
         assert sample.shape == x.shape
         assert pred_x_start_logits.shape == model_logits.shape
-        return sample, F.softmax(pred_x_start_logits, dim=-1)
+        
+        return sample, pred_x_start_logits
 
-    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, edge_features=None, edge_index=None, line_graph=None, condition=None):
+    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, edge_features=None, edge_index=None, line_graph=None, condition=None, task=None):
         """Ancestral sampling."""
         if num_timesteps is None:
             num_timesteps = self.num_timesteps
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.transition_mat_type in ['gaussian', 'uniform', 'marginal_prior']:
-            x_init = torch.randint(0, self.num_classes, size=shape, device=device)
+        if self.transition_mat_type in ['gaussian', 'uniform', 'marginal_prior', 'custom']:
+            # x_init = torch.randint(0, self.num_classes, size=shape, device=device)
+            prob_class_1 = 0.5
+            x_init = torch.bernoulli(torch.full(size=shape, fill_value=prob_class_1, device=device))
         elif self.transition_mat_type == 'absorbing':
             x_init = torch.full(shape, fill_value=self.num_classes // 2, dtype=torch.int32, device=device)
         else:
@@ -541,16 +594,17 @@ class CategoricalDiffusion:
 
         x = x_init.clone()  # (bs, num_edges)
         edge_attr = x_init.float()
-        #new_line_graph_x = line_graph.x.clone()
-        #new_line_graph_x[:, :, 0] = edge_attr
         new_edge_features = edge_features.clone()
-        new_edge_features[:, :, 0] = edge_attr
+        '''for i in range(edge_attr.shape[0]):
+            new_edge_features[i * self.num_edges:(i + 1)*self.num_edges, 0] = edge_attr[i]'''
+        # TODO: Adapt this for higher batch sizes (see loop above)
+        new_edge_features[:, 0] = edge_attr
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
-            x, _ = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
-            new_edge_features[:, :, 0] = x.float()
+            x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
+            new_edge_features[:, 0] = x.float()
 
         if return_x_init:
             return x_init, x
@@ -580,18 +634,21 @@ class CategoricalDiffusion:
     def training_losses(self, model_fn, condition=None, *, x_start, edge_features, edge_index, line_graph=None):
         """Training loss calculation."""
         # Add noise to data
+        batch_size, num_edges = x_start.shape
         noise = torch.rand(x_start.shape + (self.num_classes,), dtype=torch.float32)
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],))
 
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)  # (bs, num_edges)
+        #print("X_start", [torch.argwhere(x_start[i].unsqueeze(0) == 1)[:, 1] for i in range(x_start.shape[0])])
+        #print("X_t", [torch.argwhere(x_t[i].unsqueeze(0) == 1)[:, 1] for i in range(x_t.shape[0])])
+        #print("t", t)
+        #print("\n")
         
-        edge_attr_t = x_t.float()
-        # new_line_graph_x = line_graph.x.clone()
+        edge_attr_t = x_t.float()   # (bs, num_edges)
         new_edge_features = edge_features.clone()
         for i in range(edge_attr_t.shape[0]):
-            # new_line_graph_x[i, :, 0] = edge_attr_t[i]  # Update the edge attributes in the line graph with the noised trajectory x_t
-            new_edge_features[i, :, 0] = edge_attr_t[i]
+            new_edge_features[i * num_edges:(i + 1)*num_edges, 0] = edge_attr_t[i]
 
 
         # Calculate the loss
@@ -616,7 +673,7 @@ class CategoricalDiffusion:
             if (self.model_name == 'edge_encoder') | (self.model_name == 'edge_encoder_residual'):
                 # NOTE: Currently only works for batch size of 1
                 pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-                pred = pred_x_start_logits.argmax(dim=1)    # (num_edges, classes) -> (num_edges,)
+                pred = pred_x_start_logits.argmax(dim=2)    # (num_edges, classes) -> (num_edges,)
             elif self.model_name == 'edge_encoder_mlp':
                 pred = pred_x_start_logits.argmax(dim=2)
             
