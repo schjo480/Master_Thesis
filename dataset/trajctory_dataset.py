@@ -229,12 +229,12 @@ class TrajectoryDataset(Dataset):
             self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:
             self.num_edge_features += 1
-        if 'pos_encoding' in self.edge_features:
-            self.num_edge_features += self.embedding_dim
+        '''if 'pos_encoding' in self.edge_features:
+            self.num_edge_features += self.embedding_dim'''
         self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
         
         self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
-        self.positional_encoding = self.generate_positional_encodings().float()
+        # self.positional_encoding = self.generate_positional_encodings().float()
         
     @staticmethod
     def load_new_format(file_path, device):
@@ -321,11 +321,11 @@ class TrajectoryDataset(Dataset):
         if 'edge_orientations' in self.edge_features:
             history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
             future_edge_features = torch.cat((future_edge_features, future_edge_orientations.float()), dim=1)
-        if 'pos_encoding' in self.edge_features:
+        '''if 'pos_encoding' in self.edge_features:
             encoding_tensor = torch.zeros((len(self.edges), self.embedding_dim), dtype=torch.float64, device=self.device)
             for i, index in enumerate(history_indices):
                 encoding_tensor[index] = self.positional_encoding[i]
-            history_edge_features = torch.cat((history_edge_features, encoding_tensor.float()), dim=1)    
+            history_edge_features = torch.cat((history_edge_features, encoding_tensor.float()), dim=1)    '''
         
         return history_edge_features, future_edge_features
     

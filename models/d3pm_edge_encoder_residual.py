@@ -37,9 +37,18 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None
 
     assert emb.shape == (timesteps.shape[0], embedding_dim)
     return emb.to(device)
+    
+def generate_positional_encodings(history_len, embedding_dim, device, n=1000):
+    PE = torch.zeros((history_len, embedding_dim), device=device)
+    for k in range(history_len):
+        for i in torch.arange(int(embedding_dim/2)):
+            denominator = torch.pow(n, 2*i/embedding_dim)
+            PE[k, 2*i] = torch.sin(k/denominator)
+            PE[k, 2*i+1] = torch.cos(k/denominator)
+    return PE
 
 class Edge_Encoder_Residual(nn.Module):
-    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, num_edge_features, num_timesteps):
+    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, edge_features, num_edge_features, num_timesteps, pos_encoding_dim):
         super(Edge_Encoder_Residual, self).__init__()
         # Config
         self.config = model_config
@@ -49,7 +58,7 @@ class Edge_Encoder_Residual(nn.Module):
         self.num_edge_features = num_edge_features
         self.history_len = history_len
         self.future_len = future_len
-        
+        self.edge_features = edge_features
         
         self.num_classes = num_classes
         self.model_output = self.config['model_output']
@@ -59,6 +68,12 @@ class Edge_Encoder_Residual(nn.Module):
         self.time_embedding_dim = self.config['time_embedding_dim']
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
+        
+        # Positional Encoding
+        self.pos_encoding_dim = pos_encoding_dim
+        if 'pos_encoding' in self.edge_features:
+            self.pos_linear0 = nn.Linear(self.pos_encoding_dim, self.pos_encoding_dim)
+            self.pos_linear1 = nn.Linear(self.pos_encoding_dim, self.pos_encoding_dim)
     
         # Model
         # GNN layers
@@ -78,11 +93,15 @@ class Edge_Encoder_Residual(nn.Module):
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
-        self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
-                                        self.hidden_channels)
+        if 'pos_encoding' in self.edge_features:
+            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim + self.pos_encoding_dim,
+                                        self.hidden_channels)  # To predict future edges
+        else:
+            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
+                                            self.hidden_channels)  # To predict future edges
         self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, x, edge_index, t=None, condition=None, mode=None):
+    def forward(self, x, edge_index, indices=None, t=None, condition=None, mode=None):
         """
         Forward pass through the model
         Args:
@@ -92,34 +111,73 @@ class Edge_Encoder_Residual(nn.Module):
         
         # GNN forward pass
         # Edge Embedding
+        batch_size = x.size(0) // self.num_edges
         if x.dim() == 3:
             x = x.squeeze(0)    # (bs, num_edges, num_edge_features) -> (num_edges, num_edge_features)
         
         for conv, res_layer in zip(self.convs, self.res_layers):
             res = F.relu(res_layer(x))
-            x = F.relu(conv(x, edge_index)) # (num_edges, hidden_channels)
-            x = self.theta * x + res
+            x = F.relu(conv(x, edge_index))
+            x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)
             
         if mode == 'history':
-            c = self.history_encoder(x)
-            
+            c = self.history_encoder(x)     # (batch_size * num_edges, condition_dim)
+            if 'pos_encoding' in self.edge_features:
+                pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
+                encodings = F.silu(self.pos_linear0(pos_encoding))
+                encodings = F.silu(self.pos_linear1(encodings))
+                c = self.integrate_encodings(c, indices, encodings)     # (batch_size * num_edges, condition_dim + pos_encoding_dim)
             return c
         
         elif mode == 'future':
             # Time embedding
-            # TODO: Check if time embedding and condition generation are the same for each datapoint in a batch and hence the problems while sampling
             t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
             t_emb = self.time_linear0(t_emb)
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
-            t_emb = F.silu(t_emb)
-            t_emb = t_emb.repeat(self.num_edges, 1) # (num_edges, time_embedding_dim)
+            t_emb = F.silu(t_emb)   # (batch_size, time_embedding_dim)
+            t_emb = torch.repeat_interleave(t_emb, self.num_edges, dim=0) # (batch_size * num_edges, time_embedding_dim)
             
             #Concatenation
-            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding
-            x = torch.cat((x, condition), dim=1) # Concatenate with condition c
-            
-            logits = self.future_decoder(x) # (num_edges, hidden_channels)
-            logits = self.adjust_to_class_shape(logits) # (num_edges, num_classes=2)
+            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding, (batch_size * num_edges, hidden_dim')
+            x = torch.cat((x, condition), dim=1) # Concatenate with condition c, (batch_size * num_edges, hidden_dim')
+            logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
+            logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)
 
-            return logits.unsqueeze(0)  # (1, num_edges, num_classes=2)
+            return logits.view(batch_size, self.num_edges, -1)  # (1, num_edges, num_classes=2)
+
+    def integrate_encodings(self, features, indices, encodings):
+        """
+        Integrates positional encodings into the feature matrix.
+
+        Args:
+            features (torch.Tensor): Original feature matrix [num_edges, num_features].
+            indices (torch.Tensor): Indices of edges where the encodings should be added.
+            encodings (torch.Tensor): Positional encodings [len(indices), encoding_dim].
+
+        Returns:
+            torch.Tensor: Updated feature matrix with positional encodings integrated.
+        """
+        
+        # Ensure that features are on the same device as encodings
+        batch_size = indices.shape[0]
+        encodings = encodings.repeat(batch_size, 1)
+        # Ensure that features and encodings are on the same device
+        features = features.to(encodings.device)
+        
+        # Expand the features tensor to accommodate the positional encodings
+        new_features = torch.cat([features, torch.zeros(features.size(0), encodings.size(1), device=features.device)], dim=1)
+        
+        # Calculate batch offsets
+        batch_offsets = torch.arange(batch_size, device=features.device) * self.num_edges
+        
+        # Reshape indices to batched format to adjust with batch offsets
+        # indices_batched = indices.view(batch_size, self.history_len)
+        
+        # Flatten indices for direct access, adjust with batch offsets
+        flat_indices = (indices + batch_offsets.unsqueeze(1)).flatten()
+        
+        # Place the positional encodings in the correct rows across all batches
+        new_features[flat_indices, -encodings.size(1):] = encodings
+
+        return new_features

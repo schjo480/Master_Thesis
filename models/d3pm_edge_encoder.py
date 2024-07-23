@@ -38,8 +38,33 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None
     assert emb.shape == (timesteps.shape[0], embedding_dim)
     return emb.to(device)
 
+def generate_positional_encodings(indices, history_len, embedding_dim, device):
+    """
+    Generates positional encodings only for specified indices.
+
+    Args:
+        indices (torch.Tensor): The indices of history edges.
+        history_len (int): Total positions (here, history length).
+        embedding_dim (int): The dimensionality of each position encoding.
+        device (torch.device): The device tensors are stored on.
+
+    Returns:
+        torch.Tensor: Positional encodings for specified indices with shape [len(indices), embedding_dim].
+    """
+    positions = torch.arange(history_len, dtype=torch.float32, device=device)
+    # Get div term
+    div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * -(torch.log(torch.tensor(10000.0)) / embedding_dim))
+    div_term = div_term.to(device)
+
+    # Compute positional encodings
+    pe = torch.zeros((len(indices), embedding_dim), device=device)
+    pe[:, 0::2] = torch.sin(positions[indices][:, None] * div_term[None, :])
+    pe[:, 1::2] = torch.cos(positions[indices][:, None] * div_term[None, :])
+
+    return pe
+
 class Edge_Encoder(nn.Module):
-    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, num_edge_features, num_timesteps):
+    def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, edge_features, num_edge_features, num_timesteps, pos_encoding_dim):
         super(Edge_Encoder, self).__init__()
         # Config
         self.config = model_config
@@ -49,7 +74,7 @@ class Edge_Encoder(nn.Module):
         self.num_edge_features = num_edge_features
         self.history_len = history_len
         self.future_len = future_len
-        
+        self.edge_features = edge_features
         
         self.num_classes = num_classes
         self.model_output = self.config['model_output']
@@ -59,6 +84,12 @@ class Edge_Encoder(nn.Module):
         self.time_embedding_dim = self.config['time_embedding_dim']
         self.time_linear0 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
         self.time_linear1 = nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
+        
+        # Positional Encoding
+        self.pos_encoding_dim = pos_encoding_dim
+        if 'pos_encoding' in self.edge_features:
+            self.pos_linear0 = nn.Linear(self.pos_encoding_dim, self.pos_encoding_dim)
+            self.pos_linear1 = nn.Linear(self.pos_encoding_dim, self.pos_encoding_dim)
     
         # Model
         # GNN layers
@@ -73,11 +104,15 @@ class Edge_Encoder(nn.Module):
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
-        self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
-                                        self.hidden_channels)
+        if 'pos_encoding' in self.edge_features:
+            self.future_decoder = nn.Linear(self.hidden_channels + self.condition_dim + self.time_embedding_dim + self.pos_encoding_dim,
+                                        self.hidden_channels)  # To predict future edges
+        else:
+            self.future_decoder = nn.Linear(self.hidden_channels + self.condition_dim + self.time_embedding_dim,
+                                            self.hidden_channels)  # To predict future edges
         self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, x, edge_index, t=None, condition=None, mode=None):
+    def forward(self, x, edge_index, indices=None, t=None, condition=None, mode=None):
         """
         Forward pass through the model
         Args:
@@ -95,6 +130,11 @@ class Edge_Encoder(nn.Module):
                     
         if mode == 'history':
             c = self.history_encoder(x) # (num_edges, condition_dim)
+            if 'pos_encoding' in self.edge_features:
+                pos_encoding = generate_positional_encodings(indices, self.history_len, self.pos_encoding_dim, device=x.device)
+                encodings = F.silu(self.pos_linear0(pos_encoding))
+                encodings = F.silu(self.pos_linear1(encodings))
+                c = self.integrate_encodings(c, indices, encodings)
             
             return c
         
@@ -120,3 +160,26 @@ class Edge_Encoder(nn.Module):
             #print("Logits post size", logits.size())
 
             return logits.unsqueeze(0)  # (1, num_edges, num_classes=2)
+
+    def integrate_encodings(self, features, indices, encodings):
+        """
+        Integrates positional encodings into the feature matrix.
+
+        Args:
+            features (torch.Tensor): Original feature matrix [num_edges, num_features].
+            indices (torch.Tensor): Indices of edges where the encodings should be added.
+            encodings (torch.Tensor): Positional encodings [len(indices), encoding_dim].
+
+        Returns:
+            torch.Tensor: Updated feature matrix with positional encodings integrated.
+        """
+        # Ensure that features are on the same device as encodings
+        features = features.to(encodings.device)
+        
+        # Expand the features tensor to accommodate the positional encodings
+        new_features = torch.cat([features, torch.zeros(features.size(0), encodings.size(1), device=features.device)], dim=1)
+        
+        # Place the positional encodings in the rows specified by indices
+        new_features[indices, -encodings.size(1):] = encodings
+
+        return new_features

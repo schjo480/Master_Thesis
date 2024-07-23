@@ -2,13 +2,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+# from torch.utils.data import DataLoader
 from torchmetrics import F1Score
 from torch_geometric.utils import from_networkx
-from dataset.trajctory_dataset import TrajectoryDataset, collate_fn
+from torch_geometric.loader import DataLoader
+#from dataset.trajctory_dataset import TrajectoryDataset, collate_fn
+from dataset.trajectory_dataset_geometric import TrajectoryGeoDataset, custom_collate_fn
 from .d3pm_diffusion import make_diffusion
-from .d3pm_edge_encoder import Edge_Encoder
-import yaml
 from tqdm import tqdm
 import logging
 import os
@@ -89,7 +89,8 @@ class Graph_Diffusion_Model(nn.Module):
         file_handler.setFormatter(formatter)
         self.log.addHandler(file_handler)
         
-        self.log_loss_every_steps = self.train_config['log_loss_every_steps']        
+        self.log_loss_every_steps = self.train_config['log_loss_every_steps']
+        self.log_metrics_every_steps = self.train_config['log_metrics_every_steps']   
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -117,15 +118,15 @@ class Graph_Diffusion_Model(nn.Module):
         dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, device=self.device)
         def model_fn(x, edge_index, t, condition=None):
             if self.model_config['name'] == 'edge_encoder':
-                return self.model.forward(x, edge_index, t, condition, mode='future')
+                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
             elif self.model_config['name'] == 'edge_encoder_residual':
-                return self.model.forward(x, edge_index, t, condition, mode='future')
+                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
             elif self.model_config['name'] == 'edge_encoder_mlp':
                 return self.model.forward(x, t=t, condition=condition, mode='future')
                 
         for epoch in tqdm(range(self.num_epochs)):
             current_lr = self.scheduler.get_last_lr()[0]
-            wandb.log({"epoch": epoch, "learning_rate": current_lr})
+            wandb.log({"Epoch": epoch, "Learning Rate": current_lr})
             
             total_loss = 0
             ground_truth_fut = []
@@ -135,18 +136,18 @@ class Graph_Diffusion_Model(nn.Module):
             if self.gradient_accumulation:
                 for data in self.train_data_loader:
                     history_edge_features = data["history_edge_features"]
+                    history_indices = data["history_indices"]
                     future_edge_indices_one_hot = data["future_edge_features"][:, :, 0]
                     
                     self.optimizer.zero_grad()
                     for i in range(min(self.gradient_accumulation_steps, history_edge_features.size(0))):
                         # Calculate history condition c
-                        
                         if self.model_config['name'] == 'edge_encoder':
-                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, mode='history')
+                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i], mode='history')
                         elif self.model_config['name'] == 'edge_encoder_residual':
-                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, mode='history')
+                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i], mode='history')
                         elif self.model_config['name'] == 'edge_encoder_mlp':
-                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), mode='history')
+                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), indices=history_indices[i], mode='history')
                         else:
                             raise NotImplementedError(self.model_config['name'])
                         
@@ -166,63 +167,71 @@ class Graph_Diffusion_Model(nn.Module):
                     
             else:
                 for data in self.train_data_loader:
-                    history_edge_features = data["history_edge_features"]
-                    future_edge_indices_one_hot = data["future_edge_features"][:, :, 0]
+                    history_edge_features = data.x
+                    history_indices = data.history_indices
+                    future_edge_indices_one_hot = data.y[:, :, 0]
                     
                     batch_size = future_edge_indices_one_hot.size(0)
-                    if self.model_config['name'] == 'edge_encoder_mlp':
+                    '''if self.model_config['name'] == 'edge_encoder_mlp':
                         if batch_size == self.batch_size:
                             future_edge_indices_one_hot = future_edge_indices_one_hot.view(self.batch_size, self.num_edges)
                         else:
-                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(batch_size, self.num_edges)
+                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(batch_size, self.num_edges)'''
                     
                     self.optimizer.zero_grad()
                     # Calculate history condition c
                     if self.model_config['name'] == 'edge_encoder':
-                        c = self.model.forward(x=history_edge_features, edge_index=self.edge_index, mode='history')
+                        c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_indices, mode='history')
                     elif self.model_config['name'] == 'edge_encoder_residual':
-                        c = self.model.forward(x=history_edge_features, edge_index=self.edge_index, mode='history')
+                        c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_indices, mode='history')
                     elif self.model_config['name'] == 'edge_encoder_mlp':
-                        c = self.model.forward(x=history_edge_features, mode='history')
+                        c = self.model.forward(x=history_edge_features, indices=history_indices, mode='history')
                     else:
                         raise NotImplementedError(self.model_config['name'])
                     
-                    x_start = future_edge_indices_one_hot
+                    x_start = future_edge_indices_one_hot   # (batch_size, num_edges, 1)
                     # Get loss and predictions
-                    loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=history_edge_features, edge_index=self.edge_index, line_graph=None)
-                                        
+                    loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=history_edge_features, edge_index=data.edge_index, line_graph=None)
                     total_loss += loss
                     loss.backward()
                     
                     self.optimizer.step()
-                    if epoch % 10 == 0:
+                    if epoch % self.log_metrics_every_steps == 0:
                         ground_truth_fut.append(x_start.detach().to('cpu'))
                         pred_fut.append(preds.detach().to('cpu'))
-            
             self.scheduler.step()
                     
             if epoch % self.log_loss_every_steps == 0:
                 avg_loss = total_loss / len(self.train_data_loader)
-                wandb.log({"epoch": epoch, "average_loss": avg_loss.item()})
-                self.log.info(f"Epoch {epoch} Average Loss: {avg_loss.item()}")
-                print("Epoch:", epoch+1)
-                print("Loss:", avg_loss.item())
-                if epoch % 10 == 0:
+                wandb.log({"Epoch": epoch, "Average Train Loss": avg_loss.item()})
+                self.log.info(f"Epoch {epoch}, Average Train Loss: {avg_loss.item()}")
+                print(f"Epoch {epoch}, Average Train Loss: {avg_loss.item()}")
+                if epoch % self.log_metrics_every_steps == 0:
+                    #print("Ground Truth Training", [[torch.argwhere(ground_truth_fut[i][j].unsqueeze(0) == 1)[:, 1] for i in range(len(ground_truth_fut))] for j in range(ground_truth_fut[0].size(0))])
+                    #print("Samples Training", [[torch.argwhere(pred_fut[i][j].unsqueeze(0) == 1)[:, 1] for i in range(len(pred_fut))] for j in range(pred_fut[0].size(0))])
                     f1_score = F1Score(task='binary', average='macro', num_classes=2)
                     f1_epoch = f1_score(torch.flatten(torch.cat(pred_fut)).detach().to('cpu'), torch.flatten(torch.cat(ground_truth_fut)).detach().to('cpu'))
-                    print("F1:", f1_epoch.item())
-                    wandb.log({"epoch": epoch, "average_F1_score": f1_epoch.item()})
+                    print("Train F1 Score:", f1_epoch.item())
+                    wandb.log({"Epoch": epoch, "Train F1 Score": f1_epoch.item()})
+                    #print("Samples", pred_fut)
+                    #print("Sample 1", pred_fut[0])
+                    #print("Sample 1", pred_fut[0].size())
+                    #print([sum(sum(sample) for sample in pred_fut[i] / len(pred_fut[i])) for i in range(len(pred_fut))])
+                    #intermediate = [sum(sum(sample) for sample in pred_fut[i]) / len(pred_fut[i]) for i in range(len(pred_fut))]
+                    #avg_sample_length_train = sum(intermediate) / len(intermediate)
+                    #wandb.log({"Epoch": epoch, "Average train sample length": avg_sample_length_train.item()})
                 
             if (epoch + 1) % self.eval_every_steps == 0:
-                print("Evaluating on test set...")
-                sample_list, ground_truth_hist, ground_truth_fut = self.get_samples(task='predict')
-                fut_ratio, f1, avg_sample_length = self.eval(sample_list, ground_truth_hist, ground_truth_fut)
+                print("Evaluating on validation set...")
+                sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = self.get_samples(task='predict')
+                fut_ratio, f1, avg_sample_length = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary)
                 print("Samples", sample_list)
                 print("Ground truth", ground_truth_fut)
-                print("Test F1 Score", f1.item())
-                wandb.log({"Test F1 Score": f1.item()})
-                wandb.log({"Test Future ratio": fut_ratio})
-                wandb.log({"Average test sample length": avg_sample_length})
+                print("Val F1 Score", f1.item())
+                print("Average val sample length", round(avg_sample_length, 3))
+                wandb.log({"Epoch": epoch, "Val F1 Score": f1.item()})
+                wandb.log({"Epoch": epoch, "Val Future ratio": fut_ratio})
+                wandb.log({"Epoch": epoch, "Average val sample length": round(avg_sample_length, 3)})
                         
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
@@ -253,30 +262,34 @@ class Graph_Diffusion_Model(nn.Module):
         
         def model_fn(x, edge_index, t, condition=None):
             if self.model_config['name'] == 'edge_encoder':
-                return self.model.forward(x, edge_index, t, condition, mode='future')
+                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
             elif self.model_config['name'] == 'edge_encoder_residual':
-                return self.model.forward(x, edge_index, t, condition, mode='future')
+                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
             elif self.model_config['name'] == 'edge_encoder_mlp':
                 return self.model.forward(x=x, t=t, condition=condition, mode='future')
         
+        sample_binary_list = []
         sample_list = []
         ground_truth_hist = []
         ground_truth_fut = []
+        ground_truth_fut_binary = []
         
         if task == 'predict':
             for data in tqdm(self.val_dataloader):
-                history_edge_features = data["history_edge_features"]
+                history_edge_features = data.x
 
-                history_edge_indices = data["history_indices"]
+                history_edge_indices = data.history_indices
 
-                future_trajectory_indices = data["future_indices"]
+                future_trajectory_indices = data.future_indices
+                future_edge_indices_one_hot = data.y[:, :, 0]
+                
                 # with torch.no_grad():
                 if self.model_config['name'] == 'edge_encoder':
-                    c = self.model.forward(x=self.line_graph.x, edge_index=self.line_graph.edge_index, mode='history')
+                    c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_edge_indices, mode='history')
                 elif self.model_config['name'] == 'edge_encoder_residual':
-                    c = self.model.forward(x=self.line_graph.x, edge_index=self.line_graph.edge_index, mode='history')
+                    c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_edge_indices, mode='history')
                 elif self.model_config['name'] == 'edge_encoder_mlp':
-                    c = self.model.forward(x=history_edge_features, mode='history')
+                    c = self.model.forward(x=history_edge_features, indices=history_edge_indices, mode='history')
             
                 if number_samples > 1:
                     new_seed = torch.seed() + torch.randint(0, 100000, (1,)).item()
@@ -289,30 +302,36 @@ class Graph_Diffusion_Model(nn.Module):
                                                                                         edge_features=history_edge_features,
                                                                                         edge_index=self.edge_index,
                                                                                         line_graph=None,
-                                                                                        condition=c)
+                                                                                        condition=c,
+                                                                                        task=task)
                         samples = torch.where(samples == 1)[1]
                         sample_sublist.append(samples.detach().to('cpu'))
                     sample_list.append(sample_sublist)
+
                 elif number_samples == 1:
-                    samples = make_diffusion(self.diffusion_config, self.model_config, 
+                    samples_binary = make_diffusion(self.diffusion_config, self.model_config, 
                                             num_edges=self.num_edges, future_len=self.future_len, device=self.device).p_sample_loop(model_fn=model_fn,
                                                                                     shape=(self.test_batch_size, self.num_edges), 
                                                                                     edge_features=history_edge_features,
-                                                                                    edge_index=self.edge_index,
+                                                                                    edge_index=data.edge_index,
                                                                                     line_graph=None,
-                                                                                    condition=c)
-                    samples = torch.where(samples == 1)[1]
-                    sample_list.append(samples.detach())
+                                                                                    condition=c,
+                                                                                    task=task)
+                    sample_binary_list.append(samples_binary)
+                    samples = torch.argwhere(samples_binary == 1)[:, 1]
+                    sample_list.append(samples.detach().to('cpu'))
                 else:
                     raise ValueError("Number of samples must be greater than 0.")
                 ground_truth_hist.append(history_edge_indices.detach().to('cpu'))
                 ground_truth_fut.append(future_trajectory_indices.detach().to('cpu'))
+                ground_truth_fut_binary.append(future_edge_indices_one_hot.detach().to('cpu'))
             
             if number_samples == 1:
-                fut_ratio, f1, avg_sample_length = self.eval(sample_list, ground_truth_hist, ground_truth_fut)
-                wandb.log({"F1 Score": f1.item()})
-                wandb.log({"Future ratio": fut_ratio})
-                wandb.log({"Average sample length": avg_sample_length})
+                pass
+                #fut_ratio, f1, avg_sample_length = self.eval(sample_list, ground_truth_hist, ground_truth_fut)
+                #wandb.log({"F1 Score": f1.item()})
+                #wandb.log({"Future ratio": fut_ratio})
+                #wandb.log({"Average sample length": avg_sample_length})
             
             if save:
                 save_path = os.path.join(self.model_dir, 
@@ -323,7 +342,7 @@ class Graph_Diffusion_Model(nn.Module):
                 torch.save(ground_truth_fut, os.path.join(save_path, f'{self.exp_name}_ground_truth_fut.pth'))
                 print(f"Samples saved at {os.path.join(save_path, f'{self.exp_name}_samples.pth')}!")
             else:
-                return sample_list, ground_truth_hist, ground_truth_fut
+                return sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary
         
         elif task == 'generate':
             # Generate realistic trajectories without condition
@@ -344,7 +363,7 @@ class Graph_Diffusion_Model(nn.Module):
         """
         import matplotlib.pyplot as plt
 
-        samples, ground_truth_hist, ground_truth_fut = self.get_samples(load_model=True, model_path=self.test_config['model_path'], number_samples=number_samples)
+        sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = self.get_samples(load_model=True, model_path=self.test_config['model_path'], number_samples=number_samples)
         save_dir = f'{os.path.join(self.model_dir, f'{self.exp_name}', 'plots')}'
         os.makedirs(save_dir, exist_ok=True)
 
@@ -438,7 +457,7 @@ class Graph_Diffusion_Model(nn.Module):
             plt.savefig(os.path.join(save_dir, f'sample_{i+1}.png'))
             plt.close()  # Close the figure to free memory
     
-    def eval(self, sample_list, ground_truth_hist, ground_truth_fut):
+    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary):
         """
         Evaluate the model's performance.
 
@@ -472,7 +491,7 @@ class Graph_Diffusion_Model(nn.Module):
             ratio_2 = count_2 / total
             return ratio_1, ratio_2
         
-        def calculate_sample_f1(sample_list, ground_truth_fut):
+        def calculate_sample_f1(sample_binary_list, ground_truth_fut_binary):
             """
             Calculates the F1 score for a given list of samples and ground truth futures.
 
@@ -484,7 +503,7 @@ class Graph_Diffusion_Model(nn.Module):
                 float: The F1 score.
 
             """
-            one_hot_samples = [torch.zeros(self.num_edges) for _ in range(len(sample_list))]
+            '''one_hot_samples = [torch.zeros(self.num_edges) for _ in range(len(sample_list))]
             one_hot_futures = [torch.zeros(self.num_edges) for _ in range(len(ground_truth_fut))]
             for i, one_hot_sample in enumerate(one_hot_samples):
                 for edge_index, edge in enumerate(self.edges):
@@ -493,9 +512,11 @@ class Graph_Diffusion_Model(nn.Module):
             for i, one_hot_fut in enumerate(one_hot_futures):
                 for edge_index, edge in enumerate(self.edges):
                     if edge_index in ground_truth_fut[i]:
-                        one_hot_fut[edge_index] = 1
+                        one_hot_fut[edge_index] = 1'''
             metric = F1Score(task='binary', average='macro', num_classes=2)
-            f1 = metric(torch.cat(one_hot_samples), torch.cat(one_hot_futures))
+            f1 = metric(torch.flatten(torch.cat(sample_binary_list)).detach().to('cpu'),
+                        torch.flatten(torch.cat(ground_truth_fut_binary)).detach().to('cpu'))
+            
 
             return f1
         
@@ -512,15 +533,15 @@ class Graph_Diffusion_Model(nn.Module):
             return sum(len(sample) for sample in sample_list) / len(sample_list)
         
         fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
-        f1 = calculate_sample_f1(sample_list, ground_truth_fut)
+        f1 = calculate_sample_f1(sample_binary_list, ground_truth_fut_binary)
         avg_sample_length = calculate_avg_sample_length(sample_list)
         
         return fut_ratio, f1, avg_sample_length
     
     def save_model(self):
         save_path = os.path.join(self.model_dir, 
-                                 self.exp_name + '_' + self.model_config['name'] + '_' +  self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}_layers_{self.num_layers}.pth')
+                                 self.exp_name + '_' + self.model_config['name'] + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}.pth')
         torch.save(self.model.state_dict(), save_path)
         self.log.info(f"Model saved at {save_path}!")
         print(f"Model saved at {save_path}")
@@ -549,23 +570,32 @@ class Graph_Diffusion_Model(nn.Module):
         
     def _build_train_dataloader(self):
         print("Loading Training Dataset...")
-        self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device, embedding_dim=self.pos_encoding_dim)
+        # self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.train_dataset = TrajectoryGeoDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
         self.G = self.train_dataset.build_graph()
         self.nodes = self.G.nodes
         self.edges = self.G.edges(data=True)
         self.num_edges = self.G.number_of_edges()
         self.indexed_edges = self.train_dataset.edges
-        self.num_edge_features = self.train_dataset.num_edge_features
+        # self.num_edge_features = self.train_dataset.num_edge_features
+        self.num_edge_features = 1
+        if 'coordinates' in self.edge_features:
+            self.num_edge_features += 4
+        if 'edge_orientations' in self.edge_features:
+            self.num_edge_features += 1
         
         # Build the line graph and corresponding edge index
-        self.edge_index = self._build_edge_index()
-                
+        # self.edge_index = self._build_edge_index()
+        # self.edge_index = self.train_dataset.edge_index
+        
+        from torch_geometric.data import DataLoader
         self.train_data_loader = DataLoader(self.train_dataset, 
                                             batch_size=self.batch_size, 
-                                            shuffle=True, 
-                                            collate_fn=collate_fn, 
+                                            shuffle=False, 
+                                            collate_fn=custom_collate_fn, 
                                             num_workers=0,
-                                            pin_memory=False)
+                                            pin_memory=False,
+                                            follow_batch=['x', 'y', 'history_indices', 'future_indices'])
                         
         print("> Training Dataset loaded!\n")
         
@@ -587,12 +617,19 @@ class Graph_Diffusion_Model(nn.Module):
         return edge_index.to(self.device, non_blocking=True)
     
     def _build_val_dataloader(self):
-        self.val_dataset = TrajectoryDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device, embedding_dim=self.pos_encoding_dim)
-        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.test_batch_size, shuffle=False, collate_fn=collate_fn)
+        # self.val_dataset = TrajectoryDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.val_dataset = TrajectoryGeoDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        from torch_geometric.data import DataLoader
+        self.val_dataloader = DataLoader(self.val_dataset, 
+                                         batch_size=self.test_batch_size, 
+                                         shuffle=False, 
+                                         collate_fn=custom_collate_fn,
+                                         follow_batch=['x', 'y', 'history_indices', 'future_indices']
+                                         )
         print("> Test Dataset loaded!")
         
     def _build_model(self):
         self.model = self.model(self.model_config, self.history_len, self.future_len, self.num_classes,
-                                num_edges=self.num_edges, hidden_channels=self.hidden_channels, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps)
+                                num_edges=self.num_edges, hidden_channels=self.hidden_channels, edge_features=self.edge_features, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps, pos_encoding_dim=self.pos_encoding_dim)
         print("> Model built!")
-        
+             
