@@ -21,19 +21,10 @@ class TrajectoryGeoDataset(Dataset):
         self.edge_features = edge_features
         self.embedding_dim = embedding_dim
         self.device = device
-        '''self.num_edge_features = 1
-        if 'coordinates' in self.edge_features:
-            self.num_edge_features += 4
-        if 'edge_orientations' in self.edge_features:
-            self.num_edge_features += 1'''
-        '''if 'pos_encoding' in self.edge_features:
-            self.num_edge_features += self.embedding_dim'''
         self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(self.file_path, self.device)
         
         self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
-        '''self.positional_encoding = self.generate_positional_encodings().float()'''
         self.edge_index = self._build_edge_index()
-        # self.num_edges = self.edge_index.size(1)
 
     @staticmethod
     def load_new_format(file_path, device):

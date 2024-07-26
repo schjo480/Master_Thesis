@@ -24,8 +24,8 @@ fixed:
     edge_features: ['one_hot_edges', 'coordinates', 'pos_encoding']
 
   diffusion_config:
-    start: 0.00001  # 1e-4 gauss, 0.02 uniform
-    stop: 0.005  # 0.02 gauss, 1. uniform
+    start: 0.01  # 1e-5 custom, 0.01 prior
+    stop: 0.2  # 0.09 custom, 0.5 prior
     num_timesteps: 50
   
   model:
@@ -48,8 +48,8 @@ fixed:
     batch_size: 8
     optimizer: adam
     gradient_accumulation: False
-    gradient_accumulation_steps: 64
-    learning_rate_warmup_steps: 300 # previously 10000
+    gradient_accumulation_steps: 1
+    learning_rate_warmup_steps: 100 # previously 10000
     num_epochs: 500
     lr_decay: 0.9999 # previously 0.9999
     log_loss_every_steps: 1
@@ -65,6 +65,7 @@ fixed:
     
   wandb:
     exp_name: "tdrive_residual"
+    run_name: "tdrive_residual_prior"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
@@ -84,8 +85,8 @@ grid:
     options:
       - 2
       - 5
-      - 10
-      - 20
+      # - 10
+      # - 20
   diffusion_config.type:
     type: choice
     options:
@@ -94,8 +95,8 @@ grid:
   model.transition_mat_type:
     type: choice
     options:
-      - 'custom'
-      # - 'marginal_prior'
+      # - 'custom'
+      - 'marginal_prior'
   model.name:
     type: choice
     options:

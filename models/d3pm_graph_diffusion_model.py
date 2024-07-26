@@ -72,7 +72,7 @@ class Graph_Diffusion_Model(nn.Module):
             config={**self.data_config, **self.diffusion_config, **self.model_config, **self.train_config}
         )
         self.exp_name = self.wandb_config['exp_name']
-        wandb.run.name = self.exp_name
+        wandb.run.name = self.wandb_config['run_name']
 
         # Logging
         self.dataset = self.data_config['dataset']
@@ -467,29 +467,30 @@ class Graph_Diffusion_Model(nn.Module):
         """
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
-            Calculates the ratio of samples in `sample_list` that have at least one or two edges in common with the ground truth future trajectory.
+            Calculates the ratio of samples in `sample_list` that have at least n edges in common with the ground truth future trajectory for each n up to future_len.
 
             Args:
                 sample_list (list): A list of samples.
                 ground_truth_fut (list): A list of ground truth future trajectories.
 
             Returns:
-                tuple: A tuple containing the ratios of samples that have at least one or two edges in common with the ground truth future trajectory.
+                dict: A dictionary where keys are the minimum number of common edges (from 1 to future_len) and values are the ratios of samples meeting that criterion.
             """
-            count_1 = 0
-            count_2 = 0
+            # Initialize counts for each number of common edges from 1 up to future_len
+            counts = {i: 0 for i in range(1, self.future_len + 1)}
             total = len(sample_list)
 
             for i, sample in enumerate(sample_list):
-                edges_count = sum(1 for edge in ground_truth_fut[i][0] if edge in sample)
-                if edges_count >= 1:
-                    count_1 += 1
-                if edges_count >= 2:
-                    count_2 += 1
+                # Convert tensors to lists if they are indeed tensors
+                sample = sample.tolist() if isinstance(sample, torch.Tensor) else sample
+                ground_truth = ground_truth_fut[i].flatten().tolist()
 
-            ratio_1 = count_1 / total
-            ratio_2 = count_2 / total
-            return ratio_1, ratio_2
+                edges_count = sum(1 for edge in ground_truth if edge in sample)
+                for n in range(1, min(edges_count, self.future_len) + 1):
+                    counts[n] += 1
+
+            ratios = {n: counts[n] / total for n in counts}
+            return ratios
         
         def calculate_sample_f1(sample_binary_list, ground_truth_fut_binary):
             """
