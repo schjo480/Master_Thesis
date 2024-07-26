@@ -353,8 +353,8 @@ class CategoricalDiffusion:
         alpha_bar_t = alpha_bars[t].to(self.device)
         
         # Compute the transition probabilities
-        transition_matrix = torch.tensor([[alpha_bar_t, 1 - alpha_bar_t],
-                                        [1 - alpha_bar_t, alpha_bar_t]], device=self.device)
+        transition_matrix = torch.tensor([[alphas[t], 1 - alphas[t]],
+                                        [1 - alphas[t], alphas[t]]], device=self.device)
         
         return transition_matrix
 
@@ -583,9 +583,12 @@ class CategoricalDiffusion:
             num_timesteps = self.num_timesteps
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.transition_mat_type in ['gaussian', 'uniform', 'marginal_prior', 'custom']:
+        if self.transition_mat_type in ['gaussian', 'uniform', 'custom']:
             # x_init = torch.randint(0, self.num_classes, size=shape, device=device)
             prob_class_1 = 0.5
+            x_init = torch.bernoulli(torch.full(size=shape, fill_value=prob_class_1, device=device))
+        elif self.transition_mat_type == 'marginal_prior':
+            prob_class_1 = self.future_len / self.num_edges
             x_init = torch.bernoulli(torch.full(size=shape, fill_value=prob_class_1, device=device))
         elif self.transition_mat_type == 'absorbing':
             x_init = torch.full(shape, fill_value=self.num_classes // 2, dtype=torch.int32, device=device)

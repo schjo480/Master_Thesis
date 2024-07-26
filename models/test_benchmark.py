@@ -858,12 +858,14 @@ import networkx as nx
 import h5py
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+import wandb
 
 class AutoregressiveTrajectoryDataset(Dataset):
     def __init__(self, file_path, device):
         self.device = device
         self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
-        self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
+        self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float32, device=self.device)
         
         self.num_edges = len(self.edges)
         self.graph = self.build_graph()
@@ -877,8 +879,8 @@ class AutoregressiveTrajectoryDataset(Dataset):
                 sequence = trajectory['edge_idxs'][:i]
                 target = trajectory['edge_idxs'][i]
                 
-                edge_coordinates = self.edge_coordinates[sequence]
-                edge_coordinates = torch.flatten(edge_coordinates, start_dim=1)
+                edge_coordinates = self.edge_coordinates
+                edge_coordinates_flat = torch.flatten(edge_coordinates, start_dim=1)
 
                 # Create zero-filled tensors for sequence and target
                 sequence_tensor_bin = torch.zeros(self.num_edges, device=self.device)
@@ -886,6 +888,8 @@ class AutoregressiveTrajectoryDataset(Dataset):
 
                 # Set 1 for indices in sequence and target
                 sequence_tensor_bin[sequence] = 1
+                feature_tensor = torch.cat((sequence_tensor_bin.unsqueeze(1), edge_coordinates_flat), dim=1)
+                
                 target_tensor_bin[target] = 1
 
                 # Generate mask based on the last edge in the sequence
@@ -904,6 +908,7 @@ class AutoregressiveTrajectoryDataset(Dataset):
                 sequence_tensor = torch.tensor(sequence, dtype=torch.float32)
                 target_tensor = torch.tensor(target, dtype=torch.long)
                 self.data.append((sequence_tensor_bin, target_tensor_bin, mask, sequence_tensor, target_tensor))
+                #self.data.append((feature_tensor, target_tensor_bin, mask, sequence_tensor, target_tensor))
 
     def __len__(self):
         return len(self.data)
@@ -938,6 +943,114 @@ class AutoregressiveTrajectoryDataset(Dataset):
         for (start, end), index in indexed_edges:
             graph.add_edge(start, end, index=index, default_orientation=(start, end))
         return graph
+    
+    
+class AlternativeAutoregressiveTrajectoryDataset(Dataset):
+    def __init__(self, file_path, history_len, future_len, device):
+        self.device = device
+        self.history_len = history_len
+        self.future_len = future_len
+        self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
+        self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float32, device=self.device)
+        
+        self.num_edges = len(self.edges)
+        self.graph = self.build_graph()
+        self.edge_list = list(self.graph.edges())
+        self.data = []
+        # Preprocess and move data to the specified device
+        for trajectory in self.trajectories:
+            for i in range(1, self.history_len):
+                sequence = trajectory['edge_idxs'][:i]
+                target = trajectory['edge_idxs'][i]
+                
+                edge_coordinates = self.edge_coordinates[sequence]
+                edge_coordinates_flat = torch.flatten(edge_coordinates, start_dim=1)
+                
+                feature_tensor = torch.cat((sequence.unsqueeze(1), edge_coordinates_flat), dim=1)
+
+                # Create zero-filled tensors for sequence and target
+                # sequence_tensor_bin = torch.zeros(self.num_edges, device=self.device)
+                # target_tensor_bin = torch.zeros(self.num_edges, device=self.device)
+
+                # Set 1 for indices in sequence and target
+                '''sequence_tensor_bin[sequence] = 1
+                feature_tensor = torch.cat((sequence_tensor_bin.unsqueeze(1), edge_coordinates_flat), dim=1)
+                
+                target_tensor_bin[target] = 1'''
+                
+                target_tensor_bin = torch.zeros(self.num_edges, device=self.device)
+                target_tensor_bin[target] = 1
+
+                # Generate mask based on the last edge in the sequence
+                mask = torch.zeros(self.num_edges, device=self.device)
+                if sequence is not None:
+                    last_edge_index = sequence[-1]
+                    last_edge = self.edge_list[last_edge_index]
+                    # Find edges that share a node with the last edge
+                    neighbors = [idx for idx, edge in enumerate(self.edge_list)
+                                 if (edge[0] == last_edge[0] or edge[1] == last_edge[1]
+                                     or edge[0] == last_edge[1] or edge[1] == last_edge[0])]
+                    mask[neighbors] = 1
+                    mask[last_edge_index] = 0  # Ensure the current edge is not included in the mask
+
+                # self.data.append((sequence_tensor, target_tensor, mask))
+                sequence_tensor = torch.tensor(sequence, dtype=torch.float32)
+                target_tensor = torch.tensor(target, dtype=torch.long)
+                self.data.append((feature_tensor, target_tensor, target_tensor_bin, mask))
+                # self.data.append((sequence_tensor_bin, target_tensor_bin, mask, sequence_tensor, target_tensor))
+                #self.data.append((feature_tensor, target_tensor_bin, mask, sequence_tensor, target_tensor))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        # Directly return the preprocessed data, which is already on the correct device
+        return self.data[idx]
+    
+    @staticmethod
+    def load_new_format(file_path, device):
+        paths = []
+        with h5py.File(file_path, 'r') as new_hf:
+            node_coordinates = torch.tensor(new_hf['graph']['node_coordinates'][:], dtype=torch.float, device=device)
+            #edges = torch.tensor(new_hf['graph']['edges'][:], dtype=torch.long, device=device)
+            edges = new_hf['graph']['edges'][:]
+            edge_coordinates = node_coordinates[edges]
+            nodes = [(i, {'pos': torch.tensor(pos, device=device)}) for i, pos in enumerate(node_coordinates)]
+            #edges = [(torch.tensor(edge[0], device=device), torch.tensor(edge[1], device=device)) for edge in edges]
+            edges = [tuple(edge) for edge in edges]
+
+            for i in tqdm(new_hf['trajectories'].keys()):
+                path_group = new_hf['trajectories'][i]
+                path = {attr: torch.tensor(path_group[attr][()], device=device) for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
+                paths.append(path)
+            
+        return paths, nodes, edges, edge_coordinates
+    
+    def build_graph(self):
+        graph = nx.Graph()
+        graph.add_nodes_from(self.nodes)
+        indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
+        for (start, end), index in indexed_edges:
+            graph.add_edge(start, end, index=index, default_orientation=(start, end))
+        return graph
+    
+def collate_fn(batch):
+    # 'batch' is a list of tuples (sequence_tensor, target_tensor)
+    feature_tensor, targets, target_bin, masks = zip(*batch)
+    
+    # Pad sequences
+    padded_feature_tensor = pad_sequence(feature_tensor, batch_first=True, padding_value=0)
+    
+    # Stack targets - assuming targets are already all the same length or are scalars
+    targets = torch.stack(targets)
+    
+    target_bin = torch.stack(target_bin)
+    
+    masks = torch.stack(masks)
+    
+    lengths = torch.tensor([len(seq) for seq in padded_feature_tensor])
+    
+    return padded_feature_tensor, targets, target_bin, masks, lengths
 
 
     '''def __len__(self):
@@ -972,37 +1085,47 @@ class AutoregressiveTrajectoryDataset(Dataset):
 class EdgeModel(nn.Module):
     def __init__(self, hidden_size, num_features, num_layers, num_edges):
         super().__init__()
-        self.rnn = nn.RNN(input_size=num_features, hidden_size=num_edges, num_layers=num_layers, batch_first=True, bidirectional=False)
-        self.fc = nn.Linear(num_edges, 1)
+        hidden_size = 16
+        self.rnn = nn.RNN(input_size=num_features, hidden_size=hidden_size, num_layers=num_layers, batch_first=True, bidirectional=False)
+        self.fc = nn.Linear(hidden_size, num_edges)
 
-    def forward(self, x, hidden, mask):
+    def forward(self, x, hidden, mask, lengths):
         #print("Sequence x", x)
         #print(x.shape)
         # x should be of shape (seq_len, input_size)
         # print("Sequence", x)
-        x = x.unsqueeze(-1)    # Add a dimension for the input size
-        x, hidden = self.rnn(x, hidden)    # for unbatched data: x: (seq_len, hidden_size=num_edges), hidden: (num_layers, hidden_size=num_edges), else x: (batch_size, seq_len, hidden_size), hidden: (batch_size, seq_len, hidden_size)
-        print("out shape", x.shape)
+        # x = x.unsqueeze(-1)    # Add a dimension for the input size
+        # x has shape [bs, seq_len, num_features]
+        #x, hidden = self.rnn(x, hidden)    # for unbatched data: x: (seq_len, hidden_size=num_edges), hidden: (num_layers, hidden_size=num_edges), else x: (batch_size, seq_len, hidden_size), hidden: (batch_size, seq_len, hidden_size)
+        # print("out shape", x.shape)
         #print("hidden shape", hidden.shape)
-        logits = self.fc(x)
+        # x of shape (num_edges, num_edges)
+        #print("x", x.shape)
+        #print("hidden", hidden.shape)
+        #logits = self.fc(x)
         #print("Logits shape", logits.shape)
         
-        '''probabilities = self.masked_softmax(logits, mask)'''
-        probabilities = self.masked_softmax(torch.t(logits), mask)
-        preds = torch.argmax(probabilities, dim=-1)
+        # x has shape [bs, seq_len, num_features]
+        packed_input = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        packed_output, hidden = self.rnn(packed_input)  # hidden has size [num_layers, batch_size, hidden_size]
+        output, _ = pad_packed_sequence(packed_output, batch_first=True)
+        hidden = hidden[-1]  # Take the last hidden state
+        logits = self.fc(hidden)    # logits have size [batch_size, num_edges]
+        
+        probabilities = self.apply_mask(logits, mask)
+        preds = torch.argmax(torch.softmax(probabilities, dim=-1), dim=-1)
         return probabilities, preds
 
-
-    def masked_softmax(self, logits, mask):
-        masked_logits = logits.masked_fill(mask == 0, float('-inf'))  # Set logits for non-neighbors to -inf
-        #print("Logits", logits)
-        # print("Masked logits", masked_logits)
+    def apply_mask(self, logits, mask):
+        '''masked_logits = logits.masked_fill(mask == 0, float('-inf'))  # Set logits for non-neighbors to -inf
         probabilities = torch.softmax(masked_logits, dim=-1)
-        return probabilities
+        return probabilities'''
+        masked_logits = logits.masked_fill(mask == 0, float(-10))
+        return masked_logits
 
 
 class Train_Model(nn.Module):
-    def __init__(self, hidden_size, num_features, model, train_file_path, val_file_path):
+    def __init__(self, wandb_config, hidden_size, num_features, model, train_file_path, val_file_path):
         super(Train_Model, self).__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -1011,10 +1134,23 @@ class Train_Model(nn.Module):
         
         self.train_file_path = train_file_path
         self.val_file_path = val_file_path
-        self.num_epochs = 200
-        self.lr = 0.001
+        self.num_epochs = 50
+        self.lr = 0.005
         self.learning_rate_warmup_steps = 1000
-        self.num_layers = 1
+        self.num_layers = 2
+        
+        # WandB
+        self.wandb_config = wandb_config
+        wandb.init(
+            settings=wandb.Settings(start_method="fork"),
+            project=self.wandb_config['project'],
+            entity=self.wandb_config['entity'],
+            notes=self.wandb_config['notes'],
+            job_type=self.wandb_config['job_type'],
+            # config={**self.data_config, **self.diffusion_config, **self.model_config, **self.train_config}
+        )
+        self.exp_name = self.wandb_config['exp_name']
+        wandb.run.name = self.wandb_config['run_name']
 
         self.model = model
         self._build_train_dataloader()
@@ -1023,50 +1159,50 @@ class Train_Model(nn.Module):
         self._build_optimizer()
 
     def train(self):
-        for _ in range(self.num_epochs):
-            for sequence_bin, target_bin, mask, sequence, target in self.train_dataloader:
+        for epoch in tqdm(range(self.num_epochs)):
+            self.optimizer.zero_grad()
+            total_loss = 0
+            acc = 0
+            for features, target, target_bin, mask, lengths in self.train_dataloader:
                 # Sequence, target, mask = (bs=1, num_edges)
-                #print("Sequence", sequence.size())
-                #print("Sequence", sequence)
-                #print("Target", target.size())
-                #print("Target", target)
-                #print("Mask", mask.size())
-                #print("Mask", torch.t(torch.argwhere(mask==1)[:, 1]))
-                sequence_bin = sequence_bin.squeeze(0)
-                #target = target.squeeze(0)
-                # mask = mask.squeeze(0)
-                hidden = torch.zeros(self.num_layers, self.num_edges, device=self.device)
-                #print("Hidden", hidden.size())
-                #print(hidden)
-                probabilities, preds = self.model(sequence_bin, hidden, mask)
-                loss = F.cross_entropy(probabilities, target_bin)
-                print("Target", target)
-                print("Pred", preds)
-                print("Loss", loss.item())
+                #sequence_bin = sequence_bin.squeeze(0)
+                batch_size = features.size(0)
+                hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=self.device)
+                
+                probabilities, preds = self.model(features, hidden, mask, lengths)
+                loss = F.cross_entropy(probabilities, target)
+                total_loss += loss.item()
+                acc += (preds == target).sum().item() / batch_size
                 loss.backward()
                 self.optimizer.step()
+            print("Avg Loss", round(total_loss / len(self.train_dataloader), 5))
+            wandb.log({"Epoch": epoch, "Average Train Loss": total_loss / len(self.train_dataloader)})
+            wandb.log({"Epoch": epoch, "Train Accuracy": acc / len(self.train_dataloader)})
                 
     def eval(self):
         sequences = []
         targets = []
         preds = []
-        for sequence_bin, target_bin, mask, sequence, target in self.val_dataloader:
-            sequence_bin = sequence_bin.squeeze(0)
-            hidden = torch.zeros(self.num_layers, self.num_edges, device=self.device)
-            probabilities, pred = self.model(sequence_bin, hidden, mask)
+        for features, target, target_bin, mask, lengths in self.val_dataloader:
+            batch_size = features.size(0)
+            hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=self.device)
+            probabilities, pred = self.model(features, hidden, mask, lengths)
+            sequence = features[:, 0]
             sequences.append(sequence)
             targets.append(target)
             preds.append(pred)
         return {"Sequences": sequences, "Targets": targets, "Predictions": preds}
     
     def _build_train_dataloader(self):
-        train_dataset = AutoregressiveTrajectoryDataset(self.train_file_path, device=self.device)
+        # train_dataset = AutoregressiveTrajectoryDataset(self.train_file_path, device=self.device)
+        train_dataset = AlternativeAutoregressiveTrajectoryDataset(self.train_file_path, history_len=5, future_len=2, device=self.device)
         self.num_edges = train_dataset.num_edges
-        self.train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+        self.train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
         
     def _build_val_dataloader(self):
-        val_dataset = AutoregressiveTrajectoryDataset(self.val_file_path, device=self.device)
-        self.val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+        # val_dataset = AutoregressiveTrajectoryDataset(self.val_file_path, device=self.device)
+        val_dataset = AlternativeAutoregressiveTrajectoryDataset(self.val_file_path, history_len=5, future_len=2, device=self.device)
+        self.val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
 
     def _build_model(self):
         self.model = self.model(self.hidden_size, self.num_features, self.num_layers, self.num_edges)
@@ -1085,21 +1221,30 @@ class Train_Model(nn.Module):
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         print("> Optimizer and Scheduler built!")
         
-        print("Parameters to optimize:")
+        '''print("Parameters to optimize:")
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                print(name)
+                print(name)'''
 
 
 # Example usage
-train_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_2_traj.h5'
-val_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_2_val_traj.h5'
+train_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_4_traj.h5'
+val_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_4_traj.h5'
 #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #dataset = AutoregressiveTrajectoryDataset(train_file_path, device=device)
 #dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-model = Train_Model(hidden_size=32, num_features=1, model=EdgeModel, train_file_path=train_file_path, val_file_path=val_file_path)
+wandb_config = {"exp_name": "benchmark_test",
+                "run_name": "Coords, L=History_size",
+                "project": "trajectory_prediction_using_denoising_diffusion_models",
+                "entity": "joeschmit99",
+                "job_type": "test",
+                "notes": "",
+                "tags": ["synthetic", "benchmark_rnn"]} 
+
+model = Train_Model(wandb_config, hidden_size=16, num_features=5, model=EdgeModel, train_file_path=train_file_path, val_file_path=val_file_path)
 model.train()
 eval_dict = model.eval()
+print("History sequence", eval_dict['Sequences'])
 print("Target", eval_dict['Targets'])
 print("Pred", eval_dict['Predictions'])

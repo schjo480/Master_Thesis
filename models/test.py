@@ -71,7 +71,7 @@ class Graph_Diffusion_Model(nn.Module):
             config={**self.data_config, **self.diffusion_config, **self.model_config, **self.train_config}
         )
         self.exp_name = self.wandb_config['exp_name']
-        wandb.run.name = self.exp_name
+        wandb.run.name = self.wandb_config['run_name']
 
         # Logging
         self.dataset = self.data_config['dataset']
@@ -466,29 +466,30 @@ class Graph_Diffusion_Model(nn.Module):
         """
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
-            Calculates the ratio of samples in `sample_list` that have at least one or two edges in common with the ground truth future trajectory.
+            Calculates the ratio of samples in `sample_list` that have at least n edges in common with the ground truth future trajectory for each n up to future_len.
 
             Args:
                 sample_list (list): A list of samples.
                 ground_truth_fut (list): A list of ground truth future trajectories.
 
             Returns:
-                tuple: A tuple containing the ratios of samples that have at least one or two edges in common with the ground truth future trajectory.
+                dict: A dictionary where keys are the minimum number of common edges (from 1 to future_len) and values are the ratios of samples meeting that criterion.
             """
-            count_1 = 0
-            count_2 = 0
+            # Initialize counts for each number of common edges from 1 up to future_len
+            counts = {i: 0 for i in range(1, self.future_len + 1)}
             total = len(sample_list)
 
             for i, sample in enumerate(sample_list):
-                edges_count = sum(1 for edge in ground_truth_fut[i][0] if edge in sample)
-                if edges_count >= 1:
-                    count_1 += 1
-                if edges_count >= 2:
-                    count_2 += 1
+                # Convert tensors to lists if they are indeed tensors
+                sample = sample.tolist() if isinstance(sample, torch.Tensor) else sample
+                ground_truth = ground_truth_fut[i].flatten().tolist()
 
-            ratio_1 = count_1 / total
-            ratio_2 = count_2 / total
-            return ratio_1, ratio_2
+                edges_count = sum(1 for edge in ground_truth if edge in sample)
+                for n in range(1, min(edges_count, self.future_len) + 1):
+                    counts[n] += 1
+
+            ratios = {n: counts[n] / total for n in counts}
+            return ratios
         
         def calculate_sample_f1(sample_binary_list, ground_truth_fut_binary):
             """
@@ -539,8 +540,8 @@ class Graph_Diffusion_Model(nn.Module):
     
     def save_model(self):
         save_path = os.path.join(self.model_dir, 
-                                 self.exp_name + '_' + self.model_config['name'] + '_' + f'_hist{self.history_len}' + f'_{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}_layers_{self.num_layers}.pth')
+                                 self.exp_name + '_' + self.model_config['name'] + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}.pth')
         torch.save(self.model.state_dict(), save_path)
         self.log.info(f"Model saved at {save_path}!")
         print(f"Model saved at {save_path}")
@@ -631,7 +632,8 @@ class Graph_Diffusion_Model(nn.Module):
         self.model = self.model(self.model_config, self.history_len, self.future_len, self.num_classes,
                                 num_edges=self.num_edges, hidden_channels=self.hidden_channels, edge_features=self.edge_features, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps, pos_encoding_dim=self.pos_encoding_dim)
         print("> Model built!")
-             
+                   
+
 import torch
 from torch.utils.data import Dataset
 import h5py
@@ -664,19 +666,10 @@ class TrajectoryGeoDataset(Dataset):
         self.edge_features = edge_features
         self.embedding_dim = embedding_dim
         self.device = device
-        '''self.num_edge_features = 1
-        if 'coordinates' in self.edge_features:
-            self.num_edge_features += 4
-        if 'edge_orientations' in self.edge_features:
-            self.num_edge_features += 1'''
-        '''if 'pos_encoding' in self.edge_features:
-            self.num_edge_features += self.embedding_dim'''
         self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(self.file_path, self.device)
         
         self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
-        '''self.positional_encoding = self.generate_positional_encodings().float()'''
         self.edge_index = self._build_edge_index()
-        # self.num_edges = self.edge_index.size(1)
 
     @staticmethod
     def load_new_format(file_path, device):
@@ -798,146 +791,6 @@ def custom_collate_fn(batch):
 
     return MyData(x=x, edge_index=edge_index, y=y, history_indices=history_indices, future_indices=future_indices, num_nodes=num_nodes)
 
-"""class TrajectoryDataset(Dataset):
-    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None):
-        self.file_path = file_path
-        self.history_len = history_len
-        self.future_len = future_len
-        self.edge_features = edge_features
-        self.embedding_dim = embedding_dim
-        self.device = device
-        self.num_edge_features = 1
-        if 'coordinates' in self.edge_features:
-            self.num_edge_features += 4
-        if 'edge_orientations' in self.edge_features:
-            self.num_edge_features += 1
-        '''if 'pos_encoding' in self.edge_features:
-            self.num_edge_features += self.embedding_dim'''
-        self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
-        
-        self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
-        # self.positional_encoding = self.generate_positional_encodings().float()
-        
-    @staticmethod
-    def load_new_format(file_path, device):
-        paths = []
-        with h5py.File(file_path, 'r') as new_hf:
-            node_coordinates = torch.tensor(new_hf['graph']['node_coordinates'][:], dtype=torch.float, device=device)
-            # Normalize the coordinates to (0, 1) if any of the coordinates is larger than 1
-            if node_coordinates.max() > 1:
-                max_values = node_coordinates.max(0)[0]
-                min_values = node_coordinates.min(0)[0]
-                node_coordinates[:, 0] = (node_coordinates[:, 0] - min_values[0]) / (max_values[0] - min_values[0])
-                node_coordinates[:, 1] = (node_coordinates[:, 1] - min_values[1]) / (max_values[1] - min_values[1])
-            #edges = torch.tensor(new_hf['graph']['edges'][:], dtype=torch.long, device=device)
-            edges = new_hf['graph']['edges'][:]
-            edge_coordinates = node_coordinates[edges]
-            nodes = [(i, {'pos': torch.tensor(pos, device=device)}) for i, pos in enumerate(node_coordinates)]
-            #edges = [(torch.tensor(edge[0], device=device), torch.tensor(edge[1], device=device)) for edge in edges]
-            edges = [tuple(edge) for edge in edges]
-
-            for i in tqdm(new_hf['trajectories'].keys()):
-                path_group = new_hf['trajectories'][i]
-                path = {attr: torch.tensor(path_group[attr][()], device=device) for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
-                paths.append(path)
-            
-        return paths, nodes, edges, edge_coordinates
-    
-    # @staticmethod
-    def build_graph(self):
-        graph = nx.Graph()
-        graph.add_nodes_from(self.nodes)
-        indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
-        for (start, end), index in indexed_edges:
-            graph.add_edge(start, end, index=index, default_orientation=(start, end))
-        return graph
-
-    def __getitem__(self, idx):
-        trajectory = self.trajectories[idx]
-    
-        edge_idxs = trajectory['edge_idxs']
-        if 'edge_orientations' in self.edge_features:
-            edge_orientations = trajectory['edge_orientations']
-        
-        # Calculate the required padding length
-        total_len = self.history_len + self.future_len
-        padding_length = max(total_len - len(edge_idxs), 0)
-        
-        # Pad edge indices, orientations, and coordinates
-        edge_idxs = torch.nn.functional.pad(edge_idxs, (0, padding_length), value=-1)
-        if 'edge_orientations' in self.edge_features:
-            edge_orientations = torch.nn.functional.pad(edge_orientations, (0, padding_length), value=0)
-        
-        # Split into history and future
-        history_indices = edge_idxs[:self.history_len]
-        future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
-
-        # Extract and generate features
-        history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
-
-        return {
-            "history_indices": history_indices,
-            "future_indices": future_indices,
-            "history_edge_features": history_edge_features,
-            "future_edge_features": future_edge_features,
-        }
-
-    def generate_edge_features(self, history_indices, future_indices, history_edge_orientations=None, future_edge_orientations=None):
-        # Binary on/off edges
-        valid_history_mask = history_indices >= 0
-        valid_future_mask = future_indices >= 0
-        
-        history_one_hot_edges = torch.nn.functional.one_hot(history_indices[valid_history_mask], num_classes=len(self.edges))
-        future_one_hot_edges = torch.nn.functional.one_hot(future_indices[valid_future_mask], num_classes=len(self.edges))
-        
-        # Sum across the time dimension to count occurrences of each edge
-        history_one_hot_edges = history_one_hot_edges.sum(dim=0)  # (num_edges,)
-        future_one_hot_edges = future_one_hot_edges.sum(dim=0)  # (num_edges,)
-        
-        # Basic History edge features = coordinates, binary encoding
-        history_edge_features = history_one_hot_edges.view(-1, 1).float()
-        future_edge_features = future_one_hot_edges.view(-1, 1).float()
-        if 'coordinates' in self.edge_features:
-            history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
-            future_edge_features = torch.cat((future_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
-        if 'edge_orientations' in self.edge_features:
-            history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
-            future_edge_features = torch.cat((future_edge_features, future_edge_orientations.float()), dim=1)
-        '''if 'pos_encoding' in self.edge_features:
-            encoding_tensor = torch.zeros((len(self.edges), self.embedding_dim), dtype=torch.float64, device=self.device)
-            for i, index in enumerate(history_indices):
-                encoding_tensor[index] = self.positional_encoding[i]
-            history_edge_features = torch.cat((history_edge_features, encoding_tensor.float()), dim=1)    '''
-        
-        return history_edge_features, future_edge_features
-    
-    def generate_positional_encodings(self):
-        position = torch.arange(self.history_len)
-        angle_rates = 1 / torch.pow(10000, (2 * (torch.arange(self.embedding_dim) // 2)) / self.embedding_dim)
-        angle_rads = position.float().unsqueeze(1) * angle_rates.unsqueeze(0)
-        sines = torch.sin(angle_rads[:, 0::2])
-        cosines = torch.cos(angle_rads[:, 1::2])
-        
-        return torch.cat((sines.float(), cosines.float()), dim=-1).to(self.device, non_blocking=True)
-        
-    def __len__(self):
-        return len(self.trajectories)
-
-
-def collate_fn(batch):
-    history_indices = torch.stack([item['history_indices'] for item in batch])
-    future_indices = torch.stack([item['future_indices'] for item in batch])
-    history_edge_features = torch.stack([item['history_edge_features'] for item in batch])
-    future_edge_features = torch.stack([item['future_edge_features'] for item in batch])
-
-    return {
-        "history_indices": history_indices,
-        "future_indices": future_indices,
-        "history_edge_features": history_edge_features,
-        "future_edge_features": future_edge_features,
-    }
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -978,7 +831,7 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None
     assert emb.shape == (timesteps.shape[0], embedding_dim)
     return emb.to(device)
 
-'''def generate_positional_encodings(indices, history_len, embedding_dim, device):
+def generate_positional_encodings(indices, history_len, embedding_dim, device):
     """
     Generates positional encodings only for specified indices.
 
@@ -1001,16 +854,7 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None
     pe[:, 0::2] = torch.sin(positions[indices][:, None] * div_term[None, :])
     pe[:, 1::2] = torch.cos(positions[indices][:, None] * div_term[None, :])
 
-    return pe'''
-
-def generate_positional_encodings(history_len, embedding_dim, device, n=1000):
-    PE = torch.zeros((history_len, embedding_dim), device=device)
-    for k in range(history_len):
-        for i in torch.arange(int(embedding_dim/2)):
-            denominator = torch.pow(n, 2*i/embedding_dim)
-            PE[k, 2*i] = torch.sin(k/denominator)
-            PE[k, 2*i+1] = torch.cos(k/denominator)
-    return PE
+    return pe
 
 class Edge_Encoder(nn.Module):
     def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, edge_features, num_edge_features, num_timesteps, pos_encoding_dim):
@@ -1054,10 +898,10 @@ class Edge_Encoder(nn.Module):
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
         if 'pos_encoding' in self.edge_features:
-            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim + self.pos_encoding_dim,
+            self.future_decoder = nn.Linear(self.hidden_channels + self.condition_dim + self.time_embedding_dim + self.pos_encoding_dim,
                                         self.hidden_channels)  # To predict future edges
         else:
-            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
+            self.future_decoder = nn.Linear(self.hidden_channels + self.condition_dim + self.time_embedding_dim,
                                             self.hidden_channels)  # To predict future edges
         self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
@@ -1074,12 +918,13 @@ class Edge_Encoder(nn.Module):
         if x.dim() == 3:
             x = x.squeeze(0)    # (bs, num_edges, num_edge_features) -> (num_edges, num_edge_features)
         for conv in self.convs:
+            # print("Conv size", conv)
             x = F.relu(conv(x, edge_index)) # (num_edges, hidden_channels)
                     
         if mode == 'history':
             c = self.history_encoder(x) # (num_edges, condition_dim)
             if 'pos_encoding' in self.edge_features:
-                pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
+                pos_encoding = generate_positional_encodings(indices, self.history_len, self.pos_encoding_dim, device=x.device)
                 encodings = F.silu(self.pos_linear0(pos_encoding))
                 encodings = F.silu(self.pos_linear1(encodings))
                 c = self.integrate_encodings(c, indices, encodings)
@@ -1132,7 +977,6 @@ class Edge_Encoder(nn.Module):
 
         return new_features
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1172,7 +1016,7 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None
     assert emb.shape == (timesteps.shape[0], embedding_dim)
     return emb.to(device)
 
-'''def generate_positional_encodings(indices, history_len, embedding_dim, device):
+def generate_positional_encodings(indices, history_len, embedding_dim, device):
     """
     Generates positional encodings only for specified indices.
 
@@ -1195,16 +1039,7 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None
     pe[:, 0::2] = torch.sin(positions[indices][:, None] * div_term[None, :])
     pe[:, 1::2] = torch.cos(positions[indices][:, None] * div_term[None, :])
 
-    return pe'''
-
-def generate_positional_encodings(history_len, embedding_dim, device, n=1000):
-    PE = torch.zeros((history_len, embedding_dim), device=device)
-    for k in range(history_len):
-        for i in torch.arange(int(embedding_dim/2)):
-            denominator = torch.pow(n, 2*i/embedding_dim)
-            PE[k, 2*i] = torch.sin(k/denominator)
-            PE[k, 2*i+1] = torch.cos(k/denominator)
-    return PE
+    return pe
 
 class Edge_Encoder_MLP(nn.Module):
     def __init__(self, model_config, history_len, future_len, num_classes, num_edges, hidden_channels, edge_features, num_edge_features, num_timesteps, pos_encoding_dim):
@@ -1268,7 +1103,7 @@ class Edge_Encoder_MLP(nn.Module):
         if mode == 'history':
             c = self.history_encoder(x) # (bs, num_edges, condition_dim)
             if 'pos_encoding' in self.edge_features:
-                pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
+                pos_encoding = generate_positional_encodings(indices, self.history_len, self.pos_encoding_dim, device=x.device)
                 encodings = F.silu(self.pos_linear0(pos_encoding))
                 encodings = F.silu(self.pos_linear1(encodings))
                 c = self.integrate_encodings(c, indices, encodings)
@@ -1314,7 +1149,7 @@ class Edge_Encoder_MLP(nn.Module):
         new_features[indices, -encodings.size(1):] = encodings
 
         return new_features
-    
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1354,31 +1189,6 @@ def get_timestep_embedding(timesteps, embedding_dim, max_time=1000., device=None
 
     assert emb.shape == (timesteps.shape[0], embedding_dim)
     return emb.to(device)
-
-'''def generate_positional_encodings(indices, history_len, embedding_dim, device):
-    """
-    Generates positional encodings only for specified indices.
-
-    Args:
-        indices (torch.Tensor): The indices of history edges.
-        history_len (int): Total positions (here, history length).
-        embedding_dim (int): The dimensionality of each position encoding.
-        device (torch.device): The device tensors are stored on.
-
-    Returns:
-        torch.Tensor: Positional encodings for specified indices with shape [len(indices), embedding_dim].
-    """
-    positions = torch.arange(history_len, dtype=torch.float32, device=device)
-    # Get div term
-    div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * -(torch.log(torch.tensor(10000.0)) / embedding_dim))
-    div_term = div_term.to(device)
-
-    # Compute positional encodings
-    pe = torch.zeros((len(indices), embedding_dim), device=device)
-    pe[:, 0::2] = torch.sin(positions[indices][:, None] * div_term[None, :])
-    pe[:, 1::2] = torch.cos(positions[indices][:, None] * div_term[None, :])
-
-    return pe'''
     
 def generate_positional_encodings(history_len, embedding_dim, device, n=1000):
     PE = torch.zeros((history_len, embedding_dim), device=device)
@@ -1462,46 +1272,29 @@ class Edge_Encoder_Residual(nn.Module):
             x = F.relu(conv(x, edge_index))
             x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)
             
-        #print("x", x.size())
-        #print(x)
         if mode == 'history':
             c = self.history_encoder(x)     # (batch_size * num_edges, condition_dim)
-            #print("Condition before", c.size())
-            #print(c)
             if 'pos_encoding' in self.edge_features:
                 pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
                 encodings = F.silu(self.pos_linear0(pos_encoding))
                 encodings = F.silu(self.pos_linear1(encodings))
-                #print("Encodings", encodings.size())
-                #print(encodings)
                 c = self.integrate_encodings(c, indices, encodings)     # (batch_size * num_edges, condition_dim + pos_encoding_dim)
-            # print("Condition after", c.size())
-            # print(c)
             return c
         
         elif mode == 'future':
             # Time embedding
-            # TODO: Check if time embedding and condition generation are the same for each datapoint in a batch and hence the problems while sampling
-            #print("Time", t)
             t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
             t_emb = self.time_linear0(t_emb)
             t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
             t_emb = self.time_linear1(t_emb)
             t_emb = F.silu(t_emb)   # (batch_size, time_embedding_dim)
-            #print("T_emb", t_emb)
             t_emb = torch.repeat_interleave(t_emb, self.num_edges, dim=0) # (batch_size * num_edges, time_embedding_dim)
-            #print("T_emb after", t_emb)
-            #print("T_emb", t_emb.size())
             
             #Concatenation
             x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding, (batch_size * num_edges, hidden_dim')
-            #print("x", x.size())
             x = torch.cat((x, condition), dim=1) # Concatenate with condition c, (batch_size * num_edges, hidden_dim')
-            #print("x", x.size())
             logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
-            #print("logits", logits.size())
             logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)
-            #print("Logits size", logits.size())
 
             return logits.view(batch_size, self.num_edges, -1)  # (1, num_edges, num_classes=2)
 
@@ -1521,7 +1314,6 @@ class Edge_Encoder_Residual(nn.Module):
         # Ensure that features are on the same device as encodings
         batch_size = indices.shape[0]
         encodings = encodings.repeat(batch_size, 1)
-        #print(encodings)
         # Ensure that features and encodings are on the same device
         features = features.to(encodings.device)
         
@@ -1541,7 +1333,7 @@ class Edge_Encoder_Residual(nn.Module):
         new_features[flat_indices, -encodings.size(1):] = encodings
 
         return new_features
-    
+
 # coding=utf-8
 # Copyright 2024 The Google Research Authors.
 #
@@ -1897,8 +1689,8 @@ class CategoricalDiffusion:
         alpha_bar_t = alpha_bars[t].to(self.device)
         
         # Compute the transition probabilities
-        transition_matrix = torch.tensor([[alpha_bar_t, 1 - alpha_bar_t],
-                                        [1 - alpha_bar_t, alpha_bar_t]], device=self.device)
+        transition_matrix = torch.tensor([[alphas[t], 1 - alphas[t]],
+                                        [1 - alphas[t], alphas[t]]], device=self.device)
         
         return transition_matrix
 
@@ -2127,9 +1919,12 @@ class CategoricalDiffusion:
             num_timesteps = self.num_timesteps
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.transition_mat_type in ['gaussian', 'uniform', 'marginal_prior', 'custom']:
+        if self.transition_mat_type in ['gaussian', 'uniform', 'custom']:
             # x_init = torch.randint(0, self.num_classes, size=shape, device=device)
             prob_class_1 = 0.5
+            x_init = torch.bernoulli(torch.full(size=shape, fill_value=prob_class_1, device=device))
+        elif self.transition_mat_type == 'marginal_prior':
+            prob_class_1 = self.future_len / self.num_edges
             x_init = torch.bernoulli(torch.full(size=shape, fill_value=prob_class_1, device=device))
         elif self.transition_mat_type == 'absorbing':
             x_init = torch.full(shape, fill_value=self.num_classes // 2, dtype=torch.int32, device=device)
@@ -2227,29 +2022,31 @@ class CategoricalDiffusion:
             raise NotImplementedError(self.loss_type)
 
         return losses
+
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
     
 data_config = {"dataset": "synthetic_20_traj",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1000.h5',
-    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1001_1200.h5',
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_train.h5',
+    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_val.h5',
     "history_len": 5,
     "future_len": 5,
     "num_classes": 2,
-    "pos_encoding_dim": 8,
+    "pos_encoding_dim": 16,
     "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding']#, 'pos_encoding'
     }
 
-diffusion_config = {"type": 'linear', # Options: 'linear', 'cosine', 'jsd'
-    "start": 0.0001,  # 1e-4 gauss, 0.02 uniform
-    "stop": 0.01,  # 0.02 gauss, 1. uniform
+diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
+    "start": 0.00001,  # 1e-4 gauss, 0.02 uniform
+    "stop": 0.005,  # 0.02 gauss, 1. uniform
     "num_timesteps": 50}
 
 model_config = {"name": "edge_encoder_residual",
-    "hidden_channels": 32,
+    "hidden_channels": 64,
     "time_embedding_dim": 16,
-    "condition_dim": 16,
+    "condition_dim": 32,
     "num_heads": 2,
     "num_layers": 2,
     "theta": 1.0, # controls strength of conv layers in residual model
@@ -2276,7 +2073,7 @@ train_config = {"batch_size": 24,
     "save_model_every_steps": 5}
 
 test_config = {"batch_size": 1, # currently only 1 works
-    "model_path": '/ceph/hdd/students/schmitj/experiments/synthetic_d3pm_test/synthetic_d3pm_test_edge_encoder_residual__hist5_5_custom_linear_hidden_dim_32_time_dim_16_condition_dim_16_layers_2.pth',
+    "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/tdrive_residual_edge_encoder_residual__hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
     "number_samples": 1,
     "eval_every_steps": 20
   }
@@ -2296,24 +2093,18 @@ elif model_config["name"] == 'edge_encoder_residual':
     encoder_model = Edge_Encoder_Residual
 
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model).to(device)
-model.train()
+# model.train()
 model_path = test_config["model_path"]
 sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=True, model_path=model_path, task='predict', number_samples=1)
-torch.save(sample_list, '/ceph/hdd/students/schmitj/experiments/tdrive_1000/samples_tdrive_1001_1200.pth')
-torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/experiments/tdrive_1000/ground_truth_hist_tdrive_1001_1200.pth')
-torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/experiments/tdrive_1000/ground_truth_fut_tdrive_1001_1200.pth')
+torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/samples_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
+torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_hist_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
+torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_fut_tdriveresidual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
 fut_ratio, f1, avg_sample_length = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary)
-'''print("History", ground_truth_hist)
-print("\n")
-print("Samples", sample_list)
-print("\n")
-print("Ground truth", ground_truth_fut)
-print("\n")'''
-print("Test F1 Score", f1.item())
+print("Val F1 Score", f1.item())
 print("\n")
 print("Average sample length", avg_sample_length)
 print("\n")
-print("Test Future ratio", fut_ratio)
+print("Val Future ratio", fut_ratio)
 print("\n")
 
 
