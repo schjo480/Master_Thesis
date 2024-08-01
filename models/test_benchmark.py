@@ -968,16 +968,7 @@ class AlternativeAutoregressiveTrajectoryDataset(Dataset):
                 
                 feature_tensor = torch.cat((sequence.unsqueeze(1), edge_coordinates_flat), dim=1)
 
-                # Create zero-filled tensors for sequence and target
-                # sequence_tensor_bin = torch.zeros(self.num_edges, device=self.device)
-                # target_tensor_bin = torch.zeros(self.num_edges, device=self.device)
-
-                # Set 1 for indices in sequence and target
-                '''sequence_tensor_bin[sequence] = 1
-                feature_tensor = torch.cat((sequence_tensor_bin.unsqueeze(1), edge_coordinates_flat), dim=1)
-                
-                target_tensor_bin[target] = 1'''
-                
+                # Create zero-filled tensors for target
                 target_tensor_bin = torch.zeros(self.num_edges, device=self.device)
                 target_tensor_bin[target] = 1
 
@@ -1032,6 +1023,9 @@ class AlternativeAutoregressiveTrajectoryDataset(Dataset):
         indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
         for (start, end), index in indexed_edges:
             graph.add_edge(start, end, index=index, default_orientation=(start, end))
+        degrees = graph.degree()
+        average_degree = sum(deg for _, deg in degrees) / float(len(graph))
+        self.avg_degree = average_degree
         return graph
     
 def collate_fn(batch):
@@ -1051,36 +1045,6 @@ def collate_fn(batch):
     lengths = torch.tensor([len(seq) for seq in padded_feature_tensor])
     
     return padded_feature_tensor, targets, target_bin, masks, lengths
-
-
-    '''def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        sequence, target = self.data[idx]
-
-        # Create zero-filled tensors for sequence and target
-        sequence_tensor = torch.zeros(self.num_edges)
-        target_tensor = torch.zeros(self.num_edges)
-
-        # Set positions in the tensors: 1 for indices in sequence, 1 at the target index
-        for index in sequence:
-            sequence_tensor[index] = 1
-        target_tensor[target] = 1
-
-        # Generate mask based on the last edge in the sequence
-        mask = torch.zeros(self.num_edges)
-        if sequence:  # If the sequence is not empty
-            last_edge_index = sequence[-1]
-            last_edge = self.edge_list[last_edge_index]
-            # Find edges that share a node with the last edge
-            neighbors = [idx for idx, edge in enumerate(self.edge_list) 
-                         if (edge[0] == last_edge[0] or edge[1] == last_edge[1]
-                             or edge[0] == last_edge[1] or edge[1] == last_edge[0])]
-            mask[neighbors] = 1  # Enable only neighbors in the mask
-            mask[last_edge_index] = 0
-
-        return sequence_tensor, target_tensor, mask'''
 
 class EdgeModel(nn.Module):
     def __init__(self, hidden_size, num_features, num_layers, num_edges):
@@ -1134,7 +1098,7 @@ class Train_Model(nn.Module):
         
         self.train_file_path = train_file_path
         self.val_file_path = val_file_path
-        self.num_epochs = 50
+        self.num_epochs = 100
         self.lr = 0.005
         self.learning_rate_warmup_steps = 1000
         self.num_layers = 2
@@ -1160,6 +1124,8 @@ class Train_Model(nn.Module):
 
     def train(self):
         for epoch in tqdm(range(self.num_epochs)):
+            current_lr = self.scheduler.get_last_lr()[0]
+            wandb.log({"Epoch": epoch, "Learning Rate": current_lr})
             self.optimizer.zero_grad()
             total_loss = 0
             acc = 0
@@ -1178,31 +1144,37 @@ class Train_Model(nn.Module):
             print("Avg Loss", round(total_loss / len(self.train_dataloader), 5))
             wandb.log({"Epoch": epoch, "Average Train Loss": total_loss / len(self.train_dataloader)})
             wandb.log({"Epoch": epoch, "Train Accuracy": acc / len(self.train_dataloader)})
-                
+            wandb.log({"Epoch": epoch, "Random Baseline": 1 / self.train_dataset.avg_degree})
+
     def eval(self):
         sequences = []
         targets = []
         preds = []
+        acc = 0
         for features, target, target_bin, mask, lengths in self.val_dataloader:
             batch_size = features.size(0)
             hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=self.device)
             probabilities, pred = self.model(features, hidden, mask, lengths)
-            sequence = features[:, 0]
+            sequence = [torch.tensor([row[i, 0] for i in range(row.size(0)) if row[i, 0] != 0]) for row in features]
             sequences.append(sequence)
             targets.append(target)
             preds.append(pred)
+            acc += (pred == target).sum().item() / batch_size
+        avg_acc = acc / len(self.val_dataloader)
+        wandb.log({"Val Accuracy": avg_acc})
+        print("Val Accuracy:", avg_acc)
         return {"Sequences": sequences, "Targets": targets, "Predictions": preds}
     
     def _build_train_dataloader(self):
         # train_dataset = AutoregressiveTrajectoryDataset(self.train_file_path, device=self.device)
-        train_dataset = AlternativeAutoregressiveTrajectoryDataset(self.train_file_path, history_len=5, future_len=2, device=self.device)
-        self.num_edges = train_dataset.num_edges
-        self.train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
+        self.train_dataset = AlternativeAutoregressiveTrajectoryDataset(self.train_file_path, history_len=5, future_len=2, device=self.device)
+        self.num_edges = self.train_dataset.num_edges
+        self.train_dataloader = DataLoader(self.train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
         
     def _build_val_dataloader(self):
-        # val_dataset = AutoregressiveTrajectoryDataset(self.val_file_path, device=self.device)
-        val_dataset = AlternativeAutoregressiveTrajectoryDataset(self.val_file_path, history_len=5, future_len=2, device=self.device)
-        self.val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
+        # self.val_dataset = AutoregressiveTrajectoryDataset(self.val_file_path, device=self.device)
+        self.val_dataset = AlternativeAutoregressiveTrajectoryDataset(self.val_file_path, history_len=5, future_len=2, device=self.device)
+        self.val_dataloader = DataLoader(self.val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
 
     def _build_model(self):
         self.model = self.model(self.hidden_size, self.num_features, self.num_layers, self.num_edges)
@@ -1220,19 +1192,11 @@ class Train_Model(nn.Module):
             
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         print("> Optimizer and Scheduler built!")
-        
-        '''print("Parameters to optimize:")
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                print(name)'''
 
 
 # Example usage
-train_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_4_traj.h5'
-val_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_4_traj.h5'
-#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#dataset = AutoregressiveTrajectoryDataset(train_file_path, device=device)
-#dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+train_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1000.h5'
+val_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1001_1200.h5'
 
 wandb_config = {"exp_name": "benchmark_test",
                 "run_name": "Coords, L=History_size",

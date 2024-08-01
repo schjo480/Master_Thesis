@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch_geometric.loader import DataLoader
 from torchmetrics import F1Score
 from torch_geometric.utils import from_networkx
 #from dataset.trajctory_dataset import TrajectoryDataset, collate_fn
@@ -30,7 +30,6 @@ class Graph_Diffusion_Model(nn.Module):
         self.future_len = self.data_config['future_len']
         self.num_classes = self.data_config['num_classes']
         self.edge_features = self.data_config['edge_features']
-        self.pos_encoding_dim = self.data_config['pos_encoding_dim']
         
         # Diffusion
         self.diffusion_config = diffusion_config
@@ -43,6 +42,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.time_embedding_dim = self.model_config['time_embedding_dim']
         self.condition_dim = self.model_config['condition_dim']
         self.num_layers = self.model_config['num_layers']
+        self.pos_encoding_dim = self.model_config['pos_encoding_dim']
         
         # Training
         self.train_config = train_config
@@ -102,7 +102,7 @@ class Graph_Diffusion_Model(nn.Module):
         # Move model to GPU
         
         self.model.to(self.device, non_blocking=True)
-        print("device", self.device)
+        print("Device", self.device)
         
     def train(self):
         """
@@ -115,44 +115,44 @@ class Graph_Diffusion_Model(nn.Module):
         """
         torch.autograd.set_detect_anomaly(True)
         dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, device=self.device)
-        def model_fn(x, edge_index, t, condition=None):
-            if self.model_config['name'] == 'edge_encoder':
-                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
-            elif self.model_config['name'] == 'edge_encoder_residual':
-                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
-            elif self.model_config['name'] == 'edge_encoder_mlp':
-                return self.model.forward(x, t=t, condition=condition, mode='future')
+        def model_fn(x, edge_index, t, indices=None):
+            if self.model_config['name'] == 'edge_encoder_mlp':
+                return self.model.forward(x, t=t, indices=indices)
+            else:
+                return self.model.forward(x, edge_index, t=t, indices=indices)
                 
         for epoch in tqdm(range(self.num_epochs)):
             current_lr = self.scheduler.get_last_lr()[0]
             wandb.log({"Epoch": epoch, "Learning Rate": current_lr})
             
             total_loss = 0
+            acc = 0
+            tpr = 0
+            prec = 0
             ground_truth_fut = []
             pred_fut = []
-            #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-                #with record_function("model_training"):
+
             if self.gradient_accumulation:
                 for data in self.train_data_loader:
-                    history_edge_features = data["history_edge_features"]
+                    edge_features = data["edge_features"]
                     history_indices = data["history_indices"]
                     future_edge_indices_one_hot = data["future_edge_features"][:, :, 0]
                     
                     self.optimizer.zero_grad()
-                    for i in range(min(self.gradient_accumulation_steps, history_edge_features.size(0))):
+                    for i in range(min(self.gradient_accumulation_steps, edge_features.size(0))):
                         # Calculate history condition c
                         if self.model_config['name'] == 'edge_encoder':
-                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i], mode='history')
+                            c = self.model.forward(x=edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i])
                         elif self.model_config['name'] == 'edge_encoder_residual':
-                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i], mode='history')
+                            c = self.model.forward(x=edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i])
                         elif self.model_config['name'] == 'edge_encoder_mlp':
-                            c = self.model.forward(x=history_edge_features[i].unsqueeze(0), indices=history_indices[i], mode='history')
+                            c = self.model.forward(x=edge_features[i].unsqueeze(0), indices=history_indices[i])
                         else:
                             raise NotImplementedError(self.model_config['name'])
                         
                         x_start = future_edge_indices_one_hot[i].unsqueeze(0)   # (1, num_edges)
                         # Get loss and predictions
-                        loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=history_edge_features[i].unsqueeze(0), edge_index=self.edge_index, line_graph=None)   # preds are of shape (num_edges,)
+                        loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=edge_features[i].unsqueeze(0), edge_index=self.edge_index, line_graph=None)   # preds are of shape (num_edges,)
                         
                         total_loss += loss / self.gradient_accumulation_steps
                         (loss / self.gradient_accumulation_steps).backward() # Gradient accumulation
@@ -161,81 +161,76 @@ class Graph_Diffusion_Model(nn.Module):
                             ground_truth_fut.append(x_start.detach().to('cpu'))
                             pred_fut.append(preds.detach().to('cpu'))
                         
-                    
                     self.optimizer.step()
                     
             else:
                 for data in self.train_data_loader:
-                    history_edge_features = data.x
-                    history_indices = data.history_indices
-                    future_edge_indices_one_hot = data.y[:, :, 0]
-                    
-                    batch_size = future_edge_indices_one_hot.size(0)
-                    '''if self.model_config['name'] == 'edge_encoder_mlp':
-                        if batch_size == self.batch_size:
-                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(self.batch_size, self.num_edges)
-                        else:
-                            future_edge_indices_one_hot = future_edge_indices_one_hot.view(batch_size, self.num_edges)'''
-                    
+                    edge_features = data.x      # (batch_size * num_edges, num_edge_features)
+                    history_indices = data.history_indices  # (batch_size, history_len)
+                    x_start = data.y[:, :, 0]   # (batch_size, num_edges)
+                    edge_index = data.edge_index    # (2, batch_size * num_edges)
+                                        
                     self.optimizer.zero_grad()
-                    # Calculate history condition c
-                    if self.model_config['name'] == 'edge_encoder':
-                        c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_indices, mode='history')
-                    elif self.model_config['name'] == 'edge_encoder_residual':
-                        c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_indices, mode='history')
-                    elif self.model_config['name'] == 'edge_encoder_mlp':
-                        c = self.model.forward(x=history_edge_features, indices=history_indices, mode='history')
-                    else:
-                        raise NotImplementedError(self.model_config['name'])
                     
-                    x_start = future_edge_indices_one_hot   # (batch_size, num_edges, 1)
                     # Get loss and predictions
-                    loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=history_edge_features, edge_index=data.edge_index, line_graph=None)
+                    loss, preds = dif.training_losses(model_fn, x_start=x_start, edge_features=edge_features, edge_index=edge_index, indices=history_indices)
                     total_loss += loss
+                    # Gradient calculation and optimization
                     loss.backward()
-                    
                     self.optimizer.step()
+                    
                     if epoch % self.log_metrics_every_steps == 0:
+                        acc += torch.sum(preds == x_start).item() / (x_start.size(0) * x_start.size(1))
+                        tpr += torch.sum(preds * x_start).item() / torch.sum(x_start).item()
+                        if torch.sum(preds) > 0:
+                            prec += torch.sum(preds * x_start).item() / torch.sum(preds).item()
                         ground_truth_fut.append(x_start.detach().to('cpu'))
                         pred_fut.append(preds.detach().to('cpu'))
             self.scheduler.step()
-                    
+            
+            # Log Loss
             if epoch % self.log_loss_every_steps == 0:
                 avg_loss = total_loss / len(self.train_data_loader)
-                wandb.log({"Epoch": epoch, "Average Train Loss": avg_loss.item()})
-                self.log.info(f"Epoch {epoch}, Average Train Loss: {avg_loss.item()}")
                 print(f"Epoch {epoch}, Average Train Loss: {avg_loss.item()}")
-                if epoch % self.log_metrics_every_steps == 0:
-                    #print("Ground Truth Training", [[torch.argwhere(ground_truth_fut[i][j].unsqueeze(0) == 1)[:, 1] for i in range(len(ground_truth_fut))] for j in range(ground_truth_fut[0].size(0))])
-                    #print("Samples Training", [[torch.argwhere(pred_fut[i][j].unsqueeze(0) == 1)[:, 1] for i in range(len(pred_fut))] for j in range(pred_fut[0].size(0))])
-                    f1_score = F1Score(task='binary', average='macro', num_classes=2)
-                    f1_epoch = f1_score(torch.flatten(torch.cat(pred_fut)).detach().to('cpu'), torch.flatten(torch.cat(ground_truth_fut)).detach().to('cpu'))
-                    print("Train F1 Score:", f1_epoch.item())
-                    wandb.log({"Epoch": epoch, "Train F1 Score": f1_epoch.item()})
-                    #print("Samples", pred_fut)
-                    #print("Sample 1", pred_fut[0])
-                    #print("Sample 1", pred_fut[0].size())
-                    #print([sum(sum(sample) for sample in pred_fut[i] / len(pred_fut[i])) for i in range(len(pred_fut))])
-                    #intermediate = [sum(sum(sample) for sample in pred_fut[i]) / len(pred_fut[i]) for i in range(len(pred_fut))]
-                    #avg_sample_length_train = sum(intermediate) / len(intermediate)
-                    #wandb.log({"Epoch": epoch, "Average train sample length": avg_sample_length_train.item()})
-                
+                wandb.log({"Epoch": epoch, "Average Train Loss": avg_loss.item()})
+            
+            # Log Metrics
+            if epoch % self.log_metrics_every_steps == 0:
+                avg_acc = acc / len(self.train_data_loader)
+                avg_tpr = tpr / len(self.train_data_loader)
+                avg_prec = prec / len(self.train_data_loader)
+                if (avg_prec + avg_tpr) > 0:
+                    f1_score = 2 * (avg_prec * avg_tpr) / (avg_prec + avg_tpr)
+                else:
+                    f1_score = 0
+                print("Train F1 Score:", f1_score)
+                print("Train Accuracy:", avg_acc)
+                print("Train TPR:", avg_tpr)
+                wandb.log({"Epoch": epoch, "Train F1 Score": f1_score})
+                wandb.log({"Epoch": epoch, "Train Accuracy": avg_acc})
+                wandb.log({"Epoch": epoch, "Train TPR": avg_tpr})
+            
+            # Validation
             if (epoch + 1) % self.eval_every_steps == 0:
                 print("Evaluating on validation set...")
-                sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = self.get_samples(task='predict')
-                fut_ratio, f1, avg_sample_length = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary)
-                print("Samples", sample_list)
-                print("Ground truth", ground_truth_fut)
-                print("Val F1 Score", f1.item())
-                print("Average val sample length", round(avg_sample_length, 3))
-                wandb.log({"Epoch": epoch, "Val F1 Score": f1.item()})
+                sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = self.get_samples(task='predict', number_samples=1)
+                fut_ratio, f1, val_acc, val_tpr, avg_sample_length = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=1)
+                #print("Samples:", sample_list)
+                #print("Ground truth:", ground_truth_fut)
+                print("Val F1 Score:", f1)
+                print("Val Accuracy:", round(val_acc, 6))
+                print("Val TPR:", round(val_tpr, 6))
+                print("Average val sample length:", round(avg_sample_length, 3))
+                wandb.log({"Epoch": epoch, "Val F1 Score": f1})
+                wandb.log({"Epoch": epoch, "Val Accuracy": val_acc})
+                wandb.log({"Epoch": epoch, "Val TPR": val_tpr})
                 wandb.log({"Epoch": epoch, "Val Future ratio": fut_ratio})
                 wandb.log({"Epoch": epoch, "Average val sample length": round(avg_sample_length, 3)})
                         
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
             
-    def get_samples(self, load_model=False, model_path=None, task='predict', number_samples=1, save=False):
+    def get_samples(self, load_model=False, model_path=None, task='predict', save=False, number_samples=None):
         """
         Retrieves samples from the model.
 
@@ -256,16 +251,14 @@ class Graph_Diffusion_Model(nn.Module):
                 raise ValueError("Model path must be provided to load model.")
             self.load_model(model_path)
         
-        if self.test_config['number_samples'] is not None:
+        if number_samples is None:
             number_samples = self.test_config['number_samples']
         
-        def model_fn(x, edge_index, t, condition=None):
-            if self.model_config['name'] == 'edge_encoder':
-                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
-            elif self.model_config['name'] == 'edge_encoder_residual':
-                return self.model.forward(x, edge_index, t=t, condition=condition, mode='future')
-            elif self.model_config['name'] == 'edge_encoder_mlp':
-                return self.model.forward(x=x, t=t, condition=condition, mode='future')
+        def model_fn(x, edge_index, t, indices=None):
+            if self.model_config['name'] == 'edge_encoder_mlp':
+                return self.model.forward(x, t=t, indices=indices)
+            else:
+                return self.model.forward(x, edge_index, t=t, indices=indices)
         
         sample_binary_list = []
         sample_list = []
@@ -275,62 +268,96 @@ class Graph_Diffusion_Model(nn.Module):
         
         if task == 'predict':
             for data in tqdm(self.val_dataloader):
-                history_edge_features = data.x
-
+                edge_features = data.x
+                bs = edge_features.size(0) // self.num_edges
                 history_edge_indices = data.history_indices
-
                 future_trajectory_indices = data.future_indices
-                future_edge_indices_one_hot = data.y[:, :, 0]
-                
-                # with torch.no_grad():
-                if self.model_config['name'] == 'edge_encoder':
-                    c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_edge_indices, mode='history')
-                elif self.model_config['name'] == 'edge_encoder_residual':
-                    c = self.model.forward(x=history_edge_features, edge_index=data.edge_index, indices=history_edge_indices, mode='history')
-                elif self.model_config['name'] == 'edge_encoder_mlp':
-                    c = self.model.forward(x=history_edge_features, indices=history_edge_indices, mode='history')
+                future_binary = data.y[:, :, 0]
+                edge_index = data.edge_index
             
                 if number_samples > 1:
+                    sample_sublist_binary = []
+                    sample_sublist = []
                     new_seed = torch.seed() + torch.randint(0, 100000, (1,)).item()
                     torch.manual_seed(new_seed)
-                    sample_sublist = []
                     for _ in range(number_samples):
-                        samples = make_diffusion(self.diffusion_config, self.model_config, 
-                                                num_edges=self.num_edges, future_len=self.future_len).p_sample_loop(model_fn=model_fn,
-                                                                                        shape=(self.test_batch_size, self.num_edges),
-                                                                                        edge_features=history_edge_features,
-                                                                                        edge_index=self.edge_index,
-                                                                                        line_graph=None,
-                                                                                        condition=c,
-                                                                                        task=task)
-                        samples = torch.where(samples == 1)[1]
-                        sample_sublist.append(samples.detach().to('cpu'))
+                        samples = make_diffusion(self.diffusion_config, 
+                                                 self.model_config, 
+                                                 num_edges=self.num_edges, 
+                                                 future_len=self.future_len, 
+                                                 device=self.device).p_sample_loop(model_fn=model_fn,
+                                                                                   shape=(bs, self.num_edges),
+                                                                                   edge_features=edge_features,
+                                                                                   edge_index=edge_index,
+                                                                                   indices=history_edge_indices,
+                                                                                   task=task)
+                        sample_sublist_binary.append(samples.detach().to('cpu'))
+                        if self.test_batch_size == 1:
+                            samples_list = torch.argwhere(samples == 1)[:, 1].detach().to('cpu')
+                        else:
+                            samples_list = []
+                            for i in range(samples.size(0)):
+                                data = torch.argwhere(samples[i] == 1)
+                                samples_list.append(data.flatten().to('cpu'))
+                        sample_sublist.append(samples_list)
                     sample_list.append(sample_sublist)
-
+                    sample_binary_list.append(sample_sublist_binary)
+                
                 elif number_samples == 1:
-                    samples_binary = make_diffusion(self.diffusion_config, self.model_config, 
-                                            num_edges=self.num_edges, future_len=self.future_len, device=self.device).p_sample_loop(model_fn=model_fn,
-                                                                                    shape=(self.test_batch_size, self.num_edges), 
-                                                                                    edge_features=history_edge_features,
-                                                                                    edge_index=data.edge_index,
-                                                                                    line_graph=None,
-                                                                                    condition=c,
+                    samples_binary = make_diffusion(self.diffusion_config, 
+                                                    self.model_config, 
+                                                    num_edges=self.num_edges, 
+                                                    future_len=self.future_len, 
+                                                    device=self.device).p_sample_loop(model_fn=model_fn,
+                                                                                    shape=(bs, self.num_edges), 
+                                                                                    edge_features=edge_features,
+                                                                                    edge_index=edge_index,
+                                                                                    indices=history_edge_indices,
                                                                                     task=task)
-                    sample_binary_list.append(samples_binary)
-                    samples = torch.argwhere(samples_binary == 1)[:, 1]
-                    sample_list.append(samples.detach().to('cpu'))
+                    sample_binary_list.append(samples_binary.to('cpu'))
+                    
+                    # Updated logic to handle sample extraction
+                    current_samples = []  # This will store tensors for the current batch
+                    for batch_index in range(samples_binary.shape[0]):
+                        indices = (samples_binary[batch_index] == 1).nonzero(as_tuple=False).squeeze(-1)
+                        # Append the indices directly; no need to check for emptiness as it creates an empty tensor automatically if no '1's are found
+                        current_samples.append(indices.detach().to('cpu'))
+                    
+                    # Append the list of tensors for this batch to the main sample list
+                    sample_list.append(current_samples)
                 else:
                     raise ValueError("Number of samples must be greater than 0.")
+                
+                '''elif number_samples == 1:
+                    samples_binary = make_diffusion(self.diffusion_config, 
+                                                    self.model_config, 
+                                                    num_edges=self.num_edges, 
+                                                    future_len=self.future_len, 
+                                                    device=self.device).p_sample_loop(model_fn=model_fn,
+                                                                                      shape=(bs, self.num_edges), 
+                                                                                      edge_features=edge_features,
+                                                                                      edge_index=edge_index,
+                                                                                      indices=history_edge_indices,
+                                                                                      task=task)
+                    sample_binary_list.append(samples_binary.to('cpu'))
+                    if self.test_batch_size == 1:
+                        samples = torch.argwhere(samples_binary == 1)[:, 1].detach().to('cpu')
+                    else:
+                        data = torch.argwhere(samples_binary == 1)
+                        unique_first_columns = data[:, 0].unique()
+                        samples = []
+                        for val in unique_first_columns:
+                            # Mask to filter rows where the first column equals the current unique value
+                            mask = data[:, 0] == val
+                            # Extract the second column values and add to the grouped list
+                            samples.append(data[mask][:, 1].unsqueeze(0).detach().to('cpu'))
+                    sample_list.append(samples)'''
+                
                 ground_truth_hist.append(history_edge_indices.detach().to('cpu'))
                 ground_truth_fut.append(future_trajectory_indices.detach().to('cpu'))
-                ground_truth_fut_binary.append(future_edge_indices_one_hot.detach().to('cpu'))
-            
+                ground_truth_fut_binary.append(future_binary.detach().to('cpu'))
             if number_samples == 1:
                 pass
-                #fut_ratio, f1, avg_sample_length = self.eval(sample_list, ground_truth_hist, ground_truth_fut)
-                #wandb.log({"F1 Score": f1.item()})
-                #wandb.log({"Future ratio": fut_ratio})
-                #wandb.log({"Average sample length": avg_sample_length})
             
             if save:
                 save_path = os.path.join(self.model_dir, 
@@ -341,6 +368,26 @@ class Graph_Diffusion_Model(nn.Module):
                 torch.save(ground_truth_fut, os.path.join(save_path, f'{self.exp_name}_ground_truth_fut.pth'))
                 print(f"Samples saved at {os.path.join(save_path, f'{self.exp_name}_samples.pth')}!")
             else:
+                ### TODO: Debugging ###
+                # ground_truth_fut is a list (of length len(val_dataloader)) of tensors with shape (batch_size, future_len)
+                # ground_truth_fut_binary is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
+                
+                # For num_samples = 1 and batch_size > 1: (works ok!)
+                # sample_binary_list is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
+                # (sample_list is a list (of length len(val_dataloader)) of lists (of length batch_size) of tensors with size (num_edges == 1) (i.e could be empty tensors))
+                
+                # For num_samples > 1 and batch_size > 1: (Problem with calculating statistics after training)
+                # sample_binary_list is a list (of length len(val_dataloader)) of lists (of length number_samples) of tensors with shape (batch_size, num_edges)
+                # sample_list is a list (of length len(val_dataloader) of lists (of length number_samples) of lists (of length batch_size) of tensors with size (num_edges == 1) (i.e could be empty tensors)
+                
+                # For num_samples = 1 and batch_size = 1: (Problem with calculating statistics during training)
+                # sample_binary_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of tensors with shape (batch_size=1, num_edges)
+                # sample_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of tensors with size (num_edges == 1) (i.e could be empty tensors), no batch dimension as in ground_truth_fut
+                
+                # For num_samples > 1 and batch_size = 1: (Problem with calculating statistics after training)
+                # sample_binary_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of lists (of length number_samples) of tensors with shape (batch_size=1, num_edges)
+                # sample_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of lists (of length number_samples) of tensors with size (num_edges == 1) (i.e could be empty tensors), no batch dimension as in ground_truth_fut
+                
                 return sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary
         
         elif task == 'generate':
@@ -456,7 +503,7 @@ class Graph_Diffusion_Model(nn.Module):
             plt.savefig(os.path.join(save_dir, f'sample_{i+1}.png'))
             plt.close()  # Close the figure to free memory
     
-    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary):
+    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=None, mode='eval'):
         """
         Evaluate the model's performance.
 
@@ -464,6 +511,80 @@ class Graph_Diffusion_Model(nn.Module):
         :param ground_truth_hist: A list of actual history edge indices.
         :param ground_truth_fut: A list of actual future edge indices.
         """
+        if number_samples is None:
+            number_samples = self.test_config['number_samples']
+        
+        if number_samples > 1:
+            def get_most_predicted_numbers(sample_list):
+                """
+                Get the 'self.future_len' distinct numbers that are predicted the most amount of time from each list in the input list.
+
+                Args:
+                    sample_list (list): A list of lists containing predicted numbers.
+
+                Returns:
+                    list: A list of tensors containing the most predicted numbers.
+                """
+                if self.test_batch_size == 1:
+                    most_predicted_numbers = []
+                    most_predicted_binary = []
+                    for sample in sample_list:
+                        binary_sample = torch.zeros(self.num_edges)
+                        # Flatten the sample list
+                        flattened_sample = torch.cat(sample).flatten()
+                        # Count the occurrences of each number
+                        counts = torch.bincount(flattened_sample, minlength=self.num_edges)
+                        valid_indices = counts > 0
+                        non_zero_indices = torch.arange(self.num_edges)[valid_indices]
+                        sorted_non_zero_indices = non_zero_indices[torch.argsort(counts[non_zero_indices], descending=True)]
+                        most_predicted_indices = sorted_non_zero_indices[:min(self.future_len, len(sorted_non_zero_indices))]
+                        
+                        most_predicted_numbers.append([most_predicted_indices])
+                        binary_sample[most_predicted_indices] = 1
+                        most_predicted_binary.append(binary_sample.unsqueeze(0))
+                else:
+                    most_predicted_numbers = []
+                    most_predicted_binary = []
+                    for i in range(len(sample_list)):
+                        # Flatten the sample list
+                        transposed_data = list(zip(*sample_list[i]))
+                        # Concatenate the tensors in each group
+                        flattened_sample = [torch.cat(tensors) for tensors in transposed_data]
+                        # Initialize the list to hold binary representations for each batch item
+                        batch_binary_samples = []
+                        # Count the occurrences of each number
+                        most_predicted_numbers_int = []
+                        for s in flattened_sample:
+                            binary_sample = torch.zeros(self.num_edges, device=s.device)  # Ensure the binary_sample is on the correct device
+                            counts = torch.bincount(s, minlength=self.num_edges)
+                            valid_indices = counts > 0
+                            non_zero_indices = torch.arange(self.num_edges)[valid_indices]
+                            sorted_non_zero_indices = non_zero_indices[torch.argsort(counts[non_zero_indices], descending=True)]
+                            most_predicted_indices = sorted_non_zero_indices[:min(self.future_len, len(sorted_non_zero_indices))]
+                            most_predicted_numbers_int.append(most_predicted_indices)
+                            binary_sample[most_predicted_indices] = 1
+                            # Append the binary representation for this sample to the batch list
+                            batch_binary_samples.append(binary_sample)
+                        
+                        # Stack all binary samples for the current batch to match the desired shape (batch_size, num_edges)
+                        batch_binary_tensor = torch.stack(batch_binary_samples, dim=0)
+                        most_predicted_numbers.append(most_predicted_numbers_int)
+                        most_predicted_binary.append(batch_binary_tensor)
+
+                return most_predicted_numbers, most_predicted_binary
+
+            sample_list, sample_binary_list = get_most_predicted_numbers(sample_list)
+
+        ### For num_samples > 1 and batch_size > 1 ###
+        # sample_list is a list (of length len(val_dataloader)) of lists (of length batch_size) of tensors with size (future_len)
+        # sample_binary_list is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
+        # With this shape we can calculate the metrics without issue
+        
+        ### For num_samples > 1 and batch_size == 1 ###
+        # sample_list is a list (of length len(val_dataloader)) of lists (of length batch_size) of tensors with size (future_len)
+        # sample_binary_list is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
+        # With this shape we can calculate the metrics without issue
+        
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
             Calculates the ratio of samples in `sample_list` that have at least n edges in common with the ground truth future trajectory for each n up to future_len.
@@ -476,22 +597,27 @@ class Graph_Diffusion_Model(nn.Module):
                 dict: A dictionary where keys are the minimum number of common edges (from 1 to future_len) and values are the ratios of samples meeting that criterion.
             """
             # Initialize counts for each number of common edges from 1 up to future_len
-            counts = {i: 0 for i in range(1, self.future_len + 1)}
-            total = len(sample_list)
+            counts = {i: 0 for i in range(1, self.future_len + 1)}            
 
-            for i, sample in enumerate(sample_list):
-                # Convert tensors to lists if they are indeed tensors
-                sample = sample.tolist() if isinstance(sample, torch.Tensor) else sample
-                ground_truth = ground_truth_fut[i].flatten().tolist()
+            total = 0
+            for (sample_sublist, ground_truth_sublist) in zip(sample_list, ground_truth_fut):
+                total += len(sample_sublist)
+                for i in range(len(sample_sublist)):
+                    # Convert tensors to lists if they are indeed tensors
+                    sample = sample_sublist[i].tolist()
+                    ground_truth = ground_truth_sublist[i].flatten().tolist()
 
-                edges_count = sum(1 for edge in ground_truth if edge in sample)
-                for n in range(1, min(edges_count, self.future_len) + 1):
-                    counts[n] += 1
-
-            ratios = {n: counts[n] / total for n in counts}
+                    edges_count = sum(1 for edge in ground_truth if edge in sample)
+                    for n in range(1, min(edges_count, self.future_len) + 1):
+                        counts[n] += 1
+                
+            if total != 0:
+                ratios = {n: counts[n] / total for n in counts}
+            else:
+                ratios = {n: 0 for n in counts}
             return ratios
         
-        def calculate_sample_f1(sample_binary_list, ground_truth_fut_binary):
+        def calculate_sample_f1(tpr, prec):
             """
             Calculates the F1 score for a given list of samples and ground truth futures.
 
@@ -503,22 +629,57 @@ class Graph_Diffusion_Model(nn.Module):
                 float: The F1 score.
 
             """
-            '''one_hot_samples = [torch.zeros(self.num_edges) for _ in range(len(sample_list))]
-            one_hot_futures = [torch.zeros(self.num_edges) for _ in range(len(ground_truth_fut))]
-            for i, one_hot_sample in enumerate(one_hot_samples):
-                for edge_index, edge in enumerate(self.edges):
-                    if edge_index in sample_list[i]:
-                        one_hot_sample[edge_index] = 1
-            for i, one_hot_fut in enumerate(one_hot_futures):
-                for edge_index, edge in enumerate(self.edges):
-                    if edge_index in ground_truth_fut[i]:
-                        one_hot_fut[edge_index] = 1'''
-            metric = F1Score(task='binary', average='macro', num_classes=2)
-            f1 = metric(torch.flatten(torch.cat(sample_binary_list)).detach().to('cpu'),
-                        torch.flatten(torch.cat(ground_truth_fut_binary)).detach().to('cpu'))
-            
+            if (prec + tpr) > 0:
+                f1_score = 2 * (prec * tpr) / (prec + tpr)
+            else:
+                f1_score = 0
+            return f1_score
+        
+        def calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary):
+            """
+            Calculate the accuracy of the samples.
 
-            return f1
+            Args:
+                sample_list (list): A list of samples.
+                ground_truth_fut (list): A list of ground truth future trajectories.
+
+            Returns:
+                float: The accuracy of the samples.
+            """
+            acc = 0
+            for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
+                ground_truth = ground_truth_sublist.flatten()
+                sample = sample_sublist.flatten()
+                acc += torch.sum(sample == ground_truth).item() / ground_truth.size(0)
+            return acc / len(self.val_dataloader)
+        
+        def calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary):
+            """
+            Calculate the true positive rate of the samples.
+
+            Args:
+                sample_list (list): A list of samples.
+                ground_truth_fut (list): A list of ground truth future trajectories.
+
+            Returns:
+                float: The true positive rate of the samples.
+            """
+            tpr = 0
+            for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
+                ground_truth = ground_truth_sublist.flatten()
+                sample = sample_sublist.flatten()
+                if torch.sum(ground_truth) > 0:
+                    tpr += torch.sum(sample * ground_truth).item() / torch.sum(ground_truth).item()
+            return tpr / len(self.val_dataloader)
+        
+        def calculate_sample_prec(sample_binary_list, ground_truth_fut_binary):
+            prec = 0
+            for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
+                ground_truth = ground_truth_sublist.flatten()
+                sample = sample_sublist.flatten()
+                if torch.sum(sample) > 0:
+                    prec += torch.sum(sample * ground_truth).item() / torch.sum(sample).item()
+            return prec / len(self.val_dataloader)
         
         def calculate_avg_sample_length(sample_list):
             """
@@ -530,13 +691,20 @@ class Graph_Diffusion_Model(nn.Module):
             Returns:
                 float: The average sample length.
             """
-            return sum(len(sample) for sample in sample_list) / len(sample_list)
+            total_len = 0
+            for sample_sublist in sample_list:
+                for sample in sample_sublist:
+                    total_len += len(sample) / len(sample_sublist)
+            return total_len / len(self.val_dataloader)
         
         fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
-        f1 = calculate_sample_f1(sample_binary_list, ground_truth_fut_binary)
+        tpr = calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary)
+        prec = calculate_sample_prec(sample_binary_list, ground_truth_fut_binary)
+        f1 = calculate_sample_f1(tpr, prec)
+        acc = calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary)
         avg_sample_length = calculate_avg_sample_length(sample_list)
         
-        return fut_ratio, f1, avg_sample_length
+        return fut_ratio, f1, acc, tpr, avg_sample_length
     
     def save_model(self):
         save_path = os.path.join(self.model_dir, 
@@ -558,7 +726,7 @@ class Graph_Diffusion_Model(nn.Module):
                 return 1.0
             else:
                 decay_lr = self.lr_decay_parameter ** (epoch - self.learning_rate_warmup_steps)
-                return max(decay_lr, 2e-5 / self.lr)
+                return max(decay_lr, 4e-4 / self.lr)
             
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         print("> Optimizer and Scheduler built!")
@@ -576,19 +744,12 @@ class Graph_Diffusion_Model(nn.Module):
         self.nodes = self.G.nodes
         self.edges = self.G.edges(data=True)
         self.num_edges = self.G.number_of_edges()
-        self.indexed_edges = self.train_dataset.edges
-        # self.num_edge_features = self.train_dataset.num_edge_features
-        self.num_edge_features = 1
+        self.num_edge_features = 2  # Binary History and noised binary future
         if 'coordinates' in self.edge_features:
             self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:
             self.num_edge_features += 1
         
-        # Build the line graph and corresponding edge index
-        # self.edge_index = self._build_edge_index()
-        # self.edge_index = self.train_dataset.edge_index
-        
-        from torch_geometric.data import DataLoader
         self.train_data_loader = DataLoader(self.train_dataset, 
                                             batch_size=self.batch_size, 
                                             shuffle=False, 
@@ -617,9 +778,7 @@ class Graph_Diffusion_Model(nn.Module):
         return edge_index.to(self.device, non_blocking=True)
     
     def _build_val_dataloader(self):
-        # self.val_dataset = TrajectoryDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
         self.val_dataset = TrajectoryGeoDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
-        from torch_geometric.data import DataLoader
         self.val_dataloader = DataLoader(self.val_dataset, 
                                          batch_size=self.test_batch_size, 
                                          shuffle=False, 
@@ -732,10 +891,10 @@ class TrajectoryGeoDataset(Dataset):
         future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
 
         # Extract and generate features
-        history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
-        data = MyData(x=history_edge_features,          # (batch_size * num_edges, num_edge_features)
+        edge_features, future_binary = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
+        data = MyData(x=edge_features,          # (batch_size * num_edges, num_edge_features)
                     edge_index=self.edge_index,         # (2, num_edges)
-                    y=future_edge_features,             # (batch_size, num_edges, 1)
+                    y=future_binary,             # (batch_size, num_edges, 1)
                     history_indices=history_indices,    # (batch_size, history_len)
                     future_indices=future_indices,      # (batch_size, future_len)
                     num_nodes=self.num_edges)
@@ -755,14 +914,15 @@ class TrajectoryGeoDataset(Dataset):
         future_one_hot_edges = future_one_hot_edges.sum(dim=0)  # (num_edges,)
         
         # Basic History edge features = coordinates, binary encoding
-        history_edge_features = history_one_hot_edges.view(-1, 1).float()
-        future_edge_features = future_one_hot_edges.view(-1, 1).float()
+        edge_features = history_one_hot_edges.view(-1, 1).float()
+        future_binary = future_one_hot_edges.view(-1, 1).float()
         if 'coordinates' in self.edge_features:
-            history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            edge_features = torch.cat((edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
         if 'edge_orientations' in self.edge_features:
-            history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
+            edge_features = torch.cat((edge_features, history_edge_orientations.float()), dim=1)
+        edge_features = torch.cat((edge_features, future_binary), dim=1)
         
-        return history_edge_features, future_edge_features
+        return edge_features, future_binary
     
     def build_graph(self):
         import networkx as nx
@@ -1235,9 +1395,14 @@ class Edge_Encoder_Residual(nn.Module):
         self.theta = self.config['theta']
         
         self.convs = nn.ModuleList()
-        self.convs.append(GATv2Conv(self.num_edge_features, self.hidden_channels, heads=self.num_heads))
         self.res_layers = nn.ModuleList()
-        self.res_layers.append(nn.Linear(self.num_edge_features, self.hidden_channels * self.num_heads))
+        if 'pos_encoding' in self.edge_features:
+            self.convs.append(GATv2Conv(self.num_edge_features + self.pos_encoding_dim + self.time_embedding_dim, self.hidden_channels, heads=self.num_heads))
+            self.res_layers.append(nn.Linear(self.num_edge_features + self.pos_encoding_dim + self.time_embedding_dim, self.hidden_channels * self.num_heads))
+        else: 
+            self.convs.append(GATv2Conv(self.num_edge_features, self.hidden_channels, heads=self.num_heads))
+            self.res_layers.append(nn.Linear(self.num_edge_features, self.hidden_channels * self.num_heads))
+            
         for _ in range(1, self.num_layers):
             self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, heads=self.num_heads, bias=False))
             self.res_layers.append(nn.Linear(self.hidden_channels * self.num_heads, self.hidden_channels * self.num_heads))
@@ -1245,15 +1410,10 @@ class Edge_Encoder_Residual(nn.Module):
         # Output layers for each task
         self.condition_dim = self.config['condition_dim']
         self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
-        if 'pos_encoding' in self.edge_features:
-            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim + self.pos_encoding_dim,
-                                        self.hidden_channels)  # To predict future edges
-        else:
-            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
-                                            self.hidden_channels)  # To predict future edges
+        self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads, self.hidden_channels)  # To predict future edges
         self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, x, edge_index, indices=None, t=None, condition=None, mode=None):
+    def forward(self, x, edge_index, t, indices=None):
         """
         Forward pass through the model
         Args:
@@ -1264,39 +1424,43 @@ class Edge_Encoder_Residual(nn.Module):
         # GNN forward pass
         # Edge Embedding
         batch_size = x.size(0) // self.num_edges
-        if x.dim() == 3:
-            x = x.squeeze(0)    # (bs, num_edges, num_edge_features) -> (num_edges, num_edge_features)
+        if 'pos_encoding' in self.edge_features:
+            pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
+            encodings = F.silu(self.pos_linear0(pos_encoding))
+            encodings = F.silu(self.pos_linear1(encodings))
+            x = self.integrate_encodings(x, indices, encodings) # (batch_size * num_edges, num_edge_features + pos_encoding_dim)
+        
+        # Time embedding
+        t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
+        t_emb = self.time_linear0(t_emb)
+        t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
+        t_emb = self.time_linear1(t_emb)
+        t_emb = F.silu(t_emb)   # (batch_size, time_embedding_dim)
+        t_emb = torch.repeat_interleave(t_emb, self.num_edges, dim=0) # (batch_size * num_edges, time_embedding_dim)
+        
+        x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding, (batch_size * num_edges, num_edge_features + time_embedding_dim (+ pos_enc_dim))
         
         for conv, res_layer in zip(self.convs, self.res_layers):
             res = F.relu(res_layer(x))
             x = F.relu(conv(x, edge_index))
             x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)
             
-        if mode == 'history':
+        '''if mode == 'history':
             c = self.history_encoder(x)     # (batch_size * num_edges, condition_dim)
             if 'pos_encoding' in self.edge_features:
                 pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
                 encodings = F.silu(self.pos_linear0(pos_encoding))
                 encodings = F.silu(self.pos_linear1(encodings))
                 c = self.integrate_encodings(c, indices, encodings)     # (batch_size * num_edges, condition_dim + pos_encoding_dim)
-            return c
+            return c'''
         
-        elif mode == 'future':
-            # Time embedding
-            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
-            t_emb = self.time_linear0(t_emb)
-            t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
-            t_emb = self.time_linear1(t_emb)
-            t_emb = F.silu(t_emb)   # (batch_size, time_embedding_dim)
-            t_emb = torch.repeat_interleave(t_emb, self.num_edges, dim=0) # (batch_size * num_edges, time_embedding_dim)
-            
-            #Concatenation
-            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding, (batch_size * num_edges, hidden_dim')
-            x = torch.cat((x, condition), dim=1) # Concatenate with condition c, (batch_size * num_edges, hidden_dim')
-            logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
-            logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)
+        # elif mode == 'future':
+        
+        #Concatenation
+        logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
+        logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)
 
-            return logits.view(batch_size, self.num_edges, -1)  # (1, num_edges, num_classes=2)
+        return logits.view(batch_size, self.num_edges, -1)  # (batch_size, num_edges, num_classes=2)
 
     def integrate_encodings(self, features, indices, encodings):
         """
@@ -1694,7 +1858,7 @@ class CategoricalDiffusion:
         
         return transition_matrix
 
-    def _at(self, a, t, x):
+    def _at(self, q_mat, t, x):
         """
         Extract coefficients at specified timesteps t and conditioning data x in PyTorch.
 
@@ -1703,7 +1867,7 @@ class CategoricalDiffusion:
         t: torch.Tensor: PyTorch tensor of time indices, shape = (batch_size,).
         x: torch.Tensor: PyTorch tensor of shape (bs, ...) of int32 or int64 type.
             (Noisy) data. Should not be of one-hot representation, but have integer
-            values representing the class values. --> NOT A LOT NEEDS TO CHANGE, MY CLASS VALUES ARE SIMPLY 0 AND 1
+            values representing the class values.
 
         Returns:
         a[t, x]: torch.Tensor: PyTorch tensor.
@@ -1716,47 +1880,43 @@ class CategoricalDiffusion:
         # out[i, j, k, l, m] = a[t[i, j, k, l], x[i, j, k, l], m]
         
         ### New ###
-        # x.shape = (bs, num_edges, channels=1) 
-        # t_broadcast_shape = (bs, 1, 1)
+        # x.shape = (bs, num_edges) 
+        # t_broadcast_shape = (bs, 1)
         # a.shape = (num_timesteps, num_classes, num_classes) 
-        # out.shape = (bs, num_edges, channels, num_classes) 
+        # out.shape = (bs, num_edges, num_classes) 
         
         # Convert `a` to the desired dtype if not already
-        a = a.type(self.torch_dtype)
-        #print("A", a.shape)
-        
+        q_mat = q_mat.type(self.torch_dtype)        
 
         # Prepare t for broadcasting by adding necessary singleton dimensions
-        t_broadcast = t.view(-1, *((1,) * (x.ndim - 1))).to(self.device, non_blocking=True)
+        t_broadcast = t.unsqueeze(1).to(self.device, non_blocking=True)
 
         # Advanced indexing in PyTorch to select elements
-        #print("_at output", a[t_broadcast, x.long()].shape)
-        #print(a[t_broadcast, x.long()])
-        return a[t_broadcast, x.long()].to(self.device, non_blocking=True)  # (batch_size, num_edges, 2)
+        return q_mat[t_broadcast, x.long()].to(self.device, non_blocking=True)  # (batch_size, num_edges, 2)
 
-    def _at_onehot(self, a, t, x):
+    def _at_onehot(self, q_mat, t, x):
         """Extract coefficients at specified timesteps t and conditioning data x.
 
         Args:
-        a: torch.Tensor: PyTorch tensor of constants indexed by time, dtype should be pre-set.
+        q_mat: torch.Tensor: PyTorch tensor of constants indexed by time, dtype should be pre-set.
         t: torch.Tensor: PyTorch tensor of time indices, shape = (batch_size,).
         x: torch.Tensor: PyTorch tensor of shape (bs, ...) of float32 type.
             (Noisy) data. Should be of one-hot-type representation.
 
         Returns:
-        out: torch.tensor: output of dot(x, a[t], axis=[[-1], [1]]).
+        out: torch.tensor: output of dot(x, q_mat[t], axis=[[-1], [1]]).
             shape = (bs, num_edges, channels=1, num_classes)
         """
-        a = a.type(self.torch_dtype)
+        q_mat = q_mat.type(self.torch_dtype)
         
         ### Final ###
         # t.shape = (bs)
         # x.shape = (bs, num_edges, num_classes)
-        # a[t].shape = (bs, num_classes, num_classes)
+        # q_mat[t].shape = (bs, num_classes, num_classes)
         # out.shape = (bs, num_edges, num_classes)
 
-        a_t = a[t]
-        out = torch.einsum('bik,bkj->bij', x, a_t).to(self.device, non_blocking=True)
+        q_mat_t = q_mat[t]
+        out = torch.einsum('bik,bkj->bij', x, q_mat_t).to(self.device, non_blocking=True)
         
         return out.to(self.device, non_blocking=True)
 
@@ -1790,11 +1950,12 @@ class CategoricalDiffusion:
         sample: torch.tensor: same shape as x_start. noisy data.
         """
         assert noise.shape == x_start.shape + (self.num_classes,)
-        logits = torch.log(self.q_probs(x_start, t) + self.eps)
+        logits = torch.log(self.q_probs(x_start, t) + self.eps) # (bs, num_edges, num_classes)
 
         # To avoid numerical issues, clip the noise to a minimum value
-        noise = torch.clamp(noise, min=torch.finfo(noise.dtype).tiny, max=1.)
-        gumbel_noise = -torch.log(-torch.log(noise)).to(self.device, non_blocking=True)
+        noise = torch.clamp(noise, min=torch.finfo(noise.dtype).tiny, max=1.)   # (bs, num_edges, num_classes)
+        gumbel_noise = -torch.log(-torch.log(noise)).to(self.device, non_blocking=True) # (bs, num_edges, num_classes)
+        
         return torch.argmax(logits + gumbel_noise, dim=-1)
     
     def _get_logits_from_logistic_pars(self, loc, log_scale):
@@ -1829,16 +1990,20 @@ class CategoricalDiffusion:
         return logits
 
     def q_posterior_logits(self, x_start, x_t, t, x_start_logits):
-        """Compute logits of q(x_{t-1} | x_t, x_start) in PyTorch."""
+        """Compute logits of q(x_{t-1} | x_t, x_start_tilde) in PyTorch."""
         
         if x_start_logits:
             assert x_start.shape == x_t.shape + (self.num_classes,), (x_start.shape, x_t.shape)
         else:
             assert x_start.shape == x_t.shape, (x_start.shape, x_t.shape)
-            
-        fact1 = self._at(self.transpose_q_onestep_mats, t, x_t)
+        
+        # fact1 = x_t * Q_t.T
+        fact1 = self._at(self.transpose_q_onestep_mats, t, x_t) # (batch_size, num_edges, num_classes)
         if x_start_logits:
-            fact2 = self._at_onehot(self.q_mats, t-1, F.softmax(x_start, dim=-1))
+            # x_start represents the logits of x_start
+            # F.softmax(x_start, dim=-1) represents x_0_tilde from the D3PM paper, or x_start_tilde
+            # fact2 = x_start_tilde * Q_{t-1}_bar
+            fact2 = self._at_onehot(self.q_mats, t-1, F.softmax(x_start, dim=-1))   # (batch_size, num_edges, num_classes)
             tzero_logits = x_start
         else:
             fact2 = self._at(self.q_mats, t-1, x_start)
@@ -1851,8 +2016,12 @@ class CategoricalDiffusion:
 
         return torch.where(t_broadcast == 0, tzero_logits, out) # (bs, num_edges, num_classes)
 
-    def p_logits(self, model_fn, x, t, edge_features=None, edge_index=None, condition=None):
+    def p_logits(self, model_fn, x, t, edge_features=None, edge_index=None, indices=None):
         """Compute logits of p(x_{t-1} | x_t) in PyTorch.
+        p(x_{t-1}|x_t) ~ sum_over_x_start_tilde(q(x_{t-1}, x_t | x_start_tilde) * p(x_start_tilde|x_t))
+        
+        with q(x_{t-1}, x_t | x_start_tilde) ~ q(x_{t-1} | x_t, x_start_tilde) * q(x_t | x_start_tilde)
+            where q(x_{t-1} | x_t, x_start_tilde) is the q_posterior_logits
 
         Args:
             model_fn (function): The model function that takes input `x` and `t` and returns the model output.
@@ -1865,21 +2034,15 @@ class CategoricalDiffusion:
                 - pred_x_start_logits (torch.Tensor): The logits of p(x_{t-1} | x_start) of shape (batch_size, num_edges, num_classes).
         """
         assert t.shape == (x.shape[0],)
-        model_output = model_fn(edge_features, edge_index, t, condition=condition)
-        #print("Output", model_output.size())
+        model_output = model_fn(edge_features, edge_index, t, indices)
 
         if self.model_output == 'logits':
             model_logits = model_output
-        elif self.model_output == 'logistic_pars':
-            loc, log_scale = model_output
-            model_logits = self._get_logits_from_logistic_pars(loc, log_scale)
         else:
             raise NotImplementedError(self.model_output)
 
         if self.model_prediction == 'x_start':
             pred_x_start_logits = model_logits
-            #print("Pred_x_start_logits", pred_x_start_logits.shape)
-            # print(pred_x_start_logits)
             t_broadcast = t.unsqueeze(1).unsqueeze(2)  # Adds new dimensions: [batch_size, 1, 1]
             t_broadcast = t_broadcast.expand(-1, pred_x_start_logits.size(1), pred_x_start_logits.size(-1)).to(self.device, non_blocking=True)   # pred_x_start_logits.size(1) = num_edges, pred_x_start_logits.size(-1) = num_classes
             model_logits = torch.where(t_broadcast == 0, pred_x_start_logits,
@@ -1893,28 +2056,31 @@ class CategoricalDiffusion:
     
     # === Sampling ===
 
-    def p_sample(self, model_fn, x, t, noise, edge_features=None, edge_index=None, condition=None):
+    def p_sample(self, model_fn, x, t, noise, edge_features=None, edge_index=None, indices=None):
         """Sample one timestep from the model p(x_{t-1} | x_t)."""
         # Get model logits
-        model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, edge_features=edge_features, edge_index=edge_index, condition=condition)
+        model_logits, pred_x_start_logits = self.p_logits(model_fn=model_fn, x=x, t=t, edge_features=edge_features, edge_index=edge_index, indices=indices)
 
         assert noise.shape == model_logits.shape, noise.shape
 
-        # No noise when t == 0
-        nonzero_mask = (t != 0).float().reshape(x.shape[0], *([1] * (len(x.shape) - 1)))
         # For numerical precision clip the noise to a minimum value
         noise = torch.clamp(noise, min=torch.finfo(noise.dtype).eps, max=1.)
         gumbel_noise = -torch.log(-torch.log(noise))
-
-        sample = torch.argmax(model_logits + nonzero_mask * gumbel_noise, dim=-1)
+        
+        # No noise when t == 0
+        if t[0] == 0:
+            sample = torch.argmax(model_logits, dim=-1)
+        else:
+            sample = torch.argmax(model_logits + gumbel_noise, dim=-1)
 
         assert sample.shape == x.shape
         assert pred_x_start_logits.shape == model_logits.shape
         
         return sample, pred_x_start_logits
 
-    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, edge_features=None, edge_index=None, line_graph=None, condition=None, task=None):
+    def p_sample_loop(self, model_fn, shape, num_timesteps=None, return_x_init=False, edge_features=None, edge_index=None, indices=None, task=None):
         """Ancestral sampling."""
+        num_edges = shape[1]
         if num_timesteps is None:
             num_timesteps = self.num_timesteps
 
@@ -1930,47 +2096,46 @@ class CategoricalDiffusion:
             x_init = torch.full(shape, fill_value=self.num_classes // 2, dtype=torch.int32, device=device)
         else:
             raise ValueError(f"Invalid transition_mat_type {self.transition_mat_type}")
-
+        
         x = x_init.clone()  # (bs, num_edges)
         edge_attr = x_init.float()
         new_edge_features = edge_features.clone()
-        '''for i in range(edge_attr.shape[0]):
-            new_edge_features[i * self.num_edges:(i + 1)*self.num_edges, 0] = edge_attr[i]'''
-        # TODO: Adapt this for higher batch sizes (see loop above)
-        new_edge_features[:, 0] = edge_attr
+        new_edge_features[:, -1] = edge_attr.flatten()
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
-            x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
-            new_edge_features[:, 0] = x.float()
+            x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, indices=indices)
+            new_edge_features[:, -1] = x.flatten().float()
 
         if return_x_init:
             return x_init, x
         else:
-            return x
+            return x    # (val_bs, num_edges)
 
   # === Log likelihood / loss calculation ===
         
-    def cross_entropy_x_start(self, x_start, pred_x_start_logits, class_weights):
+    def cross_entropy_x_start(self, x_start, pred_x_start_logits):
         """Calculate binary weighted cross entropy between x_start and predicted x_start logits.
 
         Args:
             x_start (torch.Tensor): original clean data, expected binary labels (0 or 1), shape (bs, num_edges)
             pred_x_start_logits (torch.Tensor): logits as predicted by the model
-            class_weights (torch.Tensor): tensor with weights for class 0 and class 1
 
         Returns:
             torch.Tensor: scalar tensor representing the mean binary weighted cross entropy loss.
         """
         # Calculate binary cross-entropy with logits
         x_start = x_start.long().to(self.device, non_blocking=True)
-        pred_x_start_logits = pred_x_start_logits.permute(0, 2, 1).float() # (bs, num_edges, num_classes) -> (bs, num_classes, num_edges)
-        ce = F.cross_entropy(pred_x_start_logits, x_start, weight=class_weights.float().to(self.device, non_blocking=True), reduction='mean')
+        pred_x_start_logits = pred_x_start_logits.permute(0, 2, 1).float()          # (bs, num_edges, num_classes) -> (bs, num_classes, num_edges)
+        pred_x_start_logits = pred_x_start_logits.transpose(1, 2).reshape(-1, 2)    # (bs*num_edges, num_classes)
+        x_start = x_start.reshape(-1)                                               # (bs*num_edges)
+
+        ce = F.cross_entropy(pred_x_start_logits, x_start, weight=self.class_weights.float().to(self.device, non_blocking=True), reduction='mean')
 
         return ce
 
-    def training_losses(self, model_fn, condition=None, *, x_start, edge_features, edge_index, line_graph=None):
+    def training_losses(self, model_fn, x_start, edge_features, edge_index, indices=None):
         """Training loss calculation."""
         # Add noise to data
         batch_size, num_edges = x_start.shape
@@ -1979,21 +2144,18 @@ class CategoricalDiffusion:
 
         # t starts at zero. so x_0 is the first noisy datapoint, not the datapoint itself.
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)  # (bs, num_edges)
-        #print("X_start", [torch.argwhere(x_start[i].unsqueeze(0) == 1)[:, 1] for i in range(x_start.shape[0])])
-        #print("X_t", [torch.argwhere(x_t[i].unsqueeze(0) == 1)[:, 1] for i in range(x_t.shape[0])])
-        #print("t", t)
-        #print("\n")
         
-        edge_attr_t = x_t.float()   # (bs, num_edges)
+        # Replace true future with noised future
+        x_t = x_t.float()   # (bs, num_edges)
         new_edge_features = edge_features.clone()
-        for i in range(edge_attr_t.shape[0]):
-            new_edge_features[i * num_edges:(i + 1)*num_edges, 0] = edge_attr_t[i]
+        for i in range(x_t.shape[0]):
+            new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
 
 
         # Calculate the loss
         if self.loss_type == 'kl':
             losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
-                                                               edge_features=new_edge_features, edge_index=edge_index, condition=condition)
+                                                               edge_features=new_edge_features, edge_index=edge_index)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
             # NOTE: Currently only works for batch size of 1
@@ -2004,17 +2166,10 @@ class CategoricalDiffusion:
             
         elif self.loss_type == 'cross_entropy_x_start':
             
-            _, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, edge_features=new_edge_features, edge_index=edge_index, condition=condition)
-            losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits, class_weights=self.class_weights)
+            model_logits, pred_x_start_logits = self.p_logits(model_fn, x=x_t, t=t, edge_features=new_edge_features, edge_index=edge_index, indices=indices)
+            losses = self.cross_entropy_x_start(x_start=x_start, pred_x_start_logits=pred_x_start_logits)
             
-            pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-            
-            if (self.model_name == 'edge_encoder') | (self.model_name == 'edge_encoder_residual'):
-                # NOTE: Currently only works for batch size of 1
-                pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
-                pred = pred_x_start_logits.argmax(dim=2)    # (num_edges, classes) -> (num_edges,)
-            elif self.model_name == 'edge_encoder_mlp':
-                pred = pred_x_start_logits.argmax(dim=2)
+            pred = pred_x_start_logits.argmax(dim=2)    # (batch_size, num_edges, num_classes) -> (batch_size, num_edges)
             
             return losses, pred
             
@@ -2029,24 +2184,24 @@ print(device)
 
     
 data_config = {"dataset": "synthetic_20_traj",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_train.h5',
-    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_val.h5',
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_train.h5',
+    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_val.h5',
     "history_len": 5,
-    "future_len": 5,
+    "future_len": 2,
     "num_classes": 2,
-    "pos_encoding_dim": 16,
     "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding']#, 'pos_encoding'
     }
 
 diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
-    "start": 0.00001,  # 1e-4 gauss, 0.02 uniform
-    "stop": 0.005,  # 0.02 gauss, 1. uniform
-    "num_timesteps": 50}
+    "start": 1e-5,  # 1e-5 custom, 0.01 prior
+    "stop": 0.09,  # 0.09 custom, 0.5 prior
+    "num_timesteps": 100}
 
 model_config = {"name": "edge_encoder_residual",
     "hidden_channels": 64,
     "time_embedding_dim": 16,
     "condition_dim": 32,
+    "pos_encoding_dim": 16,
     "num_heads": 2,
     "num_layers": 2,
     "theta": 1.0, # controls strength of conv layers in residual model
@@ -2059,26 +2214,27 @@ model_config = {"name": "edge_encoder_residual",
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     }
 
-train_config = {"batch_size": 24,
+train_config = {"batch_size": 8,
     "optimizer": "adam",
-    "lr": 0.001,
+    "lr": 0.009,
     "gradient_accumulation": False,
     "gradient_accumulation_steps": 16,
-    "num_epochs": 800,
-    "learning_rate_warmup_steps": 300, # previously 10000
-    "lr_decay": 0.9995, # previously 0.9999
+    "num_epochs": 350,
+    "learning_rate_warmup_steps": 80, # previously 10000
+    "lr_decay": 0.999, # previously 0.9999
     "log_loss_every_steps": 1,
-    "log_metrics_every_steps": 2,
-    "save_model": True,
+    "log_metrics_every_steps": 5,
+    "save_model": False,
     "save_model_every_steps": 5}
 
-test_config = {"batch_size": 1, # currently only 1 works
+test_config = {"batch_size": 8, # currently only 1 works
     "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/tdrive_residual_edge_encoder_residual__hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
-    "number_samples": 1,
-    "eval_every_steps": 20
+    "number_samples": 10,
+    "eval_every_steps": 30
   }
 
 wandb_config = {"exp_name": "synthetic_d3pm_test",
+                "run_name": "test",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
     "job_type": "test",
@@ -2093,15 +2249,21 @@ elif model_config["name"] == 'edge_encoder_residual':
     encoder_model = Edge_Encoder_Residual
 
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model).to(device)
-# model.train()
+model.train()
 model_path = test_config["model_path"]
-sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=True, model_path=model_path, task='predict', number_samples=1)
-torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/samples_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
-torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_hist_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
-torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_fut_tdriveresidual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
-fut_ratio, f1, avg_sample_length = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary)
-print("Val F1 Score", f1.item())
+sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, model_path=model_path, task='predict')
+#torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/samples_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
+#torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_hist_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
+#torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_fut_tdriveresidual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
+fut_ratio, f1, acc, tpr, avg_sample_length = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, mode='test')
+#print("ground_truth_hist", ground_truth_hist)
+#print("ground_truth_fut", ground_truth_fut)
+#print("sample_list", sample_list)
+print("Val F1 Score", f1)
 print("\n")
+print("Val Accuracy", acc)
+print("\n")
+print("Val TPR", tpr)
 print("Average sample length", avg_sample_length)
 print("\n")
 print("Val Future ratio", fut_ratio)

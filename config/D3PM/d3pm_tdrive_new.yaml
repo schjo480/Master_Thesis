@@ -20,7 +20,6 @@ fixed:
     train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_train.h5'
     val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_val.h5'
     num_classes: 2
-    pos_encoding_dim: 16
     edge_features: ['one_hot_edges', 'coordinates', 'pos_encoding']
 
   diffusion_config:
@@ -41,6 +40,7 @@ fixed:
     condition_dim: 32
     hidden_channels: 64
     time_embedding_dim: 16
+    pos_encoding_dim: 16
   
   training:
     lr: 0.005
