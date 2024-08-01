@@ -1054,21 +1054,6 @@ class EdgeModel(nn.Module):
         self.fc = nn.Linear(hidden_size, num_edges)
 
     def forward(self, x, hidden, mask, lengths):
-        #print("Sequence x", x)
-        #print(x.shape)
-        # x should be of shape (seq_len, input_size)
-        # print("Sequence", x)
-        # x = x.unsqueeze(-1)    # Add a dimension for the input size
-        # x has shape [bs, seq_len, num_features]
-        #x, hidden = self.rnn(x, hidden)    # for unbatched data: x: (seq_len, hidden_size=num_edges), hidden: (num_layers, hidden_size=num_edges), else x: (batch_size, seq_len, hidden_size), hidden: (batch_size, seq_len, hidden_size)
-        # print("out shape", x.shape)
-        #print("hidden shape", hidden.shape)
-        # x of shape (num_edges, num_edges)
-        #print("x", x.shape)
-        #print("hidden", hidden.shape)
-        #logits = self.fc(x)
-        #print("Logits shape", logits.shape)
-        
         # x has shape [bs, seq_len, num_features]
         packed_input = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
         packed_output, hidden = self.rnn(packed_input)  # hidden has size [num_layers, batch_size, hidden_size]
@@ -1154,7 +1139,10 @@ class Train_Model(nn.Module):
         for features, target, target_bin, mask, lengths in self.val_dataloader:
             batch_size = features.size(0)
             hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=self.device)
-            probabilities, pred = self.model(features, hidden, mask, lengths)
+            current_input = features
+            for step in range(len(self.future_len)):
+                probabilities, pred = self.model(current_input, hidden, mask, lengths)
+                
             sequence = [torch.tensor([row[i, 0] for i in range(row.size(0)) if row[i, 0] != 0]) for row in features]
             sequences.append(sequence)
             targets.append(target)
