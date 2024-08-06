@@ -946,7 +946,7 @@ class AutoregressiveTrajectoryDataset(Dataset):
     
     
 class AlternativeAutoregressiveTrajectoryDataset(Dataset):
-    def __init__(self, file_path, history_len, future_len, device):
+    def __init__(self, file_path, history_len, future_len, dataset, device):
         self.device = device
         self.history_len = history_len
         self.future_len = future_len
@@ -958,19 +958,54 @@ class AlternativeAutoregressiveTrajectoryDataset(Dataset):
         self.edge_list = list(self.graph.edges())
         self.data = []
         # Preprocess and move data to the specified device
-        for trajectory in self.trajectories:
-            for i in range(1, self.history_len):
-                sequence = trajectory['edge_idxs'][:i]
-                target = trajectory['edge_idxs'][i]
-                
+        if dataset == 'train':
+            for trajectory in self.trajectories:
+                for i in range(1, self.history_len):
+                    sequence = trajectory['edge_idxs'][:i]
+                    target = trajectory['edge_idxs'][i]
+                    
+                    edge_coordinates = self.edge_coordinates[sequence]
+                    edge_coordinates_flat = torch.flatten(edge_coordinates, start_dim=1)
+                    
+                    feature_tensor = torch.cat((sequence.unsqueeze(1), edge_coordinates_flat), dim=1)
+
+                    # Create zero-filled tensors for target
+                    target_tensor_bin = torch.zeros(self.num_edges, device=self.device)
+                    target_tensor_bin[target] = 1
+
+                    # Generate mask based on the last edge in the sequence
+                    mask = torch.zeros(self.num_edges, device=self.device)
+                    if sequence is not None:
+                        last_edge_index = sequence[-1]
+                        last_edge = self.edge_list[last_edge_index]
+                        # Find edges that share a node with the last edge
+                        neighbors = [idx for idx, edge in enumerate(self.edge_list)
+                                    if (edge[0] == last_edge[0] or edge[1] == last_edge[1]
+                                        or edge[0] == last_edge[1] or edge[1] == last_edge[0])]
+                        mask[neighbors] = 1
+                        mask[last_edge_index] = 0
+                        if len(sequence) > 1:
+                            second_last_edge_index = sequence[-2]
+                            mask[second_last_edge_index] = 0  # Ensure the current edge is not included in the mask
+
+                    # self.data.append((sequence_tensor, target_tensor, mask))
+                    sequence_tensor = torch.tensor(sequence, dtype=torch.float32)
+                    target_tensor = torch.tensor(target, dtype=torch.long)
+                    self.data.append((feature_tensor, target_tensor, target_tensor_bin, mask))
+        elif dataset in ['val', 'test']:
+            for trajectory in self.trajectories:
+                sequence = trajectory['edge_idxs'][:self.history_len]
+                target = trajectory['edge_idxs'][self.history_len:self.history_len + self.future_len]
+
+                # Check if the target tensor needs padding
+                if len(target) < self.future_len:
+                    padding = torch.full((self.future_len - len(target),), -1, dtype=torch.long, device=self.device)  # Pad with -1
+                    target = torch.cat((target, padding), dim=0)
+
                 edge_coordinates = self.edge_coordinates[sequence]
                 edge_coordinates_flat = torch.flatten(edge_coordinates, start_dim=1)
-                
-                feature_tensor = torch.cat((sequence.unsqueeze(1), edge_coordinates_flat), dim=1)
 
-                # Create zero-filled tensors for target
-                target_tensor_bin = torch.zeros(self.num_edges, device=self.device)
-                target_tensor_bin[target] = 1
+                feature_tensor = torch.cat((sequence.unsqueeze(1), edge_coordinates_flat), dim=1)
 
                 # Generate mask based on the last edge in the sequence
                 mask = torch.zeros(self.num_edges, device=self.device)
@@ -979,17 +1014,19 @@ class AlternativeAutoregressiveTrajectoryDataset(Dataset):
                     last_edge = self.edge_list[last_edge_index]
                     # Find edges that share a node with the last edge
                     neighbors = [idx for idx, edge in enumerate(self.edge_list)
-                                 if (edge[0] == last_edge[0] or edge[1] == last_edge[1]
-                                     or edge[0] == last_edge[1] or edge[1] == last_edge[0])]
+                                if (edge[0] == last_edge[0] or edge[1] == last_edge[1]
+                                    or edge[0] == last_edge[1] or edge[1] == last_edge[0])]
                     mask[neighbors] = 1
                     mask[last_edge_index] = 0  # Ensure the current edge is not included in the mask
+                    if len(sequence) > 1:
+                        second_last_edge_index = sequence[-2]
+                        mask[second_last_edge_index] = 0  # Ensure the second last edge is not included in the mask
 
-                # self.data.append((sequence_tensor, target_tensor, mask))
-                sequence_tensor = torch.tensor(sequence, dtype=torch.float32)
-                target_tensor = torch.tensor(target, dtype=torch.long)
-                self.data.append((feature_tensor, target_tensor, target_tensor_bin, mask))
-                # self.data.append((sequence_tensor_bin, target_tensor_bin, mask, sequence_tensor, target_tensor))
-                #self.data.append((feature_tensor, target_tensor_bin, mask, sequence_tensor, target_tensor))
+                target_tensor_bin = torch.zeros((self.future_len, self.num_edges), device=self.device)
+                valid_targets = target[target >= 0]  # Only consider non-padded values for one-hot encoding
+                target_tensor_bin[torch.arange(len(valid_targets)), valid_targets] = 1
+
+                self.data.append((feature_tensor, target, target_tensor_bin, mask))
 
     def __len__(self):
         return len(self.data)
@@ -1088,6 +1125,8 @@ class Train_Model(nn.Module):
         self.learning_rate_warmup_steps = 1000
         self.num_layers = 2
         
+        self.future_len = 2
+        
         # WandB
         self.wandb_config = wandb_config
         wandb.init(
@@ -1119,16 +1158,17 @@ class Train_Model(nn.Module):
                 #sequence_bin = sequence_bin.squeeze(0)
                 batch_size = features.size(0)
                 hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=self.device)
-                
                 probabilities, preds = self.model(features, hidden, mask, lengths)
+                # print("Preds", preds)
                 loss = F.cross_entropy(probabilities, target)
                 total_loss += loss.item()
                 acc += (preds == target).sum().item() / batch_size
                 loss.backward()
                 self.optimizer.step()
-            print("Avg Loss", round(total_loss / len(self.train_dataloader), 5))
+            print("Avg Loss:", round(total_loss / len(self.train_dataloader), 5))
             wandb.log({"Epoch": epoch, "Average Train Loss": total_loss / len(self.train_dataloader)})
             wandb.log({"Epoch": epoch, "Train Accuracy": acc / len(self.train_dataloader)})
+            print("Accuracy:", round(acc / len(self.train_dataloader), 5))
             wandb.log({"Epoch": epoch, "Random Baseline": 1 / self.train_dataset.avg_degree})
 
     def eval(self):
@@ -1140,29 +1180,55 @@ class Train_Model(nn.Module):
             batch_size = features.size(0)
             hidden = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=self.device)
             current_input = features
-            for step in range(len(self.future_len)):
-                probabilities, pred = self.model(current_input, hidden, mask, lengths)
+            pred_tensor = torch.zeros((batch_size, self.future_len), device=self.device)
+            for step in range(self.future_len):
+                probabilities, pred = self.model(current_input, hidden, mask, lengths+step)
+                mask = torch.zeros((batch_size, self.num_edges), device=self.device)
+                for i in range(batch_size):
+                    last_edge = self.val_dataset.edge_list[pred[i]]
+                    # Find edges that share a node with the last edge
+                    neighbors = [idx for idx, edge in enumerate(self.val_dataset.edge_list)
+                                if (edge[0] == last_edge[0] or edge[1] == last_edge[1]
+                                    or edge[0] == last_edge[1] or edge[1] == last_edge[0])]
+                    mask[i, neighbors] = 1
+                    mask[i, pred[i]] = 0  # Ensure the current edge is not included in the mask
                 
+                pred_tensor[:, step] = pred
+                pred_input = self.get_edge_data(pred)
+                new_input = torch.zeros((batch_size, current_input.size(1) + step + 1, current_input.size(2)), device=self.device)
+                if step < self.future_len - 1:
+                    for i in range(current_input.size(0)):  # batch item
+                        new_input[i] = torch.cat([current_input[i], torch.cat([pred[i].unsqueeze(0), pred_input[i]]).unsqueeze(0)])
+                current_input = new_input
+                    
             sequence = [torch.tensor([row[i, 0] for i in range(row.size(0)) if row[i, 0] != 0]) for row in features]
             sequences.append(sequence)
             targets.append(target)
-            preds.append(pred)
-            acc += (pred == target).sum().item() / batch_size
+            preds.append(pred_tensor)
+            print("Pred", pred_tensor)
+            print("Target", target)
+            acc += (pred_tensor == target).sum().item() / batch_size
         avg_acc = acc / len(self.val_dataloader)
         wandb.log({"Val Accuracy": avg_acc})
         print("Val Accuracy:", avg_acc)
         return {"Sequences": sequences, "Targets": targets, "Predictions": preds}
     
+    def get_edge_data(self, edge_indices):
+        bs = edge_indices.size(0)
+        edge_data = self.train_dataset.edge_coordinates[edge_indices].flatten()
+        edge_data = edge_data.view(bs, -1)
+        return edge_data
+    
     def _build_train_dataloader(self):
         # train_dataset = AutoregressiveTrajectoryDataset(self.train_file_path, device=self.device)
-        self.train_dataset = AlternativeAutoregressiveTrajectoryDataset(self.train_file_path, history_len=5, future_len=2, device=self.device)
+        self.train_dataset = AlternativeAutoregressiveTrajectoryDataset(self.train_file_path, history_len=5, future_len=self.future_len, dataset='train', device=self.device)
         self.num_edges = self.train_dataset.num_edges
-        self.train_dataloader = DataLoader(self.train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
+        self.train_dataloader = DataLoader(self.train_dataset, batch_size=64, shuffle=True, collate_fn=collate_fn)
         
     def _build_val_dataloader(self):
         # self.val_dataset = AutoregressiveTrajectoryDataset(self.val_file_path, device=self.device)
-        self.val_dataset = AlternativeAutoregressiveTrajectoryDataset(self.val_file_path, history_len=5, future_len=2, device=self.device)
-        self.val_dataloader = DataLoader(self.val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
+        self.val_dataset = AlternativeAutoregressiveTrajectoryDataset(self.val_file_path, history_len=5, future_len=self.future_len, dataset='val', device=self.device)
+        self.val_dataloader = DataLoader(self.val_dataset, batch_size=64, shuffle=False, collate_fn=collate_fn)
 
     def _build_model(self):
         self.model = self.model(self.hidden_size, self.num_features, self.num_layers, self.num_edges)
@@ -1183,11 +1249,11 @@ class Train_Model(nn.Module):
 
 
 # Example usage
-train_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1000.h5'
-val_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_1001_1200.h5'
+train_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_train.h5'
+val_file_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_val.h5'
 
 wandb_config = {"exp_name": "benchmark_test",
-                "run_name": "Coords, L=History_size",
+                "run_name": "tdrive_benchmark_test",
                 "project": "trajectory_prediction_using_denoising_diffusion_models",
                 "entity": "joeschmit99",
                 "job_type": "test",

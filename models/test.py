@@ -503,7 +503,7 @@ class Graph_Diffusion_Model(nn.Module):
             plt.savefig(os.path.join(save_dir, f'sample_{i+1}.png'))
             plt.close()  # Close the figure to free memory
     
-    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=None, mode='eval'):
+    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=None, return_samples=False):
         """
         Evaluate the model's performance.
 
@@ -704,7 +704,10 @@ class Graph_Diffusion_Model(nn.Module):
         acc = calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary)
         avg_sample_length = calculate_avg_sample_length(sample_list)
         
-        return fut_ratio, f1, acc, tpr, avg_sample_length
+        if return_samples:
+            return fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut
+        else:
+            return fut_ratio, f1, acc, tpr, avg_sample_length
     
     def save_model(self):
         save_path = os.path.join(self.model_dir, 
@@ -2184,10 +2187,10 @@ print(device)
 
     
 data_config = {"dataset": "synthetic_20_traj",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_train.h5',
-    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_val.h5',
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_train.h5',
+    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_val.h5',
     "history_len": 5,
-    "future_len": 2,
+    "future_len": 5,
     "num_classes": 2,
     "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding']#, 'pos_encoding'
     }
@@ -2208,33 +2211,33 @@ model_config = {"name": "edge_encoder_residual",
     "dropout": 0.1,
     "model_output": "logits",
     "model_prediction": "x_start",  # Options: 'x_start','xprev'
-    "transition_mat_type": 'custom',  # Options: 'gaussian', 'uniform', 'absorbing', 'marginal_prior', 'custom'
+    "transition_mat_type": 'marginal_prior',  # Options: 'gaussian', 'uniform', 'absorbing', 'marginal_prior', 'custom'
     "transition_bands": 0,
     "loss_type": "cross_entropy_x_start",  # Options: kl, cross_entropy_x_start, hybrid
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     }
 
-train_config = {"batch_size": 8,
+train_config = {"batch_size": 70,
     "optimizer": "adam",
     "lr": 0.009,
     "gradient_accumulation": False,
     "gradient_accumulation_steps": 16,
-    "num_epochs": 350,
+    "num_epochs": 160,
     "learning_rate_warmup_steps": 80, # previously 10000
     "lr_decay": 0.999, # previously 0.9999
     "log_loss_every_steps": 1,
-    "log_metrics_every_steps": 5,
-    "save_model": False,
+    "log_metrics_every_steps": 2,
+    "save_model": True,
     "save_model_every_steps": 5}
 
-test_config = {"batch_size": 8, # currently only 1 works
-    "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/tdrive_residual_edge_encoder_residual__hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
+test_config = {"batch_size": 32, # currently only 1 works
+    "model_path": '/ceph/hdd/students/schmitj/experiments/synthetic_d3pm_test/synthetic_d3pm_test_edge_encoder_residual__hist5_fut2_marginal_prior_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
     "number_samples": 10,
     "eval_every_steps": 30
   }
 
 wandb_config = {"exp_name": "synthetic_d3pm_test",
-                "run_name": "test",
+                "run_name": "pneuma_prior_cosine_fut_5_train",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
     "job_type": "test",
@@ -2255,10 +2258,13 @@ sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_tru
 #torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/samples_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
 #torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_hist_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
 #torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_fut_tdriveresidual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
-fut_ratio, f1, acc, tpr, avg_sample_length = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, mode='test')
-#print("ground_truth_hist", ground_truth_hist)
-#print("ground_truth_fut", ground_truth_fut)
-#print("sample_list", sample_list)
+fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
+torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/prior_cosine/samples.pth')
+torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/prior_cosine/gt_hist.pth')
+torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/prior_cosine/gt_fut.pth')
+print("ground_truth_hist", ground_truth_hist)
+print("ground_truth_fut", ground_truth_fut)
+print("sample_list", sample_list)
 print("Val F1 Score", f1)
 print("\n")
 print("Val Accuracy", acc)
