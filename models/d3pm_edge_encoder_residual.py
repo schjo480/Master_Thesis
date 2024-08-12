@@ -83,25 +83,23 @@ class Edge_Encoder_Residual(nn.Module):
         self.theta = self.config['theta']
         
         self.convs = nn.ModuleList()
-        self.convs.append(GATv2Conv(self.num_edge_features, self.hidden_channels, heads=self.num_heads))
         self.res_layers = nn.ModuleList()
-        self.res_layers.append(nn.Linear(self.num_edge_features, self.hidden_channels * self.num_heads))
+        if 'pos_encoding' in self.edge_features:
+            self.convs.append(GATv2Conv(self.num_edge_features + self.pos_encoding_dim + self.time_embedding_dim, self.hidden_channels, heads=self.num_heads))
+            self.res_layers.append(nn.Linear(self.num_edge_features + self.pos_encoding_dim + self.time_embedding_dim, self.hidden_channels * self.num_heads))
+        else: 
+            self.convs.append(GATv2Conv(self.num_edge_features + self.time_embedding_dim, self.hidden_channels, heads=self.num_heads))
+            self.res_layers.append(nn.Linear(self.num_edge_features + self.time_embedding_dim, self.hidden_channels * self.num_heads))
+            
         for _ in range(1, self.num_layers):
             self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, heads=self.num_heads, bias=False))
             self.res_layers.append(nn.Linear(self.hidden_channels * self.num_heads, self.hidden_channels * self.num_heads))
 
         # Output layers for each task
-        self.condition_dim = self.config['condition_dim']
-        self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
-        if 'pos_encoding' in self.edge_features:
-            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim + self.pos_encoding_dim,
-                                        self.hidden_channels)  # To predict future edges
-        else:
-            self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads + self.condition_dim + self.time_embedding_dim,
-                                            self.hidden_channels)  # To predict future edges
+        self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads, self.hidden_channels)  # To predict future edges
         self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
-    def forward(self, x, edge_index, indices=None, t=None, condition=None, mode=None):
+    def forward(self, x, edge_index, t, indices=None):
         """
         Forward pass through the model
         Args:
@@ -112,39 +110,30 @@ class Edge_Encoder_Residual(nn.Module):
         # GNN forward pass
         # Edge Embedding
         batch_size = x.size(0) // self.num_edges
-        if x.dim() == 3:
-            x = x.squeeze(0)    # (bs, num_edges, num_edge_features) -> (num_edges, num_edge_features)
+        if 'pos_encoding' in self.edge_features:
+            pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
+            encodings = F.silu(self.pos_linear0(pos_encoding))
+            encodings = F.silu(self.pos_linear1(encodings))
+            x = self.integrate_encodings(x, indices, encodings) # (batch_size * num_edges, num_edge_features + pos_encoding_dim)
+        # Time embedding
+        t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
+        t_emb = self.time_linear0(t_emb)
+        t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
+        t_emb = self.time_linear1(t_emb)
+        t_emb = F.silu(t_emb)   # (batch_size, time_embedding_dim)
+        t_emb = torch.repeat_interleave(t_emb, self.num_edges, dim=0) # (batch_size * num_edges, time_embedding_dim)
+        
+        x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding, (batch_size * num_edges, num_edge_features + time_embedding_dim (+ pos_enc_dim))
         
         for conv, res_layer in zip(self.convs, self.res_layers):
             res = F.relu(res_layer(x))
             x = F.relu(conv(x, edge_index))
-            x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)
-            
-        if mode == 'history':
-            c = self.history_encoder(x)     # (batch_size * num_edges, condition_dim)
-            if 'pos_encoding' in self.edge_features:
-                pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
-                encodings = F.silu(self.pos_linear0(pos_encoding))
-                encodings = F.silu(self.pos_linear1(encodings))
-                c = self.integrate_encodings(c, indices, encodings)     # (batch_size * num_edges, condition_dim + pos_encoding_dim)
-            return c
-        
-        elif mode == 'future':
-            # Time embedding
-            t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
-            t_emb = self.time_linear0(t_emb)
-            t_emb = F.silu(t_emb)  # SiLU activation, equivalent to Swish
-            t_emb = self.time_linear1(t_emb)
-            t_emb = F.silu(t_emb)   # (batch_size, time_embedding_dim)
-            t_emb = torch.repeat_interleave(t_emb, self.num_edges, dim=0) # (batch_size * num_edges, time_embedding_dim)
-            
-            #Concatenation
-            x = torch.cat((x, t_emb), dim=1) # Concatenate with time embedding, (batch_size * num_edges, hidden_dim')
-            x = torch.cat((x, condition), dim=1) # Concatenate with condition c, (batch_size * num_edges, hidden_dim')
-            logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
-            logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)
+            x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)        
 
-            return logits.view(batch_size, self.num_edges, -1)  # (1, num_edges, num_classes=2)
+        logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
+        logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)
+
+        return logits.view(batch_size, self.num_edges, -1)  # (batch_size, num_edges, num_classes=2)
 
     def integrate_encodings(self, features, indices, encodings):
         """
@@ -170,9 +159,6 @@ class Edge_Encoder_Residual(nn.Module):
         
         # Calculate batch offsets
         batch_offsets = torch.arange(batch_size, device=features.device) * self.num_edges
-        
-        # Reshape indices to batched format to adjust with batch offsets
-        # indices_batched = indices.view(batch_size, self.history_len)
         
         # Flatten indices for direct access, adjust with batch offsets
         flat_indices = (indices + batch_offsets.unsqueeze(1)).flatten()

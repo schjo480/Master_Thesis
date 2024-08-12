@@ -651,7 +651,6 @@ class CategoricalDiffusion:
         for i in range(x_t.shape[0]):
             new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
 
-
         # Calculate the loss
         if self.loss_type == 'kl':
             losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
