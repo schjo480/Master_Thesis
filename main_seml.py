@@ -1,5 +1,7 @@
 # from seml.experiment import Experiment
+import numpy as np
 import seml
+import torch
 from models.d3pm_graph_diffusion_model import Graph_Diffusion_Model
 from models.d3pm_edge_encoder import Edge_Encoder
 from models.d3pm_edge_encoder_mlp import Edge_Encoder_MLP
@@ -32,8 +34,9 @@ def main(data, wandb, diffusion_config, model, training, testing, eval):
         edge_encoder = Edge_Encoder_MLP
     else:
         raise NotImplementedError(f"Model {model['name']} not implemented")
+    model_config = model
     
-    model = Graph_Diffusion_Model(data_config=data, wandb_config=wandb, diffusion_config=diffusion_config, model_config=model, train_config=training, test_config=testing, model=edge_encoder)
+    model = Graph_Diffusion_Model(data_config=data, wandb_config=wandb, diffusion_config=diffusion_config, model_config=model, train_config=training, test_config=testing, model=edge_encoder, pretrained=training['pretrained'])
     
     if eval:
         sample_list, ground_truth_hist, ground_truth_fut = model.get_samples(load_model=True, model_path=testing['model_path'])
@@ -44,5 +47,33 @@ def main(data, wandb, diffusion_config, model, training, testing, eval):
         }
     else:    
         model.train()
-        model.get_samples(load_model=False, task='predict', number_samples=1, save=True)
-            
+        features = ''
+        for feature in data['edge_features']:
+            features += feature + '_'
+        sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, task='predict')
+        torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/samples_raw_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
+        torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/samples_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/gt_hist_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/gt_fut_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        
+        #print("ground_truth_hist", ground_truth_hist)
+        #print("ground_truth_fut", ground_truth_fut)
+        #print("sample_list", sample_list)
+        print("\n")
+        print("Val F1 Score", f1)
+        #wandb.log({"Val F1 Score, mult samples": f1})
+        print("\n")
+        print("Val Accuracy", acc)
+        #wandb.log({"Val Accuracy, mult samples": acc})
+        print("\n")
+        print("Val TPR", tpr)
+        #wandb.log({"Val TPR, mult samples": tpr})
+        print("\n")
+        print("Average sample length", avg_sample_length)
+        print("\n")
+        #wandb.log({"Val Avg. Sample length, mult samples": avg_sample_length})
+        print("Val Future ratio", fut_ratio)
+        #wandb.log({"Val Future ratio, mult samples": fut_ratio})
+        print("\n")
+        

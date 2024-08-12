@@ -21,13 +21,18 @@ class TrajectoryGeoDataset(Dataset):
         self.edge_features = edge_features
         self.embedding_dim = embedding_dim
         self.device = device
-        self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(self.file_path, self.device)
+        if 'road_type' in self.edge_features:
+            self.trajectories, self.nodes, self.edges, self.edge_coordinates, self.road_type = self.load_new_format(self.file_path, self.edge_features, self.device)
+            self.road_type = torch.tensor(self.road_type, dtype=torch.float64, device=self.device)
+            self.num_road_types = self.road_type.size(1)
+        else:
+            self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(self.file_path, self.edge_features, self.device)
         
         self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
         self.edge_index = self._build_edge_index()
 
     @staticmethod
-    def load_new_format(file_path, device):
+    def load_new_format(file_path, edge_features, device):
         paths = []
         with h5py.File(file_path, 'r') as new_hf:
             node_coordinates = torch.tensor(new_hf['graph']['node_coordinates'][:], dtype=torch.float, device=device)
@@ -37,19 +42,19 @@ class TrajectoryGeoDataset(Dataset):
                 min_values = node_coordinates.min(0)[0]
                 node_coordinates[:, 0] = (node_coordinates[:, 0] - min_values[0]) / (max_values[0] - min_values[0])
                 node_coordinates[:, 1] = (node_coordinates[:, 1] - min_values[1]) / (max_values[1] - min_values[1])
-            #edges = torch.tensor(new_hf['graph']['edges'][:], dtype=torch.long, device=device)
             edges = new_hf['graph']['edges'][:]
             edge_coordinates = node_coordinates[edges]
             nodes = [(i, {'pos': torch.tensor(pos, device=device)}) for i, pos in enumerate(node_coordinates)]
-            #edges = [(torch.tensor(edge[0], device=device), torch.tensor(edge[1], device=device)) for edge in edges]
             edges = [tuple(edge) for edge in edges]
-
             for i in tqdm(new_hf['trajectories'].keys()):
                 path_group = new_hf['trajectories'][i]
                 path = {attr: torch.tensor(path_group[attr][()], device=device) for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
                 paths.append(path)
-            
-        return paths, nodes, edges, edge_coordinates
+            if 'road_type' in edge_features:
+                onehot_encoded_road_type = new_hf['graph']['road_type'][:]
+                return paths, nodes, edges, edge_coordinates, onehot_encoded_road_type
+            else:
+                return paths, nodes, edges, edge_coordinates
     
     def _build_edge_index(self):
         print("Building edge index for line graph...")
@@ -116,8 +121,71 @@ class TrajectoryGeoDataset(Dataset):
             history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
         if 'edge_orientations' in self.edge_features:
             history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
+        if 'road_type' in self.edge_features:
+            history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
+        if 'pw_distance' in self.edge_features:
+            last_history_edge_coords = self.edge_coordinates[history_indices[-1]]
+            edge_middles = (self.edge_coordinates[:, 0, :] + self.edge_coordinates[:, 1, :]) / 2
+            last_history_edge_middle = (last_history_edge_coords[0, :] + last_history_edge_coords[1, :]) / 2  # Last edge in the history_indices
+            distances = torch.norm(edge_middles - last_history_edge_middle, dim=1, keepdim=True)
+            history_edge_features = torch.cat((history_edge_features, distances.float()), dim=1)
+        if 'edge_length' in self.edge_features:
+            edge_lengths = torch.norm(self.edge_coordinates[:, 0, :] - self.edge_coordinates[:, 1, :], dim=1, keepdim=True)
+            history_edge_features = torch.cat((history_edge_features, edge_lengths.float()), dim=1)
+        if 'edge_angles' in self.edge_features:
+            start, end = self.find_trajectory_endpoints(history_indices)
+            v1 = end - start
+            starts = self.edge_coordinates[:, 0, :]
+            ends = self.edge_coordinates[:, 1, :]
+            vectors = ends - starts
+            
+            # Calculate the dot product of v1 with each vector
+            dot_products = torch.sum(v1 * vectors, dim=1)
+            
+            # Calculate magnitudes of v1 and all vectors
+            v1_mag = torch.norm(v1)
+            vector_mags = torch.norm(vectors, dim=1)
+            
+            # Calculate the cosine of the angles
+            cosines = dot_products / (v1_mag * vector_mags)
+            cosines = cosines.unsqueeze(1)
+            history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
+            if torch.isnan(cosines).any():
+                cosines = torch.nan_to_num(cosines, nan=0.0)
+            
+        history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
         
         return history_edge_features, future_edge_features
+    
+    def find_trajectory_endpoints(self, edge_sequence):
+        """
+        Find the start and end points of a trajectory based on a sequence of edge indices,
+        accounting for the direction and connection of edges.
+        
+        Args:
+            edge_coordinates (torch.Tensor): Coordinates of all edges in the graph, shape (num_edges, 2, 2).
+                                            Each edge is represented by two points [point1, point2].
+            edge_sequence (torch.Tensor): Indices of edges forming the trajectory, shape (sequence_length).
+        
+        Returns:
+            tuple: Start point and end point of the trajectory.
+        """
+        # Get the coordinates of edges in the sequence
+        trajectory_edges = self.edge_coordinates[edge_sequence]
+        
+        # Determine the start point by checking the connection of the first edge with the second
+        if torch.norm(trajectory_edges[0, 0] - trajectory_edges[1, 0]) < torch.norm(trajectory_edges[0, 1] - trajectory_edges[1, 0]):
+            start_point = trajectory_edges[0, 1]  # Closer to the second edge's start
+        else:
+            start_point = trajectory_edges[0, 0]
+        
+        # Determine the end point by checking the connection of the last edge with the second to last
+        if torch.norm(trajectory_edges[-1, 1] - trajectory_edges[-2, 1]) < torch.norm(trajectory_edges[-1, 0] - trajectory_edges[-2, 1]):
+            end_point = trajectory_edges[-1, 0]  # Closer to the second to last edge's end
+        else:
+            end_point = trajectory_edges[-1, 1]
+        
+        return start_point, end_point
     
     def build_graph(self):
         import networkx as nx

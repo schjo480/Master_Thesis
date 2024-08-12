@@ -15,7 +15,7 @@ import wandb
 import networkx as nx
 
 class Graph_Diffusion_Model(nn.Module):
-    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model):
+    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model, pretrained=False):
         super(Graph_Diffusion_Model, self).__init__()
         
         # Data
@@ -36,7 +36,6 @@ class Graph_Diffusion_Model(nn.Module):
         self.model = model # Edge_Encoder
         self.hidden_channels = self.model_config['hidden_channels']
         self.time_embedding_dim = self.model_config['time_embedding_dim']
-        self.condition_dim = self.model_config['condition_dim']
         self.num_layers = self.model_config['num_layers']
         self.pos_encoding_dim = self.model_config['pos_encoding_dim']
         
@@ -94,6 +93,16 @@ class Graph_Diffusion_Model(nn.Module):
         self._build_val_dataloader()
         self._build_model()
         self._build_optimizer()
+        
+        # Load model
+        if pretrained:
+            features = ''
+            for feature in self.edge_features:
+                features += feature + '_'
+            pretrained_model_path = os.path.join(self.model_dir, 
+                                    self.exp_name + '_' + self.model_config['name'] + features + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                    f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}.pth')
+            self.load_model(pretrained_model_path)
         
         # Move model to GPU
         
@@ -333,12 +342,31 @@ class Graph_Diffusion_Model(nn.Module):
             if save:
                 save_path = os.path.join(self.model_dir, 
                                  self.exp_name + '_' + self.model_config['name'] + '_' +  self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}_layers_{self.num_layers}')
+                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_layers_{self.num_layers}')
                 torch.save(sample_list, os.path.join(save_path, f'{self.exp_name}_samples.pth'))
                 torch.save(ground_truth_hist, os.path.join(save_path, f'{self.exp_name}_ground_truth_hist.pth'))
                 torch.save(ground_truth_fut, os.path.join(save_path, f'{self.exp_name}_ground_truth_fut.pth'))
                 print(f"Samples saved at {os.path.join(save_path, f'{self.exp_name}_samples.pth')}!")
             else:
+                ### TODO: Debugging ###
+                # ground_truth_fut is a list (of length len(val_dataloader)) of tensors with shape (batch_size, future_len)
+                # ground_truth_fut_binary is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
+                
+                # For num_samples = 1 and batch_size > 1: (works ok!)
+                # sample_binary_list is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
+                # (sample_list is a list (of length len(val_dataloader)) of lists (of length batch_size) of tensors with size (num_edges == 1) (i.e could be empty tensors))
+                
+                # For num_samples > 1 and batch_size > 1: (Problem with calculating statistics after training)
+                # sample_binary_list is a list (of length len(val_dataloader)) of lists (of length number_samples) of tensors with shape (batch_size, num_edges)
+                # sample_list is a list (of length len(val_dataloader) of lists (of length number_samples) of lists (of length batch_size) of tensors with size (num_edges == 1) (i.e could be empty tensors)
+                
+                # For num_samples = 1 and batch_size = 1: (Problem with calculating statistics during training)
+                # sample_binary_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of tensors with shape (batch_size=1, num_edges)
+                # sample_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of tensors with size (num_edges == 1) (i.e could be empty tensors), no batch dimension as in ground_truth_fut
+                
+                # For num_samples > 1 and batch_size = 1: (Problem with calculating statistics after training)
+                # sample_binary_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of lists (of length number_samples) of tensors with shape (batch_size=1, num_edges)
+                # sample_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of lists (of length number_samples) of tensors with size (num_edges == 1) (i.e could be empty tensors), no batch dimension as in ground_truth_fut
                 
                 return sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary
         
@@ -455,7 +483,7 @@ class Graph_Diffusion_Model(nn.Module):
             plt.savefig(os.path.join(save_dir, f'sample_{i+1}.png'))
             plt.close()  # Close the figure to free memory
     
-    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=None, mode='eval'):
+    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=None, return_samples=False):
         """
         Evaluate the model's performance.
 
@@ -646,12 +674,18 @@ class Graph_Diffusion_Model(nn.Module):
         acc = calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary)
         avg_sample_length = calculate_avg_sample_length(sample_list)
         
-        return fut_ratio, f1, acc, tpr, avg_sample_length
+        if return_samples:
+            return fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut
+        else:
+            return fut_ratio, f1, acc, tpr, avg_sample_length
     
     def save_model(self):
+        features = ''
+        for feature in self.edge_features:
+            features += feature + '_'
         save_path = os.path.join(self.model_dir, 
-                                 self.exp_name + '_' + self.model_config['name'] + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}.pth')
+                                 self.exp_name + '_' + self.model_config['name'] + features + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}.pth')
         torch.save(self.model.state_dict(), save_path)
         self.log.info(f"Model saved at {save_path}!")
         print(f"Model saved at {save_path}")
@@ -691,7 +725,14 @@ class Graph_Diffusion_Model(nn.Module):
             self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:
             self.num_edge_features += 1
-        
+        if 'road_type' in self.edge_features:
+            self.num_edge_features += self.train_dataset.num_road_types
+        if 'pw_distance' in self.edge_features:
+            self.num_edge_features += 1
+        if 'edge_length' in self.edge_features:
+            self.num_edge_features += 1
+        if 'edge_angles' in self.edge_features:
+            self.num_edge_features += 1
         self.train_data_loader = DataLoader(self.train_dataset, 
                                             batch_size=self.batch_size, 
                                             shuffle=False, 
@@ -733,4 +774,3 @@ class Graph_Diffusion_Model(nn.Module):
         self.model = self.model(self.model_config, self.history_len, self.future_len, self.num_classes,
                                 num_edges=self.num_edges, hidden_channels=self.hidden_channels, edge_features=self.edge_features, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps, pos_encoding_dim=self.pos_encoding_dim)
         print("> Model built!")
-      

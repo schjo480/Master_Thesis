@@ -2,24 +2,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.loader import DataLoader
 from torchmetrics import F1Score
 from torch_geometric.utils import from_networkx
-#from dataset.trajctory_dataset import TrajectoryDataset, collate_fn
+from torch_geometric.loader import DataLoader
+#from dataset.trajectory_dataset_geometric import TrajectoryGeoDataset, custom_collate_fn
 #from .d3pm_diffusion import make_diffusion
-#from .d3pm_edge_encoder import Edge_Encoder
-import yaml
 from tqdm import tqdm
 import logging
 import os
 import time
 import wandb
 import networkx as nx
-from torch_geometric.data import Data
-from torch.profiler import profile, record_function, ProfilerActivity
+torch.set_printoptions(threshold=10_000)
 
 class Graph_Diffusion_Model(nn.Module):
-    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model):
+    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model, pretrained=False):
         super(Graph_Diffusion_Model, self).__init__()
         
         # Data
@@ -40,7 +37,6 @@ class Graph_Diffusion_Model(nn.Module):
         self.model = model # Edge_Encoder
         self.hidden_channels = self.model_config['hidden_channels']
         self.time_embedding_dim = self.model_config['time_embedding_dim']
-        self.condition_dim = self.model_config['condition_dim']
         self.num_layers = self.model_config['num_layers']
         self.pos_encoding_dim = self.model_config['pos_encoding_dim']
         
@@ -98,6 +94,16 @@ class Graph_Diffusion_Model(nn.Module):
         self._build_val_dataloader()
         self._build_model()
         self._build_optimizer()
+        
+        # Load model
+        if pretrained:
+            features = ''
+            for feature in self.edge_features:
+                features += feature + '_'
+            pretrained_model_path = os.path.join(self.model_dir, 
+                                    self.exp_name + '_' + self.model_config['name'] + features + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                    f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}.pth')
+            self.load_model(pretrained_model_path)
         
         # Move model to GPU
         
@@ -164,7 +170,8 @@ class Graph_Diffusion_Model(nn.Module):
                     self.optimizer.step()
                     
             else:
-                for data in self.train_data_loader:
+                for b, data in enumerate(self.train_data_loader):
+                    print("Batch", b, "of", len(self.train_data_loader))
                     edge_features = data.x      # (batch_size * num_edges, num_edge_features)
                     history_indices = data.history_indices  # (batch_size, history_len)
                     x_start = data.y[:, :, 0]   # (batch_size, num_edges)
@@ -328,31 +335,6 @@ class Graph_Diffusion_Model(nn.Module):
                 else:
                     raise ValueError("Number of samples must be greater than 0.")
                 
-                '''elif number_samples == 1:
-                    samples_binary = make_diffusion(self.diffusion_config, 
-                                                    self.model_config, 
-                                                    num_edges=self.num_edges, 
-                                                    future_len=self.future_len, 
-                                                    device=self.device).p_sample_loop(model_fn=model_fn,
-                                                                                      shape=(bs, self.num_edges), 
-                                                                                      edge_features=edge_features,
-                                                                                      edge_index=edge_index,
-                                                                                      indices=history_edge_indices,
-                                                                                      task=task)
-                    sample_binary_list.append(samples_binary.to('cpu'))
-                    if self.test_batch_size == 1:
-                        samples = torch.argwhere(samples_binary == 1)[:, 1].detach().to('cpu')
-                    else:
-                        data = torch.argwhere(samples_binary == 1)
-                        unique_first_columns = data[:, 0].unique()
-                        samples = []
-                        for val in unique_first_columns:
-                            # Mask to filter rows where the first column equals the current unique value
-                            mask = data[:, 0] == val
-                            # Extract the second column values and add to the grouped list
-                            samples.append(data[mask][:, 1].unsqueeze(0).detach().to('cpu'))
-                    sample_list.append(samples)'''
-                
                 ground_truth_hist.append(history_edge_indices.detach().to('cpu'))
                 ground_truth_fut.append(future_trajectory_indices.detach().to('cpu'))
                 ground_truth_fut_binary.append(future_binary.detach().to('cpu'))
@@ -362,7 +344,7 @@ class Graph_Diffusion_Model(nn.Module):
             if save:
                 save_path = os.path.join(self.model_dir, 
                                  self.exp_name + '_' + self.model_config['name'] + '_' +  self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}_layers_{self.num_layers}')
+                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_layers_{self.num_layers}')
                 torch.save(sample_list, os.path.join(save_path, f'{self.exp_name}_samples.pth'))
                 torch.save(ground_truth_hist, os.path.join(save_path, f'{self.exp_name}_ground_truth_hist.pth'))
                 torch.save(ground_truth_fut, os.path.join(save_path, f'{self.exp_name}_ground_truth_fut.pth'))
@@ -574,16 +556,6 @@ class Graph_Diffusion_Model(nn.Module):
                 return most_predicted_numbers, most_predicted_binary
 
             sample_list, sample_binary_list = get_most_predicted_numbers(sample_list)
-
-        ### For num_samples > 1 and batch_size > 1 ###
-        # sample_list is a list (of length len(val_dataloader)) of lists (of length batch_size) of tensors with size (future_len)
-        # sample_binary_list is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
-        # With this shape we can calculate the metrics without issue
-        
-        ### For num_samples > 1 and batch_size == 1 ###
-        # sample_list is a list (of length len(val_dataloader)) of lists (of length batch_size) of tensors with size (future_len)
-        # sample_binary_list is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
-        # With this shape we can calculate the metrics without issue
         
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
@@ -710,9 +682,12 @@ class Graph_Diffusion_Model(nn.Module):
             return fut_ratio, f1, acc, tpr, avg_sample_length
     
     def save_model(self):
+        features = ''
+        for feature in self.edge_features:
+            features += feature + '_'
         save_path = os.path.join(self.model_dir, 
-                                 self.exp_name + '_' + self.model_config['name'] + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_condition_dim_{self.condition_dim}.pth')
+                                 self.exp_name + '_' + self.model_config['name'] + features + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}.pth')
         torch.save(self.model.state_dict(), save_path)
         self.log.info(f"Model saved at {save_path}!")
         print(f"Model saved at {save_path}")
@@ -752,7 +727,14 @@ class Graph_Diffusion_Model(nn.Module):
             self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:
             self.num_edge_features += 1
-        
+        if 'road_type' in self.edge_features:
+            self.num_edge_features += self.train_dataset.num_road_types
+        if 'pw_distance' in self.edge_features:
+            self.num_edge_features += 1
+        if 'edge_length' in self.edge_features:
+            self.num_edge_features += 1
+        if 'edge_angles' in self.edge_features:
+            self.num_edge_features += 1
         self.train_data_loader = DataLoader(self.train_dataset, 
                                             batch_size=self.batch_size, 
                                             shuffle=False, 
@@ -794,17 +776,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.model = self.model(self.model_config, self.history_len, self.future_len, self.num_classes,
                                 num_edges=self.num_edges, hidden_channels=self.hidden_channels, edge_features=self.edge_features, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps, pos_encoding_dim=self.pos_encoding_dim)
         print("> Model built!")
-                   
-
-import torch
-from torch.utils.data import Dataset
-import h5py
-import networkx as nx
-import numpy as np
-import time
-from tqdm import tqdm
-
-
+                  
 import torch
 from torch_geometric.data import Dataset, Data
 import h5py
@@ -828,13 +800,18 @@ class TrajectoryGeoDataset(Dataset):
         self.edge_features = edge_features
         self.embedding_dim = embedding_dim
         self.device = device
-        self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(self.file_path, self.device)
+        if 'road_type' in self.edge_features:
+            self.trajectories, self.nodes, self.edges, self.edge_coordinates, self.road_type = self.load_new_format(self.file_path, self.edge_features, self.device)
+            self.road_type = torch.tensor(self.road_type, dtype=torch.float64, device=self.device)
+            self.num_road_types = self.road_type.size(1)
+        else:
+            self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(self.file_path, self.edge_features, self.device)
         
         self.edge_coordinates = torch.tensor(self.edge_coordinates, dtype=torch.float64, device=self.device)
         self.edge_index = self._build_edge_index()
 
     @staticmethod
-    def load_new_format(file_path, device):
+    def load_new_format(file_path, edge_features, device):
         paths = []
         with h5py.File(file_path, 'r') as new_hf:
             node_coordinates = torch.tensor(new_hf['graph']['node_coordinates'][:], dtype=torch.float, device=device)
@@ -844,19 +821,19 @@ class TrajectoryGeoDataset(Dataset):
                 min_values = node_coordinates.min(0)[0]
                 node_coordinates[:, 0] = (node_coordinates[:, 0] - min_values[0]) / (max_values[0] - min_values[0])
                 node_coordinates[:, 1] = (node_coordinates[:, 1] - min_values[1]) / (max_values[1] - min_values[1])
-            #edges = torch.tensor(new_hf['graph']['edges'][:], dtype=torch.long, device=device)
             edges = new_hf['graph']['edges'][:]
             edge_coordinates = node_coordinates[edges]
             nodes = [(i, {'pos': torch.tensor(pos, device=device)}) for i, pos in enumerate(node_coordinates)]
-            #edges = [(torch.tensor(edge[0], device=device), torch.tensor(edge[1], device=device)) for edge in edges]
             edges = [tuple(edge) for edge in edges]
-
             for i in tqdm(new_hf['trajectories'].keys()):
                 path_group = new_hf['trajectories'][i]
                 path = {attr: torch.tensor(path_group[attr][()], device=device) for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
                 paths.append(path)
-            
-        return paths, nodes, edges, edge_coordinates
+            if 'road_type' in edge_features:
+                onehot_encoded_road_type = new_hf['graph']['road_type'][:]
+                return paths, nodes, edges, edge_coordinates, onehot_encoded_road_type
+            else:
+                return paths, nodes, edges, edge_coordinates
     
     def _build_edge_index(self):
         print("Building edge index for line graph...")
@@ -894,10 +871,10 @@ class TrajectoryGeoDataset(Dataset):
         future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
 
         # Extract and generate features
-        edge_features, future_binary = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
-        data = MyData(x=edge_features,          # (batch_size * num_edges, num_edge_features)
+        history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
+        data = MyData(x=history_edge_features,          # (batch_size * num_edges, num_edge_features)
                     edge_index=self.edge_index,         # (2, num_edges)
-                    y=future_binary,             # (batch_size, num_edges, 1)
+                    y=future_edge_features,             # (batch_size, num_edges, 1)
                     history_indices=history_indices,    # (batch_size, history_len)
                     future_indices=future_indices,      # (batch_size, future_len)
                     num_nodes=self.num_edges)
@@ -917,15 +894,79 @@ class TrajectoryGeoDataset(Dataset):
         future_one_hot_edges = future_one_hot_edges.sum(dim=0)  # (num_edges,)
         
         # Basic History edge features = coordinates, binary encoding
-        edge_features = history_one_hot_edges.view(-1, 1).float()
-        future_binary = future_one_hot_edges.view(-1, 1).float()
+        history_edge_features = history_one_hot_edges.view(-1, 1).float()
+        future_edge_features = future_one_hot_edges.view(-1, 1).float()
         if 'coordinates' in self.edge_features:
-            edge_features = torch.cat((edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
         if 'edge_orientations' in self.edge_features:
-            edge_features = torch.cat((edge_features, history_edge_orientations.float()), dim=1)
-        edge_features = torch.cat((edge_features, future_binary), dim=1)
+            history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
+        if 'road_type' in self.edge_features:
+            history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
+        if 'pw_distance' in self.edge_features:
+            last_history_edge_coords = self.edge_coordinates[history_indices[-1]]
+            edge_middles = (self.edge_coordinates[:, 0, :] + self.edge_coordinates[:, 1, :]) / 2
+            last_history_edge_middle = (last_history_edge_coords[0, :] + last_history_edge_coords[1, :]) / 2  # Last edge in the history_indices
+            distances = torch.norm(edge_middles - last_history_edge_middle, dim=1, keepdim=True)
+            history_edge_features = torch.cat((history_edge_features, distances.float()), dim=1)
+        if 'edge_length' in self.edge_features:
+            edge_lengths = torch.norm(self.edge_coordinates[:, 0, :] - self.edge_coordinates[:, 1, :], dim=1, keepdim=True)
+            history_edge_features = torch.cat((history_edge_features, edge_lengths.float()), dim=1)
+        if 'edge_angles' in self.edge_features:
+            start, end = self.find_trajectory_endpoints(history_indices)
+            v1 = end - start
+            starts = self.edge_coordinates[:, 0, :]
+            ends = self.edge_coordinates[:, 1, :]
+            vectors = ends - starts
+            
+            # Calculate the dot product of v1 with each vector
+            dot_products = torch.sum(v1 * vectors, dim=1)
+            
+            # Calculate magnitudes of v1 and all vectors
+            v1_mag = torch.norm(v1)
+            vector_mags = torch.norm(vectors, dim=1)
+            
+            # Calculate the cosine of the angles
+            cosines = dot_products / (v1_mag * vector_mags)
+            cosines = cosines.unsqueeze(1)
+            if torch.isnan(cosines).any():
+                cosines = torch.nan_to_num(cosines, nan=0.0)
+                
+            history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
+            
+            
+        history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
         
-        return edge_features, future_binary
+        return history_edge_features, future_edge_features
+    
+    def find_trajectory_endpoints(self, edge_sequence):
+        """
+        Find the start and end points of a trajectory based on a sequence of edge indices,
+        accounting for the direction and connection of edges.
+        
+        Args:
+            edge_coordinates (torch.Tensor): Coordinates of all edges in the graph, shape (num_edges, 2, 2).
+                                            Each edge is represented by two points [point1, point2].
+            edge_sequence (torch.Tensor): Indices of edges forming the trajectory, shape (sequence_length).
+        
+        Returns:
+            tuple: Start point and end point of the trajectory.
+        """
+        # Get the coordinates of edges in the sequence
+        trajectory_edges = self.edge_coordinates[edge_sequence]
+        
+        # Determine the start point by checking the connection of the first edge with the second
+        if torch.norm(trajectory_edges[0, 0] - trajectory_edges[1, 0]) < torch.norm(trajectory_edges[0, 1] - trajectory_edges[1, 0]):
+            start_point = trajectory_edges[0, 1]  # Closer to the second edge's start
+        else:
+            start_point = trajectory_edges[0, 0]
+        
+        # Determine the end point by checking the connection of the last edge with the second to last
+        if torch.norm(trajectory_edges[-1, 1] - trajectory_edges[-2, 1]) < torch.norm(trajectory_edges[-1, 0] - trajectory_edges[-2, 1]):
+            end_point = trajectory_edges[-1, 0]  # Closer to the second to last edge's end
+        else:
+            end_point = trajectory_edges[-1, 1]
+        
+        return start_point, end_point
     
     def build_graph(self):
         import networkx as nx
@@ -1403,16 +1444,14 @@ class Edge_Encoder_Residual(nn.Module):
             self.convs.append(GATv2Conv(self.num_edge_features + self.pos_encoding_dim + self.time_embedding_dim, self.hidden_channels, heads=self.num_heads))
             self.res_layers.append(nn.Linear(self.num_edge_features + self.pos_encoding_dim + self.time_embedding_dim, self.hidden_channels * self.num_heads))
         else: 
-            self.convs.append(GATv2Conv(self.num_edge_features, self.hidden_channels, heads=self.num_heads))
-            self.res_layers.append(nn.Linear(self.num_edge_features, self.hidden_channels * self.num_heads))
+            self.convs.append(GATv2Conv(self.num_edge_features + self.time_embedding_dim, self.hidden_channels, heads=self.num_heads))
+            self.res_layers.append(nn.Linear(self.num_edge_features + self.time_embedding_dim, self.hidden_channels * self.num_heads))
             
         for _ in range(1, self.num_layers):
             self.convs.append(GATv2Conv(self.hidden_channels * self.num_heads, self.hidden_channels, heads=self.num_heads, bias=False))
             self.res_layers.append(nn.Linear(self.hidden_channels * self.num_heads, self.hidden_channels * self.num_heads))
 
         # Output layers for each task
-        self.condition_dim = self.config['condition_dim']
-        self.history_encoder = nn.Linear(self.hidden_channels * self.num_heads, self.condition_dim)  # To encode history to c
         self.future_decoder = nn.Linear(self.hidden_channels * self.num_heads, self.hidden_channels)  # To predict future edges
         self.adjust_to_class_shape = nn.Linear(self.hidden_channels, self.num_classes)
 
@@ -1432,7 +1471,6 @@ class Edge_Encoder_Residual(nn.Module):
             encodings = F.silu(self.pos_linear0(pos_encoding))
             encodings = F.silu(self.pos_linear1(encodings))
             x = self.integrate_encodings(x, indices, encodings) # (batch_size * num_edges, num_edge_features + pos_encoding_dim)
-        
         # Time embedding
         t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
         t_emb = self.time_linear0(t_emb)
@@ -1446,20 +1484,8 @@ class Edge_Encoder_Residual(nn.Module):
         for conv, res_layer in zip(self.convs, self.res_layers):
             res = F.relu(res_layer(x))
             x = F.relu(conv(x, edge_index))
-            x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)
-            
-        '''if mode == 'history':
-            c = self.history_encoder(x)     # (batch_size * num_edges, condition_dim)
-            if 'pos_encoding' in self.edge_features:
-                pos_encoding = generate_positional_encodings(self.history_len, self.pos_encoding_dim, device=x.device)
-                encodings = F.silu(self.pos_linear0(pos_encoding))
-                encodings = F.silu(self.pos_linear1(encodings))
-                c = self.integrate_encodings(c, indices, encodings)     # (batch_size * num_edges, condition_dim + pos_encoding_dim)
-            return c'''
-        
-        # elif mode == 'future':
-        
-        #Concatenation
+            x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)        
+
         logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
         logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)
 
@@ -1490,9 +1516,6 @@ class Edge_Encoder_Residual(nn.Module):
         # Calculate batch offsets
         batch_offsets = torch.arange(batch_size, device=features.device) * self.num_edges
         
-        # Reshape indices to batched format to adjust with batch offsets
-        # indices_batched = indices.view(batch_size, self.history_len)
-        
         # Flatten indices for direct access, adjust with batch offsets
         flat_indices = (indices + batch_offsets.unsqueeze(1)).flatten()
         
@@ -1500,7 +1523,7 @@ class Edge_Encoder_Residual(nn.Module):
         new_features[flat_indices, -encodings.size(1):] = encodings
 
         return new_features
-
+    
 # coding=utf-8
 # Copyright 2024 The Google Research Authors.
 #
@@ -2154,7 +2177,6 @@ class CategoricalDiffusion:
         for i in range(x_t.shape[0]):
             new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
 
-
         # Calculate the loss
         if self.loss_type == 'kl':
             losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
@@ -2192,7 +2214,7 @@ data_config = {"dataset": "synthetic_20_traj",
     "history_len": 5,
     "future_len": 5,
     "num_classes": 2,
-    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding']#, 'pos_encoding'
+    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles'] # , 'road_type'
     }
 
 diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
@@ -2205,8 +2227,8 @@ model_config = {"name": "edge_encoder_residual",
     "time_embedding_dim": 16,
     "condition_dim": 32,
     "pos_encoding_dim": 16,
-    "num_heads": 2,
-    "num_layers": 2,
+    "num_heads": 3,
+    "num_layers": 3,
     "theta": 1.0, # controls strength of conv layers in residual model
     "dropout": 0.1,
     "model_output": "logits",
@@ -2217,27 +2239,28 @@ model_config = {"name": "edge_encoder_residual",
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     }
 
-train_config = {"batch_size": 70,
+train_config = {"batch_size": 8,
+                "pretrain": False,
     "optimizer": "adam",
     "lr": 0.009,
     "gradient_accumulation": False,
     "gradient_accumulation_steps": 16,
-    "num_epochs": 160,
+    "num_epochs": 170,
     "learning_rate_warmup_steps": 80, # previously 10000
     "lr_decay": 0.999, # previously 0.9999
     "log_loss_every_steps": 1,
     "log_metrics_every_steps": 2,
-    "save_model": True,
+    "save_model": False,
     "save_model_every_steps": 5}
 
-test_config = {"batch_size": 32, # currently only 1 works
-    "model_path": '/ceph/hdd/students/schmitj/experiments/synthetic_d3pm_test/synthetic_d3pm_test_edge_encoder_residual__hist5_fut2_marginal_prior_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
+test_config = {"batch_size": 5,
+    "model_path": '/ceph/hdd/students/schmitj/experiments/synthetic_d3pm_test/synthetic_d3pm_test_edge_encoder_residual__hist5_fut5_marginal_prior_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
     "number_samples": 10,
     "eval_every_steps": 30
   }
 
 wandb_config = {"exp_name": "synthetic_d3pm_test",
-                "run_name": "pneuma_prior_cosine_fut_5_train",
+                "run_name": "munich_prior_cosine_fut_5_eval",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
     "job_type": "test",
@@ -2254,25 +2277,30 @@ elif model_config["name"] == 'edge_encoder_residual':
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model).to(device)
 model.train()
 model_path = test_config["model_path"]
-sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, model_path=model_path, task='predict')
-#torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/samples_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
+sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=True, model_path=model_path, task='predict')
+torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/samples_raw_fut_5.pth')
 #torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_hist_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
 #torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_fut_tdriveresidual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
 fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
-torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/prior_cosine/samples.pth')
-torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/prior_cosine/gt_hist.pth')
-torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/prior_cosine/gt_fut.pth')
+torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/samples_fut_5.pth')
+torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/gt_hist_fut_5.pth')
+torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/gt_fut_fut_5.pth')
 print("ground_truth_hist", ground_truth_hist)
 print("ground_truth_fut", ground_truth_fut)
 print("sample_list", sample_list)
 print("Val F1 Score", f1)
+wandb.log({"Val F1 Score, mult samples": f1})
 print("\n")
 print("Val Accuracy", acc)
+wandb.log({"Val Accuracy, mult samples": acc})
 print("\n")
 print("Val TPR", tpr)
+wandb.log({"Val TPR, mult samples": tpr})
 print("Average sample length", avg_sample_length)
 print("\n")
+wandb.log({"Val Avg. Sample length, mult samples": avg_sample_length})
 print("Val Future ratio", fut_ratio)
+wandb.log({"Val Future ratio, mult samples": fut_ratio})
 print("\n")
 
 
