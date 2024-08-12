@@ -170,8 +170,7 @@ class Graph_Diffusion_Model(nn.Module):
                     self.optimizer.step()
                     
             else:
-                for b, data in enumerate(self.train_data_loader):
-                    print("Batch", b, "of", len(self.train_data_loader))
+                for data in self.train_data_loader:
                     edge_features = data.x      # (batch_size * num_edges, num_edge_features)
                     history_indices = data.history_indices  # (batch_size, history_len)
                     x_start = data.y[:, :, 0]   # (batch_size, num_edges)
@@ -184,6 +183,7 @@ class Graph_Diffusion_Model(nn.Module):
                     total_loss += loss
                     # Gradient calculation and optimization
                     loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                     self.optimizer.step()
                     
                     if epoch % self.log_metrics_every_steps == 0:

@@ -12,7 +12,7 @@ slurm:
     gres: gpu:1     # num GPUs
     mem: 64G          # memory
     cpus-per-task: 8  # num cores
-    time: 0-08:00     # max time, D-HH:MM
+    time: 0-23:00     # max time, D-HH:MM
 
 fixed:
   data:
@@ -49,14 +49,14 @@ fixed:
     optimizer: adam
     gradient_accumulation: False
     gradient_accumulation_steps: 1
-    learning_rate_warmup_steps: 80 # previously 10000
-    num_epochs: 1
-    lr_decay: 0.999 # previously 0.9999
+    learning_rate_warmup_steps: 50 
+    num_epochs: 100
+    lr_decay: 0.99 # previously 0.9999
     log_loss_every_steps: 1
     log_metrics_every_steps: 2
     save_model: True
     save_model_every_steps: 5
-    pretrained: True
+    pretrained: False
 
   testing:
     batch_size: 64
@@ -85,11 +85,11 @@ grid:
   data.edge_features:
     type: choice
     options:
-      - ['one_hot_edges', 'coordinates']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      # - ['one_hot_edges', 'coordinates']
+      # - ['one_hot_edges', 'coordinates', 'pos_encoding']
+      # - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
+      # - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
       - ['one_hot_edges', 'pw_distance', 'edge_length', 'edge_angles']
   diffusion_config.type:
@@ -100,7 +100,7 @@ grid:
   model.transition_mat_type:
     type: choice
     options:
-      # - 'custom'
+      - 'custom'
       - 'marginal_prior'
 
 random:

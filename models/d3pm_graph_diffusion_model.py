@@ -182,6 +182,7 @@ class Graph_Diffusion_Model(nn.Module):
                     total_loss += loss
                     # Gradient calculation and optimization
                     loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                     self.optimizer.step()
                     
                     if epoch % self.log_metrics_every_steps == 0:
