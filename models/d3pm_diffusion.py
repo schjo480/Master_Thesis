@@ -20,7 +20,6 @@ import time
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 def make_diffusion(diffusion_config, model_config, num_edges, future_len, device):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
@@ -601,12 +600,14 @@ class CategoricalDiffusion:
         edge_attr = x_init.float()
         new_edge_features = edge_features.clone()
         new_edge_features[:, -1] = edge_attr.flatten()
+        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
             x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, indices=indices)
-            new_edge_features[:, -1] = x.flatten().float()
+            new_edge_features[:, -2] = x.flatten().float()
+            new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges)
 
         if return_x_init:
             return x_init, x
@@ -648,16 +649,18 @@ class CategoricalDiffusion:
         # Replace true future with noised future
         x_t = x_t.float()   # (bs, num_edges)
         new_edge_features = edge_features.clone()
+        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
         for i in range(x_t.shape[0]):
-            new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
-
+            new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
+            sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
+            new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t
+            
         # Calculate the loss
         if self.loss_type == 'kl':
             losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
                                                                edge_features=new_edge_features, edge_index=edge_index)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-            # NOTE: Currently only works for batch size of 1
             pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
             pred = pred_x_start_logits.argmax(dim=1)                # (num_edges, classes) -> (num_edges,)
             
@@ -676,3 +679,4 @@ class CategoricalDiffusion:
             raise NotImplementedError(self.loss_type)
 
         return losses
+

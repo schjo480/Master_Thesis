@@ -66,7 +66,11 @@ class Graph_Diffusion_Model(nn.Module):
             config={**self.data_config, **self.diffusion_config, **self.model_config, **self.train_config}
         )
         self.exp_name = self.wandb_config['exp_name']
-        wandb.run.name = self.wandb_config['run_name']
+        features = ''
+        for feature in self.edge_features:
+            features += feature + '_'
+        run_name = f'{self.exp_name}_{self.model_config['transition_mat_type']}_{self.diffusion_config['type']}_{features}_hist{self.history_len}_fut{self.future_len}'
+        wandb.run.name = run_name
 
         # Logging
         self.dataset = self.data_config['dataset']
@@ -733,6 +737,8 @@ class Graph_Diffusion_Model(nn.Module):
         if 'edge_length' in self.edge_features:
             self.num_edge_features += 1
         if 'edge_angles' in self.edge_features:
+            self.num_edge_features += 1
+        if 'num_pred_edges' in self.edge_features:
             self.num_edge_features += 1
         self.train_data_loader = DataLoader(self.train_dataset, 
                                             batch_size=self.batch_size, 

@@ -66,7 +66,6 @@ fixed:
     
   wandb:
     exp_name: "pneuma_residual"
-    run_name: "pneuma_residual_different_edge_features"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
@@ -85,13 +84,15 @@ grid:
   data.edge_features:
     type: choice
     options:
-      # - ['one_hot_edges', 'coordinates']
-      # - ['one_hot_edges', 'coordinates', 'pos_encoding']
-      # - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
-      # - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
-      - ['one_hot_edges', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['one_hot_edges', 'pw_distance', 'edge_length', 'edge_angles']
+      - ['coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
+      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
   diffusion_config.type:
     type: choice
     options:

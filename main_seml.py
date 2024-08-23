@@ -51,11 +51,11 @@ def main(data, wandb, diffusion_config, model, training, testing, eval):
         for feature in data['edge_features']:
             features += feature + '_'
         sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, task='predict')
-        torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/samples_raw_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{wandb['exp_name']}' + '/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/samples_raw_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
         fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
-        torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/samples_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
-        torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/gt_hist_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
-        torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/gt_fut_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{wandb['exp_name']}' + '/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/samples_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{wandb['exp_name']}' + '/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/gt_hist_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
+        torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{wandb['exp_name']}' + '/' + f'{model_config['transition_mat_type']}' + '_' + f'{diffusion_config['type']}' + '/gt_fut_' + features + f'hist{data['history_len']}_fut_{data['future_len']}.pth')
         
         #print("ground_truth_hist", ground_truth_hist)
         #print("ground_truth_fut", ground_truth_fut)

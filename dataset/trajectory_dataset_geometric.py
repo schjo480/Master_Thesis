@@ -154,6 +154,7 @@ class TrajectoryGeoDataset(Dataset):
                 cosines = torch.nan_to_num(cosines, nan=0.0)
             
         history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
+        history_edge_features = torch.nan_to_num(history_edge_features, nan=0.0)
         
         return history_edge_features, future_edge_features
     

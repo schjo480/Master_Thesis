@@ -115,6 +115,7 @@ class Edge_Encoder_Residual(nn.Module):
             encodings = F.silu(self.pos_linear0(pos_encoding))
             encodings = F.silu(self.pos_linear1(encodings))
             x = self.integrate_encodings(x, indices, encodings) # (batch_size * num_edges, num_edge_features + pos_encoding_dim)
+        
         # Time embedding
         t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
         t_emb = self.time_linear0(t_emb)

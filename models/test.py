@@ -67,7 +67,11 @@ class Graph_Diffusion_Model(nn.Module):
             config={**self.data_config, **self.diffusion_config, **self.model_config, **self.train_config}
         )
         self.exp_name = self.wandb_config['exp_name']
-        wandb.run.name = self.wandb_config['run_name']
+        features = ''
+        for feature in self.edge_features:
+            features += feature + '_'
+        run_name = f'{self.exp_name}_{self.model_config['transition_mat_type']}_{self.diffusion_config['type']}_{features}_hist{self.history_len}_fut{self.future_len}'
+        wandb.run.name = run_name
 
         # Logging
         self.dataset = self.data_config['dataset']
@@ -735,6 +739,8 @@ class Graph_Diffusion_Model(nn.Module):
             self.num_edge_features += 1
         if 'edge_angles' in self.edge_features:
             self.num_edge_features += 1
+        if 'num_pred_edges' in self.edge_features:
+            self.num_edge_features += 1
         self.train_data_loader = DataLoader(self.train_dataset, 
                                             batch_size=self.batch_size, 
                                             shuffle=False, 
@@ -776,7 +782,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.model = self.model(self.model_config, self.history_len, self.future_len, self.num_classes,
                                 num_edges=self.num_edges, hidden_channels=self.hidden_channels, edge_features=self.edge_features, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps, pos_encoding_dim=self.pos_encoding_dim)
         print("> Model built!")
-                  
+
 import torch
 from torch_geometric.data import Dataset, Data
 import h5py
@@ -928,13 +934,12 @@ class TrajectoryGeoDataset(Dataset):
             # Calculate the cosine of the angles
             cosines = dot_products / (v1_mag * vector_mags)
             cosines = cosines.unsqueeze(1)
+            history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
             if torch.isnan(cosines).any():
                 cosines = torch.nan_to_num(cosines, nan=0.0)
-                
-            history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
-            
             
         history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
+        history_edge_features = torch.nan_to_num(history_edge_features, nan=0.0)
         
         return history_edge_features, future_edge_features
     
@@ -1471,6 +1476,7 @@ class Edge_Encoder_Residual(nn.Module):
             encodings = F.silu(self.pos_linear0(pos_encoding))
             encodings = F.silu(self.pos_linear1(encodings))
             x = self.integrate_encodings(x, indices, encodings) # (batch_size * num_edges, num_edge_features + pos_encoding_dim)
+        
         # Time embedding
         t_emb = get_timestep_embedding(t, embedding_dim=self.time_embedding_dim, max_time=self.max_time, device=x.device)
         t_emb = self.time_linear0(t_emb)
@@ -1523,7 +1529,7 @@ class Edge_Encoder_Residual(nn.Module):
         new_features[flat_indices, -encodings.size(1):] = encodings
 
         return new_features
-    
+
 # coding=utf-8
 # Copyright 2024 The Google Research Authors.
 #
@@ -1545,7 +1551,6 @@ import torch
 import time
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 def make_diffusion(diffusion_config, model_config, num_edges, future_len, device):
     """HParams -> diffusion object."""
@@ -2127,12 +2132,14 @@ class CategoricalDiffusion:
         edge_attr = x_init.float()
         new_edge_features = edge_features.clone()
         new_edge_features[:, -1] = edge_attr.flatten()
+        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
             x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, indices=indices)
-            new_edge_features[:, -1] = x.flatten().float()
+            new_edge_features[:, -2] = x.flatten().float()
+            new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges)
 
         if return_x_init:
             return x_init, x
@@ -2174,16 +2181,18 @@ class CategoricalDiffusion:
         # Replace true future with noised future
         x_t = x_t.float()   # (bs, num_edges)
         new_edge_features = edge_features.clone()
+        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
         for i in range(x_t.shape[0]):
-            new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
-
+            new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
+            sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
+            new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t
+            
         # Calculate the loss
         if self.loss_type == 'kl':
             losses, pred_x_start_logits = self.vb_terms_bpd(model_fn=model_fn, x_start=x_start, x_t=x_t, t=t,
                                                                edge_features=new_edge_features, edge_index=edge_index)
             
             pred_x_start_logits = pred_x_start_logits.squeeze(2)    # (bs, num_edges, channels, classes) -> (bs, num_edges, classes)
-            # NOTE: Currently only works for batch size of 1
             pred_x_start_logits = pred_x_start_logits.squeeze(0)    # (bs, num_edges, classes) -> (num_edges, classes)
             pred = pred_x_start_logits.argmax(dim=1)                # (num_edges, classes) -> (num_edges,)
             
@@ -2209,12 +2218,12 @@ print(device)
 
     
 data_config = {"dataset": "synthetic_20_traj",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_train.h5',
-    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_val.h5',
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_8_traj.h5',
+    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_8_traj.h5',
     "history_len": 5,
-    "future_len": 5,
+    "future_len": 2,
     "num_classes": 2,
-    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles'] # , 'road_type'
+    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges'] # , 'road_type'
     }
 
 diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
@@ -2245,7 +2254,7 @@ train_config = {"batch_size": 8,
     "lr": 0.009,
     "gradient_accumulation": False,
     "gradient_accumulation_steps": 16,
-    "num_epochs": 170,
+    "num_epochs": 50,
     "learning_rate_warmup_steps": 80, # previously 10000
     "lr_decay": 0.999, # previously 0.9999
     "log_loss_every_steps": 1,
@@ -2253,14 +2262,14 @@ train_config = {"batch_size": 8,
     "save_model": False,
     "save_model_every_steps": 5}
 
-test_config = {"batch_size": 5,
+test_config = {"batch_size": 8,
     "model_path": '/ceph/hdd/students/schmitj/experiments/synthetic_d3pm_test/synthetic_d3pm_test_edge_encoder_residual__hist5_fut5_marginal_prior_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
     "number_samples": 10,
-    "eval_every_steps": 30
+    "eval_every_steps": 50
   }
 
 wandb_config = {"exp_name": "synthetic_d3pm_test",
-                "run_name": "munich_prior_cosine_fut_5_eval",
+                "run_name": "test_sum_pred_edges",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
     "job_type": "test",
@@ -2277,14 +2286,14 @@ elif model_config["name"] == 'edge_encoder_residual':
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model).to(device)
 model.train()
 model_path = test_config["model_path"]
-sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=True, model_path=model_path, task='predict')
-torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/samples_raw_fut_5.pth')
+sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, model_path=model_path, task='predict')
+#torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/samples_raw_fut_5.pth')
 #torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_hist_tdrive_residual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
 #torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/tdrive_residual/ground_truth_fut_tdriveresidual_hist5_fut5_custom_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth')
 fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
-torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/samples_fut_5.pth')
-torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/gt_hist_fut_5.pth')
-torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/gt_fut_fut_5.pth')
+#torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/samples_fut_5.pth')
+#torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/gt_hist_fut_5.pth')
+#torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/munich_residual/prior_cosine/gt_fut_fut_5.pth')
 print("ground_truth_hist", ground_truth_hist)
 print("ground_truth_fut", ground_truth_fut)
 print("sample_list", sample_list)
