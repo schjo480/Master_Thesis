@@ -124,7 +124,7 @@ class Graph_Diffusion_Model(nn.Module):
             None
         """
         torch.autograd.set_detect_anomaly(True)
-        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, device=self.device)
+        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, edge_features=self.edge_features, device=self.device)
         def model_fn(x, edge_index, t, indices=None):
             if self.model_config['name'] == 'edge_encoder_mlp':
                 return self.model.forward(x, t=t, indices=indices)
@@ -198,6 +198,7 @@ class Graph_Diffusion_Model(nn.Module):
                         ground_truth_fut.append(x_start.detach().to('cpu'))
                         pred_fut.append(preds.detach().to('cpu'))
             self.scheduler.step()
+            print("Number of invalid samples:", self.train_dataset.ct // (epoch + 1))
             
             # Log Loss
             if epoch % self.log_loss_every_steps == 0:
@@ -225,18 +226,20 @@ class Graph_Diffusion_Model(nn.Module):
             if (epoch + 1) % self.eval_every_steps == 0:
                 print("Evaluating on validation set...")
                 sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = self.get_samples(task='predict', number_samples=1)
-                fut_ratio, f1, val_acc, val_tpr, avg_sample_length = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=1)
+                fut_ratio, f1, val_acc, val_tpr, avg_sample_length, valid_sample_ratio = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=1)
                 #print("Samples:", sample_list)
                 #print("Ground truth:", ground_truth_fut)
                 print("Val F1 Score:", f1)
                 print("Val Accuracy:", round(val_acc, 6))
                 print("Val TPR:", round(val_tpr, 6))
                 print("Average val sample length:", round(avg_sample_length, 3))
+                print("Valid sample ratio:", round(valid_sample_ratio, 3))
                 wandb.log({"Epoch": epoch, "Val F1 Score": f1})
                 wandb.log({"Epoch": epoch, "Val Accuracy": val_acc})
                 wandb.log({"Epoch": epoch, "Val TPR": val_tpr})
                 wandb.log({"Epoch": epoch, "Val Future ratio": fut_ratio})
                 wandb.log({"Epoch": epoch, "Average val sample length": round(avg_sample_length, 3)})
+                wandb.log({"Epoch": epoch, "Valid sample ratio": round(valid_sample_ratio, 3)})
                         
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
@@ -295,7 +298,8 @@ class Graph_Diffusion_Model(nn.Module):
                         samples = make_diffusion(self.diffusion_config, 
                                                  self.model_config, 
                                                  num_edges=self.num_edges, 
-                                                 future_len=self.future_len, 
+                                                 future_len=self.future_len,
+                                                 edge_features=self.edge_features,
                                                  device=self.device).p_sample_loop(model_fn=model_fn,
                                                                                    shape=(bs, self.num_edges),
                                                                                    edge_features=edge_features,
@@ -319,7 +323,8 @@ class Graph_Diffusion_Model(nn.Module):
                     samples_binary = make_diffusion(self.diffusion_config, 
                                                     self.model_config, 
                                                     num_edges=self.num_edges, 
-                                                    future_len=self.future_len, 
+                                                    future_len=self.future_len,
+                                                    edge_features=self.edge_features,
                                                     device=self.device).p_sample_loop(model_fn=model_fn,
                                                                                     shape=(bs, self.num_edges), 
                                                                                     edge_features=edge_features,
@@ -510,10 +515,10 @@ class Graph_Diffusion_Model(nn.Module):
                     def is_connected_sequence(edge_indices, graph):
                         if len(edge_indices) <= 1:
                             return True
-                        edges = list(graph.edges)
+                        edges = self.train_dataset.indexed_edges
                         subgraph_nodes = set()
                         for idx in edge_indices:
-                            edge = edges[idx]  # get the node tuple for each edge
+                            edge = edges[idx][0]  # get the node tuple for each edge
                             subgraph_nodes.update(edge)
 
                         # Create a subgraph with these nodes
@@ -526,11 +531,11 @@ class Graph_Diffusion_Model(nn.Module):
                     def is_acyclical_sequence(edge_indices, graph):
                         if len(edge_indices) <= 1:
                             return True
-                        edges = list(graph.edges)
+                        edges = self.train_dataset.indexed_edges
                         subgraph_nodes = []
                         subgraph_edges = []
                         for idx in edge_indices:
-                            edge = edges[idx]  # get the node tuple for each edge
+                            edge = edges[idx][0]  # get the node tuple for each edge
                             subgraph_nodes.append(edge)
                             subgraph_edges.append(edge)
 
@@ -544,11 +549,11 @@ class Graph_Diffusion_Model(nn.Module):
                     def is_not_split(edge_indices, graph):
                         if len(edge_indices) <= 1:
                             return True
-                        edges = list(graph.edges)
+                        edges = self.train_dataset.indexed_edges
                         subgraph_nodes = set()
                         subgraph_edges = []
                         for idx in edge_indices:
-                            edge = edges[idx]  # get the node tuple for each edge
+                            edge = edges[idx][0]  # get the node tuple for each edge
                             subgraph_nodes.update(edge)
                             subgraph_edges.append(edge)
 
@@ -566,9 +571,9 @@ class Graph_Diffusion_Model(nn.Module):
                     acyclical = is_acyclical_sequence(sample, self.G)
                     no_splits = is_not_split(sample, self.G)
                     
-                    print("Connected", connected)
-                    print("Acyclical", acyclical)
-                    print("No splits", no_splits)
+                    #print("Connected", connected)
+                    #print("Acyclical", acyclical)
+                    #print("No splits", no_splits)
                     if connected and acyclical and no_splits:
                         return True, sample
                     else:
@@ -576,12 +581,12 @@ class Graph_Diffusion_Model(nn.Module):
                     
         if number_samples is None:
             number_samples = self.test_config['number_samples']
-        
+        valid_sample_ratio = 0
         if number_samples > 1:
             valid_samples = []
             binary_valid_samples = []
             valid_ids = []
-            
+            valid_ct = 0
             #for batch_idx in tqdm(range(len(sample_list))):
             for i in range(len(sample_list)):
                 valid_sample_list = []
@@ -590,19 +595,17 @@ class Graph_Diffusion_Model(nn.Module):
                 
                 transposed_data = list(zip(*sample_list[i]))
                 for j in range(len(transposed_data)):
-                    print("Datapoint:", j)                 
                     preds = transposed_data[j]
                     for i, sample in enumerate(preds):
-                        print("Sample:", sample)
                         binary_valid_sample = torch.zeros(self.num_edges, device=sample.device)
                         valid_index = None
                         valid_sample = torch.tensor([])
                         valid, sample = check_sample(sample)
-                        print("Valid", valid)
                         if valid:
                             valid_sample = sample
                             binary_valid_sample[valid_sample] = 1
                             valid_index = i
+                            valid_ct += 1 / len(transposed_data)
                             break
                     if valid_index is None:
                         random_index = torch.randint(0, len(preds), (1,)).item()
@@ -620,6 +623,7 @@ class Graph_Diffusion_Model(nn.Module):
                 valid_samples.append(valid_sample_list)
                 binary_valid_samples.append(binary_valid_sample_list)
                 
+            valid_sample_ratio = valid_ct / len(sample_list)
             def get_most_predicted_numbers(sample_list):
                 """
                 Get the 'self.future_len' distinct numbers that are predicted the most amount of time from each list in the input list.
@@ -682,6 +686,14 @@ class Graph_Diffusion_Model(nn.Module):
             sample_list = valid_samples
             sample_binary_list = binary_valid_samples
         
+        elif number_samples == 1:
+            valid_ct = 0
+            for sample_sublist in sample_list:
+                for sample in sample_sublist:
+                    valid, sample = check_sample(sample)
+                    if valid:
+                        valid_ct += 1 / len(sample_sublist)
+            valid_sample_ratio = valid_ct / len(self.val_dataloader)
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
             Calculates the ratio of samples in `sample_list` that have at least n edges in common with the ground truth future trajectory for each n up to future_len.
@@ -802,9 +814,9 @@ class Graph_Diffusion_Model(nn.Module):
         avg_sample_length = calculate_avg_sample_length(sample_list)
         
         if return_samples:
-            return fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, valid_ids, ground_truth_hist, ground_truth_fut
+            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, sample_list, valid_ids, ground_truth_hist, ground_truth_fut
         else:
-            return fut_ratio, f1, acc, tpr, avg_sample_length
+            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio
     
     def save_model(self):
         features = ''
@@ -909,6 +921,7 @@ from torch_geometric.data import Dataset, Data
 import h5py
 import numpy as np
 from tqdm import tqdm
+import networkx as nx
 
 class MyData(Data):
     def __cat_dim__(self, key, value, *args, **kwargs):
@@ -921,6 +934,7 @@ class MyData(Data):
 class TrajectoryGeoDataset(Dataset):
     def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None):
         super().__init__()
+        self.ct = 0
         self.file_path = file_path
         self.history_len = history_len
         self.future_len = future_len
@@ -996,7 +1010,119 @@ class TrajectoryGeoDataset(Dataset):
         # Split into history and future
         history_indices = edge_idxs[:self.history_len]
         future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
-
+        future_indices_check = future_indices[future_indices >= 0]
+        
+        # Check if datapoint is valid
+        # 1. Check if history and future are connected
+        subgraph_nodes = set()
+        for idx in torch.cat((history_indices, future_indices_check), dim=0):
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.update(edge)
+        # Create a subgraph with these nodes
+        subgraph = self.G.subgraph(subgraph_nodes)
+        connected = nx.is_connected(subgraph)
+        
+        # 2. Check if neither history nor future contain loops
+        if len(future_indices_check) <= 1:
+            acyclic_fut = True
+        else:
+            subgraph_nodes = []
+            subgraph_edges = []
+            for idx in future_indices_check:
+                edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                subgraph_nodes.append(edge)
+                subgraph_edges.append(edge)
+            subgraph = nx.Graph()
+            subgraph.add_edges_from(subgraph_edges)
+            has_cycle = nx.cycle_basis(subgraph)
+            acyclic_fut = len(has_cycle) == 0
+        
+        subgraph_nodes = []
+        subgraph_edges = []
+        for idx in history_indices:
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.append(edge)
+            subgraph_edges.append(edge)
+        subgraph = nx.Graph()
+        subgraph.add_edges_from(subgraph_edges)
+        has_cycle = nx.cycle_basis(subgraph)
+        acyclic_hist = len(has_cycle) == 0
+        
+        # 3. Check if neither history nor future contain splits
+        if len(future_indices_check) <= 1:
+            no_splits_fut = True
+        else:
+            subgraph_nodes = set()
+            subgraph_edges = []
+            for idx in future_indices_check:
+                edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                subgraph_nodes.update(edge)
+                subgraph_edges.append(edge)
+            # Create a directed version of the subgraph to check for cycles
+            subgraph = nx.Graph()
+            subgraph.add_nodes_from(subgraph_nodes)
+            subgraph.add_edges_from(subgraph_edges)
+            if any(subgraph.degree(node) > 2 for node in subgraph.nodes()):
+                no_splits_fut = False
+            else:
+                no_splits_fut = True
+        
+        subgraph_nodes = set()
+        subgraph_edges = []
+        for idx in history_indices:
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.update(edge)
+            subgraph_edges.append(edge)
+        # Create a directed version of the subgraph to check for cycles
+        subgraph = nx.Graph()
+        subgraph.add_nodes_from(subgraph_nodes)
+        subgraph.add_edges_from(subgraph_edges)
+        if any(subgraph.degree(node) > 2 for node in subgraph.nodes()):
+            no_splits_hist = False
+        else:
+            no_splits_hist = True
+        
+        # 4. Check if history is connected and future is connected
+        subgraph_nodes = set()
+        for idx in history_indices:
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.update(edge)
+        # Create a subgraph with these nodes
+        subgraph = self.G.subgraph(subgraph_nodes)
+        connected_hist = nx.is_connected(subgraph)
+        
+        if len(future_indices_check) <= 1:
+            connected_fut = True
+        else:
+            subgraph_nodes = set()
+            for idx in future_indices_check:
+                edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                subgraph_nodes.update(edge)
+            # Create a subgraph with these nodes
+            subgraph = self.G.subgraph(subgraph_nodes)
+            connected_fut = nx.is_connected(subgraph)
+        
+        if not (connected and acyclic_fut and acyclic_hist and no_splits_fut and no_splits_hist and connected_hist and connected_fut):
+            print("Invalid trajectory, skipping...")
+            if not connected:
+                print("History and Future not connected")
+            if not acyclic_fut:
+                print("Future contains a cycle")
+            if not acyclic_hist:
+                print("History contains a cycle")
+            if not no_splits_fut:
+                print("Future contains a split")
+            if not no_splits_hist:
+                print("History contains a split")
+            if not connected_hist:
+                print("History not connected")
+            if not connected_fut:
+                print("Future not connected")
+            print("History indices:", history_indices)
+            print("Future indices:", future_indices_check)
+            self.ct += 1
+            self.__getitem__((idx + 1) % len(self.trajectories))
+            
         # Extract and generate features
         history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
         data = MyData(x=history_edge_features,          # (batch_size * num_edges, num_edge_features)
@@ -1095,11 +1221,10 @@ class TrajectoryGeoDataset(Dataset):
         return start_point, end_point
     
     def build_graph(self):
-        import networkx as nx
         graph = nx.Graph()
         graph.add_nodes_from(self.nodes)
-        indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
-        for (start, end), index in indexed_edges:
+        self.indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
+        for (start, end), index in self.indexed_edges:
             graph.add_edge(start, end, index=index, default_orientation=(start, end))
         return graph
     
@@ -1673,7 +1798,7 @@ import time
 import torch.nn as nn
 import torch.nn.functional as F
 
-def make_diffusion(diffusion_config, model_config, num_edges, future_len, device):
+def make_diffusion(diffusion_config, model_config, num_edges, future_len, edge_features, device):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
         betas=get_diffusion_betas(diffusion_config, device),
@@ -1686,6 +1811,7 @@ def make_diffusion(diffusion_config, model_config, num_edges, future_len, device
         num_edges=num_edges,
         model_name=model_config['name'],
         future_len=future_len,
+        edge_features=edge_features,
         device=device
 )
 
@@ -1750,7 +1876,7 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, device=None):
+               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, edge_features=None, device=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
@@ -1764,6 +1890,7 @@ class CategoricalDiffusion:
         self.num_classes = 2 # 0 or 1
         self.num_edges = num_edges
         self.future_len = future_len
+        self.edge_features = edge_features
         # self.class_weights = torch.tensor([self.future_len / self.num_edges, 1 - self.future_len / self.num_edges], dtype=torch.float64)
         self.class_weights = torch.tensor([0.5, 0.5], dtype=torch.float64)
         self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
@@ -2253,14 +2380,18 @@ class CategoricalDiffusion:
         edge_attr = x_init.float()
         new_edge_features = edge_features.clone()
         new_edge_features[:, -1] = edge_attr.flatten()
-        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
+        if 'num_pred_edges' in self.edge_features:
+            new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
             x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, indices=indices)
-            new_edge_features[:, -2] = x.flatten().float()
-            new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges)
+            if 'num_pred_edges' in self.edge_features:
+                new_edge_features[:, -2] = x.flatten().float()
+                new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges)
+            else:
+                new_edge_features[:, -1] = x.flatten().float()
 
         if return_x_init:
             return x_init, x
@@ -2302,11 +2433,15 @@ class CategoricalDiffusion:
         # Replace true future with noised future
         x_t = x_t.float()   # (bs, num_edges)
         new_edge_features = edge_features.clone()
-        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
+        if 'num_pred_edges' in self.edge_features:
+            new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
         for i in range(x_t.shape[0]):
-            new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
-            sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
-            new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t
+            if 'num_pred_edges' in self.edge_features:
+                new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
+                sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
+                new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t
+            else:
+                new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
             
         # Calculate the loss
         if self.loss_type == 'kl':
@@ -2332,19 +2467,17 @@ class CategoricalDiffusion:
             raise NotImplementedError(self.loss_type)
 
         return losses
-
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
     
 data_config = {"dataset": "synthetic_20_traj",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_20_traj.h5',
-    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_20_traj.h5',
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_val.h5',
+    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_val.h5',
     "history_len": 5,
-    "future_len": 2,
+    "future_len": 5,
     "num_classes": 2,
-    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges'] # , 'road_type'
+    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles'] # , 'road_type'
     }
 
 diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
@@ -2369,7 +2502,7 @@ model_config = {"name": "edge_encoder_residual",
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     }
 
-train_config = {"batch_size": 10,
+train_config = {"batch_size": 8,
                 "pretrain": False,
     "optimizer": "adam",
     "lr": 0.009,
@@ -2383,10 +2516,10 @@ train_config = {"batch_size": 10,
     "save_model": False,
     "save_model_every_steps": 5}
 
-test_config = {"batch_size": 10,
+test_config = {"batch_size": 6,
     "model_path": '/ceph/hdd/students/schmitj/experiments/synthetic_d3pm_test/synthetic_d3pm_test_edge_encoder_residual__hist5_fut5_marginal_prior_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
     "number_samples": 10,
-    "eval_every_steps": 50
+    "eval_every_steps": 1
   }
 
 wandb_config = {"exp_name": "synthetic_d3pm_test",
@@ -2409,8 +2542,9 @@ model.train()
 model_path = test_config["model_path"]
 sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, model_path=model_path, task='predict')
 torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/samples_raw.pth')
-fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, valid_ids, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
+fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, sample_list, valid_ids, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
 torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/samples.pth')
+torch.save(valid_ids, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/valid_ids.pth')
 torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/gt_hist.pth')
 torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/gt_fut.pth')
 print("ground_truth_hist", ground_truth_hist)

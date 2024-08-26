@@ -3,6 +3,7 @@ from torch_geometric.data import Dataset, Data
 import h5py
 import numpy as np
 from tqdm import tqdm
+import networkx as nx
 
 class MyData(Data):
     def __cat_dim__(self, key, value, *args, **kwargs):
@@ -15,6 +16,7 @@ class MyData(Data):
 class TrajectoryGeoDataset(Dataset):
     def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None):
         super().__init__()
+        self.ct = 0
         self.file_path = file_path
         self.history_len = history_len
         self.future_len = future_len
@@ -90,7 +92,119 @@ class TrajectoryGeoDataset(Dataset):
         # Split into history and future
         history_indices = edge_idxs[:self.history_len]
         future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
-
+        future_indices_check = future_indices[future_indices >= 0]
+        
+        # Check if datapoint is valid
+        # 1. Check if history and future are connected
+        subgraph_nodes = set()
+        for idx in torch.cat((history_indices, future_indices_check), dim=0):
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.update(edge)
+        # Create a subgraph with these nodes
+        subgraph = self.G.subgraph(subgraph_nodes)
+        connected = nx.is_connected(subgraph)
+        
+        # 2. Check if neither history nor future contain loops
+        if len(future_indices_check) <= 1:
+            acyclic_fut = True
+        else:
+            subgraph_nodes = []
+            subgraph_edges = []
+            for idx in future_indices_check:
+                edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                subgraph_nodes.append(edge)
+                subgraph_edges.append(edge)
+            subgraph = nx.Graph()
+            subgraph.add_edges_from(subgraph_edges)
+            has_cycle = nx.cycle_basis(subgraph)
+            acyclic_fut = len(has_cycle) == 0
+        
+        subgraph_nodes = []
+        subgraph_edges = []
+        for idx in history_indices:
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.append(edge)
+            subgraph_edges.append(edge)
+        subgraph = nx.Graph()
+        subgraph.add_edges_from(subgraph_edges)
+        has_cycle = nx.cycle_basis(subgraph)
+        acyclic_hist = len(has_cycle) == 0
+        
+        # 3. Check if neither history nor future contain splits
+        if len(future_indices_check) <= 1:
+            no_splits_fut = True
+        else:
+            subgraph_nodes = set()
+            subgraph_edges = []
+            for idx in future_indices_check:
+                edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                subgraph_nodes.update(edge)
+                subgraph_edges.append(edge)
+            # Create a directed version of the subgraph to check for cycles
+            subgraph = nx.Graph()
+            subgraph.add_nodes_from(subgraph_nodes)
+            subgraph.add_edges_from(subgraph_edges)
+            if any(subgraph.degree(node) > 2 for node in subgraph.nodes()):
+                no_splits_fut = False
+            else:
+                no_splits_fut = True
+        
+        subgraph_nodes = set()
+        subgraph_edges = []
+        for idx in history_indices:
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.update(edge)
+            subgraph_edges.append(edge)
+        # Create a directed version of the subgraph to check for cycles
+        subgraph = nx.Graph()
+        subgraph.add_nodes_from(subgraph_nodes)
+        subgraph.add_edges_from(subgraph_edges)
+        if any(subgraph.degree(node) > 2 for node in subgraph.nodes()):
+            no_splits_hist = False
+        else:
+            no_splits_hist = True
+        
+        # 4. Check if history is connected and future is connected
+        subgraph_nodes = set()
+        for idx in history_indices:
+            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+            subgraph_nodes.update(edge)
+        # Create a subgraph with these nodes
+        subgraph = self.G.subgraph(subgraph_nodes)
+        connected_hist = nx.is_connected(subgraph)
+        
+        if len(future_indices_check) <= 1:
+            connected_fut = True
+        else:
+            subgraph_nodes = set()
+            for idx in future_indices_check:
+                edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                subgraph_nodes.update(edge)
+            # Create a subgraph with these nodes
+            subgraph = self.G.subgraph(subgraph_nodes)
+            connected_fut = nx.is_connected(subgraph)
+        
+        if not (connected and acyclic_fut and acyclic_hist and no_splits_fut and no_splits_hist and connected_hist and connected_fut):
+            print("Invalid trajectory, skipping...")
+            if not connected:
+                print("History and Future not connected")
+            if not acyclic_fut:
+                print("Future contains a cycle")
+            if not acyclic_hist:
+                print("History contains a cycle")
+            if not no_splits_fut:
+                print("Future contains a split")
+            if not no_splits_hist:
+                print("History contains a split")
+            if not connected_hist:
+                print("History not connected")
+            if not connected_fut:
+                print("Future not connected")
+            print("History indices:", history_indices)
+            print("Future indices:", future_indices_check)
+            self.ct += 1
+            self.__getitem__((idx + 1) % len(self.trajectories))
+            
         # Extract and generate features
         history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, self.edge_coordinates)
         data = MyData(x=history_edge_features,          # (batch_size * num_edges, num_edge_features)
@@ -189,11 +303,10 @@ class TrajectoryGeoDataset(Dataset):
         return start_point, end_point
     
     def build_graph(self):
-        import networkx as nx
         graph = nx.Graph()
         graph.add_nodes_from(self.nodes)
-        indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
-        for (start, end), index in indexed_edges:
+        self.indexed_edges = [((start, end), index) for index, (start, end) in enumerate(self.edges)]
+        for (start, end), index in self.indexed_edges:
             graph.add_edge(start, end, index=index, default_orientation=(start, end))
         return graph
     
