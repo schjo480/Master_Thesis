@@ -123,7 +123,7 @@ class Graph_Diffusion_Model(nn.Module):
             None
         """
         torch.autograd.set_detect_anomaly(True)
-        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, device=self.device)
+        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, edge_features=self.edge_features, device=self.device)
         def model_fn(x, edge_index, t, indices=None):
             if self.model_config['name'] == 'edge_encoder_mlp':
                 return self.model.forward(x, t=t, indices=indices)
@@ -294,7 +294,8 @@ class Graph_Diffusion_Model(nn.Module):
                         samples = make_diffusion(self.diffusion_config, 
                                                  self.model_config, 
                                                  num_edges=self.num_edges, 
-                                                 future_len=self.future_len, 
+                                                 future_len=self.future_len,
+                                                 edge_features=self.edge_features,
                                                  device=self.device).p_sample_loop(model_fn=model_fn,
                                                                                    shape=(bs, self.num_edges),
                                                                                    edge_features=edge_features,
@@ -318,7 +319,8 @@ class Graph_Diffusion_Model(nn.Module):
                     samples_binary = make_diffusion(self.diffusion_config, 
                                                     self.model_config, 
                                                     num_edges=self.num_edges, 
-                                                    future_len=self.future_len, 
+                                                    future_len=self.future_len,
+                                                    edge_features=self.edge_features,
                                                     device=self.device).p_sample_loop(model_fn=model_fn,
                                                                                     shape=(bs, self.num_edges), 
                                                                                     edge_features=edge_features,

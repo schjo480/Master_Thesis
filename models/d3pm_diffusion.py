@@ -20,7 +20,7 @@ import time
 import torch.nn as nn
 import torch.nn.functional as F
 
-def make_diffusion(diffusion_config, model_config, num_edges, future_len, device):
+def make_diffusion(diffusion_config, model_config, num_edges, future_len, edge_features, device):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
         betas=get_diffusion_betas(diffusion_config, device),
@@ -33,6 +33,7 @@ def make_diffusion(diffusion_config, model_config, num_edges, future_len, device
         num_edges=num_edges,
         model_name=model_config['name'],
         future_len=future_len,
+        edge_features=edge_features,
         device=device
 )
 
@@ -97,7 +98,7 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, device=None):
+               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, edge_features=None, device=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
@@ -111,6 +112,7 @@ class CategoricalDiffusion:
         self.num_classes = 2 # 0 or 1
         self.num_edges = num_edges
         self.future_len = future_len
+        self.edge_features = edge_features
         # self.class_weights = torch.tensor([self.future_len / self.num_edges, 1 - self.future_len / self.num_edges], dtype=torch.float64)
         self.class_weights = torch.tensor([0.5, 0.5], dtype=torch.float64)
         self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
@@ -600,14 +602,18 @@ class CategoricalDiffusion:
         edge_attr = x_init.float()
         new_edge_features = edge_features.clone()
         new_edge_features[:, -1] = edge_attr.flatten()
-        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
+        if 'num_pred_edges' in self.edge_features:
+            new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
             noise = torch.rand(x.shape + (self.num_classes,), device=device, dtype=torch.float32)
             x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, indices=indices)
-            new_edge_features[:, -2] = x.flatten().float()
-            new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges)
+            if 'num_pred_edges' in self.edge_features:
+                new_edge_features[:, -2] = x.flatten().float()
+                new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges)
+            else:
+                new_edge_features[:, -1] = x.flatten().float()
 
         if return_x_init:
             return x_init, x
@@ -649,11 +655,15 @@ class CategoricalDiffusion:
         # Replace true future with noised future
         x_t = x_t.float()   # (bs, num_edges)
         new_edge_features = edge_features.clone()
-        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
+        if 'num_pred_edges' in self.edge_features:
+            new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
         for i in range(x_t.shape[0]):
-            new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
-            sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
-            new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t
+            if 'num_pred_edges' in self.edge_features:
+                new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
+                sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
+                new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t
+            else:
+                new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
             
         # Calculate the loss
         if self.loss_type == 'kl':
