@@ -12,7 +12,7 @@ slurm:
     gres: gpu:1     # num GPUs
     mem: 64G          # memory
     cpus-per-task: 8  # num cores
-    time: 0-23:00     # max time, D-HH:MM
+    time: 1-03:00     # max time, D-HH:MM
 
 fixed:
   data:
@@ -49,13 +49,13 @@ fixed:
     optimizer: adam
     gradient_accumulation: False
     gradient_accumulation_steps: 1
-    learning_rate_warmup_steps: 50 
-    num_epochs: 40
+    learning_rate_warmup_steps: 40 
+    num_epochs: 60
     lr_decay: 0.99 # previously 0.9999
     log_loss_every_steps: 1
     log_metrics_every_steps: 2
     save_model: True
-    save_model_every_steps: 5
+    save_model_every_steps: 2
     pretrained: False
 
   testing:
@@ -65,7 +65,7 @@ fixed:
     eval_every_steps: 10
     
   wandb:
-    exp_name: "pneuma_test"
+    exp_name: "pneuma_residual"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
@@ -78,21 +78,22 @@ grid:
   data.future_len:
     type: choice
     options:
-      #- 2
-      #- 5
+      - 2
+      - 5
       - 10
   data.edge_features:
     type: choice
     options:
       #- ['one_hot_edges', 'coordinates']
-      #- ['one_hot_edges', 'coordinates', 'pos_encoding']
-      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       #- ['one_hot_edges', 'pw_distance', 'edge_length', 'edge_angles']
       #- ['coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
-      #- ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
+      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
       
   diffusion_config.type:
     type: choice
