@@ -197,6 +197,7 @@ class Graph_Diffusion_Model(nn.Module):
                         ground_truth_fut.append(x_start.detach().to('cpu'))
                         pred_fut.append(preds.detach().to('cpu'))
             self.scheduler.step()
+            print("Number of invalid samples:", self.train_dataset.ct // (epoch + 1))
             
             # Log Loss
             if epoch % self.log_loss_every_steps == 0:
@@ -224,18 +225,20 @@ class Graph_Diffusion_Model(nn.Module):
             if (epoch + 1) % self.eval_every_steps == 0:
                 print("Evaluating on validation set...")
                 sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = self.get_samples(task='predict', number_samples=1)
-                fut_ratio, f1, val_acc, val_tpr, avg_sample_length = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=1)
+                fut_ratio, f1, val_acc, val_tpr, avg_sample_length, valid_sample_ratio = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=1)
                 #print("Samples:", sample_list)
                 #print("Ground truth:", ground_truth_fut)
                 print("Val F1 Score:", f1)
                 print("Val Accuracy:", round(val_acc, 6))
                 print("Val TPR:", round(val_tpr, 6))
                 print("Average val sample length:", round(avg_sample_length, 3))
+                print("Valid sample ratio:", round(valid_sample_ratio, 3))
                 wandb.log({"Epoch": epoch, "Val F1 Score": f1})
                 wandb.log({"Epoch": epoch, "Val Accuracy": val_acc})
                 wandb.log({"Epoch": epoch, "Val TPR": val_tpr})
                 wandb.log({"Epoch": epoch, "Val Future ratio": fut_ratio})
                 wandb.log({"Epoch": epoch, "Average val sample length": round(avg_sample_length, 3)})
+                wandb.log({"Epoch": epoch, "Valid sample ratio": round(valid_sample_ratio, 3)})
                         
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
@@ -511,10 +514,10 @@ class Graph_Diffusion_Model(nn.Module):
                     def is_connected_sequence(edge_indices, graph):
                         if len(edge_indices) <= 1:
                             return True
-                        edges = list(graph.edges)
+                        edges = self.train_dataset.indexed_edges
                         subgraph_nodes = set()
                         for idx in edge_indices:
-                            edge = edges[idx]  # get the node tuple for each edge
+                            edge = edges[idx][0]  # get the node tuple for each edge
                             subgraph_nodes.update(edge)
 
                         # Create a subgraph with these nodes
@@ -527,11 +530,11 @@ class Graph_Diffusion_Model(nn.Module):
                     def is_acyclical_sequence(edge_indices, graph):
                         if len(edge_indices) <= 1:
                             return True
-                        edges = list(graph.edges)
+                        edges = self.train_dataset.indexed_edges
                         subgraph_nodes = []
                         subgraph_edges = []
                         for idx in edge_indices:
-                            edge = edges[idx]  # get the node tuple for each edge
+                            edge = edges[idx][0]  # get the node tuple for each edge
                             subgraph_nodes.append(edge)
                             subgraph_edges.append(edge)
 
@@ -545,11 +548,11 @@ class Graph_Diffusion_Model(nn.Module):
                     def is_not_split(edge_indices, graph):
                         if len(edge_indices) <= 1:
                             return True
-                        edges = list(graph.edges)
+                        edges = self.train_dataset.indexed_edges
                         subgraph_nodes = set()
                         subgraph_edges = []
                         for idx in edge_indices:
-                            edge = edges[idx]  # get the node tuple for each edge
+                            edge = edges[idx][0]  # get the node tuple for each edge
                             subgraph_nodes.update(edge)
                             subgraph_edges.append(edge)
 
@@ -567,9 +570,9 @@ class Graph_Diffusion_Model(nn.Module):
                     acyclical = is_acyclical_sequence(sample, self.G)
                     no_splits = is_not_split(sample, self.G)
                     
-                    print("Connected", connected)
-                    print("Acyclical", acyclical)
-                    print("No splits", no_splits)
+                    #print("Connected", connected)
+                    #print("Acyclical", acyclical)
+                    #print("No splits", no_splits)
                     if connected and acyclical and no_splits:
                         return True, sample
                     else:
@@ -577,12 +580,12 @@ class Graph_Diffusion_Model(nn.Module):
                     
         if number_samples is None:
             number_samples = self.test_config['number_samples']
-        
+        valid_sample_ratio = 0
         if number_samples > 1:
             valid_samples = []
             binary_valid_samples = []
             valid_ids = []
-            
+            valid_ct = 0
             #for batch_idx in tqdm(range(len(sample_list))):
             for i in range(len(sample_list)):
                 valid_sample_list = []
@@ -591,19 +594,17 @@ class Graph_Diffusion_Model(nn.Module):
                 
                 transposed_data = list(zip(*sample_list[i]))
                 for j in range(len(transposed_data)):
-                    print("Datapoint:", j)                 
                     preds = transposed_data[j]
                     for i, sample in enumerate(preds):
-                        print("Sample:", sample)
                         binary_valid_sample = torch.zeros(self.num_edges, device=sample.device)
                         valid_index = None
                         valid_sample = torch.tensor([])
                         valid, sample = check_sample(sample)
-                        print("Valid", valid)
                         if valid:
                             valid_sample = sample
                             binary_valid_sample[valid_sample] = 1
                             valid_index = i
+                            valid_ct += 1 / len(transposed_data)
                             break
                     if valid_index is None:
                         random_index = torch.randint(0, len(preds), (1,)).item()
@@ -621,6 +622,7 @@ class Graph_Diffusion_Model(nn.Module):
                 valid_samples.append(valid_sample_list)
                 binary_valid_samples.append(binary_valid_sample_list)
                 
+            valid_sample_ratio = valid_ct / len(sample_list)
             def get_most_predicted_numbers(sample_list):
                 """
                 Get the 'self.future_len' distinct numbers that are predicted the most amount of time from each list in the input list.
@@ -683,6 +685,14 @@ class Graph_Diffusion_Model(nn.Module):
             sample_list = valid_samples
             sample_binary_list = binary_valid_samples
         
+        elif number_samples == 1:
+            valid_ct = 0
+            for sample_sublist in sample_list:
+                for sample in sample_sublist:
+                    valid, sample = check_sample(sample)
+                    if valid:
+                        valid_ct += 1 / len(sample_sublist)
+            valid_sample_ratio = valid_ct / len(self.val_dataloader)
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
             Calculates the ratio of samples in `sample_list` that have at least n edges in common with the ground truth future trajectory for each n up to future_len.
@@ -803,9 +813,9 @@ class Graph_Diffusion_Model(nn.Module):
         avg_sample_length = calculate_avg_sample_length(sample_list)
         
         if return_samples:
-            return fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, valid_ids, ground_truth_hist, ground_truth_fut
+            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, sample_list, valid_ids, ground_truth_hist, ground_truth_fut
         else:
-            return fut_ratio, f1, acc, tpr, avg_sample_length
+            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio
     
     def save_model(self):
         features = ''
