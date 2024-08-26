@@ -600,7 +600,7 @@ class CategoricalDiffusion:
         edge_attr = x_init.float()
         new_edge_features = edge_features.clone()
         new_edge_features[:, -1] = edge_attr.flatten()
-        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
+        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
@@ -649,7 +649,7 @@ class CategoricalDiffusion:
         # Replace true future with noised future
         x_t = x_t.float()   # (bs, num_edges)
         new_edge_features = edge_features.clone()
-        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1))), dim=1)
+        new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
         for i in range(x_t.shape[0]):
             new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
             sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
@@ -679,4 +679,3 @@ class CategoricalDiffusion:
             raise NotImplementedError(self.loss_type)
 
         return losses
-

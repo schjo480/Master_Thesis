@@ -50,7 +50,7 @@ fixed:
     gradient_accumulation: False
     gradient_accumulation_steps: 1
     learning_rate_warmup_steps: 50 
-    num_epochs: 100
+    num_epochs: 40
     lr_decay: 0.99 # previously 0.9999
     log_loss_every_steps: 1
     log_metrics_every_steps: 2
@@ -62,10 +62,10 @@ fixed:
     batch_size: 64
     model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_without_last_two_relu_longer_training/synthetic_d3pm_without_last_two_relu_longer_training.pth'
     number_samples: 10
-    eval_every_steps: 20
+    eval_every_steps: 10
     
   wandb:
-    exp_name: "pneuma_residual"
+    exp_name: "pneuma_test"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
@@ -78,8 +78,8 @@ grid:
   data.future_len:
     type: choice
     options:
-      - 2
-      - 5
+      #- 2
+      #- 5
       - 10
   data.edge_features:
     type: choice
@@ -89,10 +89,11 @@ grid:
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
-      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       #- ['one_hot_edges', 'pw_distance', 'edge_length', 'edge_angles']
-      - ['coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
-      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
+      
   diffusion_config.type:
     type: choice
     options:

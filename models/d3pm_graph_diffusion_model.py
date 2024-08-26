@@ -186,7 +186,7 @@ class Graph_Diffusion_Model(nn.Module):
                     total_loss += loss
                     # Gradient calculation and optimization
                     loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.3)
                     self.optimizer.step()
                     
                     if epoch % self.log_metrics_every_steps == 0:
@@ -307,8 +307,9 @@ class Graph_Diffusion_Model(nn.Module):
                         else:
                             samples_list = []
                             for i in range(samples.size(0)):
-                                data = torch.argwhere(samples[i] == 1)
-                                samples_list.append(data.flatten().to('cpu'))
+                                sample = torch.argwhere(samples[i] == 1).flatten().to('cpu')
+                                samples_list.append(sample)
+                        
                         sample_sublist.append(samples_list)
                     sample_list.append(sample_sublist)
                     sample_binary_list.append(sample_sublist_binary)
@@ -341,8 +342,6 @@ class Graph_Diffusion_Model(nn.Module):
                 ground_truth_hist.append(history_edge_indices.detach().to('cpu'))
                 ground_truth_fut.append(future_trajectory_indices.detach().to('cpu'))
                 ground_truth_fut_binary.append(future_binary.detach().to('cpu'))
-            if number_samples == 1:
-                pass
             
             if save:
                 save_path = os.path.join(self.model_dir, 
@@ -496,10 +495,130 @@ class Graph_Diffusion_Model(nn.Module):
         :param ground_truth_hist: A list of actual history edge indices.
         :param ground_truth_fut: A list of actual future edge indices.
         """
+        def check_sample(sample):
+                """
+                Check if the sample is valid, i.e. connected, acyclical, and no splits.
+
+                :param sample: A list of predicted edge indices.
+                """
+                if len(sample) == 0:
+                    return True, sample
+                
+                else:
+                    # Check connectivity
+                    def is_connected_sequence(edge_indices, graph):
+                        if len(edge_indices) <= 1:
+                            return True
+                        edges = list(graph.edges)
+                        subgraph_nodes = set()
+                        for idx in edge_indices:
+                            edge = edges[idx]  # get the node tuple for each edge
+                            subgraph_nodes.update(edge)
+
+                        # Create a subgraph with these nodes
+                        subgraph = graph.subgraph(subgraph_nodes)
+
+                        # Check if the subgraph is connected
+                        return nx.is_connected(subgraph)
+
+                    # Check acyclical
+                    def is_acyclical_sequence(edge_indices, graph):
+                        if len(edge_indices) <= 1:
+                            return True
+                        edges = list(graph.edges)
+                        subgraph_nodes = []
+                        subgraph_edges = []
+                        for idx in edge_indices:
+                            edge = edges[idx]  # get the node tuple for each edge
+                            subgraph_nodes.append(edge)
+                            subgraph_edges.append(edge)
+
+                        subgraph = nx.Graph()
+                        subgraph.add_edges_from(subgraph_edges)
+                        
+                        has_cycle = nx.cycle_basis(subgraph)
+                        return len(has_cycle) == 0
+                    
+                    # Check no splits
+                    def is_not_split(edge_indices, graph):
+                        if len(edge_indices) <= 1:
+                            return True
+                        edges = list(graph.edges)
+                        subgraph_nodes = set()
+                        subgraph_edges = []
+                        for idx in edge_indices:
+                            edge = edges[idx]  # get the node tuple for each edge
+                            subgraph_nodes.update(edge)
+                            subgraph_edges.append(edge)
+
+                        # Create a directed version of the subgraph to check for cycles
+                        graph = nx.Graph()
+                        graph.add_nodes_from(subgraph_nodes)
+                        graph.add_edges_from(subgraph_edges)
+                        
+                        if any(graph.degree(node) > 2 for node in graph.nodes()):
+                            return False
+                        else:
+                            return True
+
+                    connected = is_connected_sequence(sample, self.G)
+                    acyclical = is_acyclical_sequence(sample, self.G)
+                    no_splits = is_not_split(sample, self.G)
+                    
+                    print("Connected", connected)
+                    print("Acyclical", acyclical)
+                    print("No splits", no_splits)
+                    if connected and acyclical and no_splits:
+                        return True, sample
+                    else:
+                        return False, sample
+                    
         if number_samples is None:
             number_samples = self.test_config['number_samples']
         
         if number_samples > 1:
+            valid_samples = []
+            binary_valid_samples = []
+            valid_ids = []
+            
+            #for batch_idx in tqdm(range(len(sample_list))):
+            for i in range(len(sample_list)):
+                valid_sample_list = []
+                binary_valid_sample_list = []
+                valid_id_list = []
+                
+                transposed_data = list(zip(*sample_list[i]))
+                for j in range(len(transposed_data)):
+                    print("Datapoint:", j)                 
+                    preds = transposed_data[j]
+                    for i, sample in enumerate(preds):
+                        print("Sample:", sample)
+                        binary_valid_sample = torch.zeros(self.num_edges, device=sample.device)
+                        valid_index = None
+                        valid_sample = torch.tensor([])
+                        valid, sample = check_sample(sample)
+                        print("Valid", valid)
+                        if valid:
+                            valid_sample = sample
+                            binary_valid_sample[valid_sample] = 1
+                            valid_index = i
+                            break
+                    if valid_index is None:
+                        random_index = torch.randint(0, len(preds), (1,)).item()
+                        random_sample = preds[random_index]
+                        binary_valid_sample[random_sample] = 1
+                        valid_id_list.append(valid_index)
+                        valid_sample_list.append(random_sample)
+                    else:
+                        valid_id_list.append(valid_index)
+                        valid_sample_list.append(valid_sample)
+                        binary_valid_sample_list.append(binary_valid_sample)
+                
+                binary_valid_sample_list = torch.stack(binary_valid_sample_list, dim=0)
+                valid_ids.append(valid_id_list)
+                valid_samples.append(valid_sample_list)
+                binary_valid_samples.append(binary_valid_sample_list)
+                
             def get_most_predicted_numbers(sample_list):
                 """
                 Get the 'self.future_len' distinct numbers that are predicted the most amount of time from each list in the input list.
@@ -558,7 +677,9 @@ class Graph_Diffusion_Model(nn.Module):
 
                 return most_predicted_numbers, most_predicted_binary
 
-            sample_list, sample_binary_list = get_most_predicted_numbers(sample_list)
+            # sample_list, sample_binary_list = get_most_predicted_numbers(sample_list)
+            sample_list = valid_samples
+            sample_binary_list = binary_valid_samples
         
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
@@ -680,7 +801,7 @@ class Graph_Diffusion_Model(nn.Module):
         avg_sample_length = calculate_avg_sample_length(sample_list)
         
         if return_samples:
-            return fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, ground_truth_hist, ground_truth_fut
+            return fut_ratio, f1, acc, tpr, avg_sample_length, sample_list, valid_ids, ground_truth_hist, ground_truth_fut
         else:
             return fut_ratio, f1, acc, tpr, avg_sample_length
     
