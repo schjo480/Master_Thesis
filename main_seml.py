@@ -71,7 +71,7 @@ def main(data, wandb, diffusion_config, model, training, testing, eval):
         print("Val TPR", tpr)
         #wandb.log({"Val TPR, mult samples": tpr})
         print("\n")
-        valid_ids = [item for sublist in valid_ids for item in sublist]
+        valid_ids = [item if item is not None else testing['number_samples'] for sublist in valid_ids for item in sublist]
         print("Avg. number of samples until valid", sum(valid_ids) / len(valid_ids))
         print("\n")
         print("Average sample length", avg_sample_length)

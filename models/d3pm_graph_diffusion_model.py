@@ -612,6 +612,7 @@ class Graph_Diffusion_Model(nn.Module):
                         binary_valid_sample[random_sample] = 1
                         valid_id_list.append(valid_index)
                         valid_sample_list.append(random_sample)
+                        binary_valid_sample_list.append(binary_valid_sample)
                     else:
                         valid_id_list.append(valid_index)
                         valid_sample_list.append(valid_sample)

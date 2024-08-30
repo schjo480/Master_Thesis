@@ -78,8 +78,8 @@ grid:
   data.future_len:
     type: choice
     options:
-      - 2
-      - 5
+      # - 2
+      # - 5
       - 10
   data.edge_features:
     type: choice
