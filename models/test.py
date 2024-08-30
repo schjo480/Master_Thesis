@@ -198,7 +198,6 @@ class Graph_Diffusion_Model(nn.Module):
                         ground_truth_fut.append(x_start.detach().to('cpu'))
                         pred_fut.append(preds.detach().to('cpu'))
             self.scheduler.step()
-            print("Number of invalid samples:", self.train_dataset.ct // (epoch + 1))
             
             # Log Loss
             if epoch % self.log_loss_every_steps == 0:
@@ -224,22 +223,27 @@ class Graph_Diffusion_Model(nn.Module):
             
             # Validation
             if (epoch + 1) % self.eval_every_steps == 0:
+                print("Number of invalid paths in dataset:", self.train_dataset.ct // (epoch + 1))
                 print("Evaluating on validation set...")
                 sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = self.get_samples(task='predict', number_samples=1)
-                fut_ratio, f1, val_acc, val_tpr, avg_sample_length, valid_sample_ratio = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=1)
-                #print("Samples:", sample_list)
-                #print("Ground truth:", ground_truth_fut)
-                print("Val F1 Score:", f1)
-                print("Val Accuracy:", round(val_acc, 6))
-                print("Val TPR:", round(val_tpr, 6))
-                print("Average val sample length:", round(avg_sample_length, 3))
-                print("Valid sample ratio:", round(valid_sample_ratio, 3))
-                wandb.log({"Epoch": epoch, "Val F1 Score": f1})
-                wandb.log({"Epoch": epoch, "Val Accuracy": val_acc})
-                wandb.log({"Epoch": epoch, "Val TPR": val_tpr})
-                wandb.log({"Epoch": epoch, "Val Future ratio": fut_ratio})
-                wandb.log({"Epoch": epoch, "Average val sample length": round(avg_sample_length, 3)})
-                wandb.log({"Epoch": epoch, "Valid sample ratio": round(valid_sample_ratio, 3)})
+                val_fut_ratio, val_f1, val_acc, val_tpr, val_avg_sample_length, val_valid_sample_ratio, ade, fde = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=1)
+                print("Validation F1 Score:", val_f1)
+                print("Validation Accuracy:", val_acc)
+                print("Validation TPR:", val_tpr)
+                print("Validation Future ratio:", val_fut_ratio)
+                print("Validation Average sample length:", val_avg_sample_length)
+                print("Validation Average valid sample ratio:", val_valid_sample_ratio)
+                print("Validation ADE:", ade)
+                print("Validation FDE:", fde)
+                
+                wandb.log({"Epoch": epoch, "Validation F1 Score": val_f1})
+                wandb.log({"Epoch": epoch, "Validation Accuracy": val_acc})
+                wandb.log({"Epoch": epoch, "Validation TPR": val_tpr})
+                wandb.log({"Epoch": epoch, "Validation Future ratio": val_fut_ratio})
+                wandb.log({"Epoch": epoch, "Validation Average sample length": round(val_avg_sample_length, 3)})
+                wandb.log({"Epoch": epoch, "Validation Average valid sample ratio": round(val_valid_sample_ratio, 3)})
+                wandb.log({"Epoch": epoch, "Validation ADE": ade})
+                wandb.log({"Epoch": epoch, "Validation FDE": fde})
                         
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
@@ -350,13 +354,38 @@ class Graph_Diffusion_Model(nn.Module):
                 ground_truth_fut_binary.append(future_binary.detach().to('cpu'))
             
             if save:
-                save_path = os.path.join(self.model_dir, 
-                                 self.exp_name + '_' + self.model_config['name'] + '_' +  self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}_layers_{self.num_layers}')
-                torch.save(sample_list, os.path.join(save_path, f'{self.exp_name}_samples.pth'))
-                torch.save(ground_truth_hist, os.path.join(save_path, f'{self.exp_name}_ground_truth_hist.pth'))
-                torch.save(ground_truth_fut, os.path.join(save_path, f'{self.exp_name}_ground_truth_fut.pth'))
-                print(f"Samples saved at {os.path.join(save_path, f'{self.exp_name}_samples.pth')}!")
+                features = ''
+                for feature in self.edge_features:
+                    features += feature + '_'
+                save_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{self.wandb_config['exp_name']}' + '/' + f'{self.model_config['transition_mat_type']}' + '_' + f'{self.diffusion_config['type']}/'
+                if number_samples == 1:
+                    torch.save(sample_list, save_path + f'samples_one_shot_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                    print(f"Samples saved at {save_path}samples_one_shot_{features}hist{self.history_len}_fut_{self.future_len}.pth)!")
+                    fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, ade, fde = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=number_samples)
+                    wandb.log({"One-Shot F1 Score": f1})
+                    wandb.log({"One-Shot Accuracy": acc})
+                    wandb.log({"One-Shot TPR": tpr})
+                    wandb.log({"One-Shot Future ratio": fut_ratio})
+                    wandb.log({"One-Shot Average sample length": avg_sample_length})
+                    wandb.log({"One-Shot Valid sample ratio": valid_sample_ratio})
+                    wandb.log({"One-Shot ADE": ade})
+                    wandb.log({"One-Shot FDE": fde})
+                elif number_samples > 1:
+                    torch.save(sample_list, save_path + f'samples_raw_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                    fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, valid_samples, valid_ids, ade, fde = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=number_samples)
+                    wandb.log({"Valid Sample F1 Score": f1})
+                    wandb.log({"Valid Sample Accuracy": acc})
+                    wandb.log({"Valid Sample TPR": tpr})
+                    wandb.log({"Valid Sample Future ratio": fut_ratio})
+                    wandb.log({"Valid Sample Average sample length": avg_sample_length})
+                    wandb.log({"Valid Sample Valid sample ratio": valid_sample_ratio})
+                    wandb.log({"Valid Sample ADE": ade})
+                    wandb.log({"Valid Sample FDE": fde})
+                    torch.save(valid_samples, save_path + f'samples_valid_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                    torch.save(valid_ids, save_path + f'valid_ids_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                    
+                torch.save(ground_truth_hist, save_path + f'gt_hist_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                torch.save(ground_truth_fut, save_path + f'gt_hist_fut_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
             else:
                 ### TODO: Debugging ###
                 # ground_truth_fut is a list (of length len(val_dataloader)) of tensors with shape (batch_size, future_len)
@@ -501,142 +530,143 @@ class Graph_Diffusion_Model(nn.Module):
         :param ground_truth_hist: A list of actual history edge indices.
         :param ground_truth_fut: A list of actual future edge indices.
         """
-        def check_sample(sample):
-                """
-                Check if the sample is valid, i.e. connected, acyclical, and no splits.
-
-                :param sample: A list of predicted edge indices.
-                """
-                if len(sample) == 0:
-                    return True, sample
-                
-                else:
-                    # Check connectivity
-                    def is_connected_sequence(edge_indices, graph):
-                        if len(edge_indices) <= 1:
-                            return True
-                        edges = self.train_dataset.indexed_edges
-                        subgraph_nodes = set()
-                        for idx in edge_indices:
-                            edge = edges[idx][0]  # get the node tuple for each edge
-                            subgraph_nodes.update(edge)
-
-                        # Create a subgraph with these nodes
-                        subgraph = graph.subgraph(subgraph_nodes)
-
-                        # Check if the subgraph is connected
-                        return nx.is_connected(subgraph)
-
-                    # Check acyclical
-                    def is_acyclical_sequence(edge_indices, graph):
-                        if len(edge_indices) <= 1:
-                            return True
-                        edges = self.train_dataset.indexed_edges
-                        subgraph_nodes = []
-                        subgraph_edges = []
-                        for idx in edge_indices:
-                            edge = edges[idx][0]  # get the node tuple for each edge
-                            subgraph_nodes.append(edge)
-                            subgraph_edges.append(edge)
-
-                        subgraph = nx.Graph()
-                        subgraph.add_edges_from(subgraph_edges)
-                        
-                        has_cycle = nx.cycle_basis(subgraph)
-                        return len(has_cycle) == 0
-                    
-                    # Check no splits
-                    def is_not_split(edge_indices, graph):
-                        if len(edge_indices) <= 1:
-                            return True
-                        edges = self.train_dataset.indexed_edges
-                        subgraph_nodes = set()
-                        subgraph_edges = []
-                        for idx in edge_indices:
-                            edge = edges[idx][0]  # get the node tuple for each edge
-                            subgraph_nodes.update(edge)
-                            subgraph_edges.append(edge)
-
-                        # Create a directed version of the subgraph to check for cycles
-                        graph = nx.Graph()
-                        graph.add_nodes_from(subgraph_nodes)
-                        graph.add_edges_from(subgraph_edges)
-                        
-                        if any(graph.degree(node) > 2 for node in graph.nodes()):
-                            return False
-                        else:
-                            return True
-
-                    connected = is_connected_sequence(sample, self.G)
-                    acyclical = is_acyclical_sequence(sample, self.G)
-                    no_splits = is_not_split(sample, self.G)
-                    
-                    #print("Connected", connected)
-                    #print("Acyclical", acyclical)
-                    #print("No splits", no_splits)
-                    if connected and acyclical and no_splits:
-                        return True, sample
-                    else:
-                        return False, sample
-                    
         if number_samples is None:
             number_samples = self.test_config['number_samples']
-        valid_sample_ratio = 0
-        if number_samples > 1:
-            valid_samples = []
-            binary_valid_samples = []
-            valid_ids = []
-            valid_ct = 0
-            for i in range(len(sample_list)):
-                valid_sample_list = []
-                binary_valid_sample_list = []
-                valid_id_list = []
-                
-                transposed_data = list(zip(*sample_list[i]))
-                for j in range(len(transposed_data)):
-                    preds = transposed_data[j]
-                    valid_sample_len = 0
-                    valid_index = None
-                    binary_valid_sample = torch.zeros(self.num_edges, device='cpu')
-                    valid_sample = torch.tensor([])
-                    for i, sample in enumerate(preds):
-                        valid, sample = check_sample(sample)
-                        if valid and len(sample) > valid_sample_len:
-                            print("Trigger")
-                            valid_sample_len = len(sample)
-                            valid_sample = sample
-                            binary_valid_sample[valid_sample] = 1
-                            valid_index = i
-                            valid_ct += 1 / len(transposed_data)
-                    if valid_index is None:
-                        random_index = torch.randint(0, len(preds), (1,)).item()
-                        random_sample = preds[random_index]
-                        binary_valid_sample[random_sample] = 1
-                        valid_id_list.append(valid_index)
-                        valid_sample_list.append(random_sample)
-                        binary_valid_sample_list.append(binary_valid_sample)
-                    else:
-                        valid_id_list.append(valid_index)
-                        valid_sample_list.append(valid_sample)
-                        binary_valid_sample_list.append(binary_valid_sample)
-                
-                binary_valid_sample_list = torch.stack(binary_valid_sample_list, dim=0)
-                valid_ids.append(valid_id_list)
-                valid_samples.append(valid_sample_list)
-                binary_valid_samples.append(binary_valid_sample_list)
-                
-            valid_sample_ratio = valid_ct / len(sample_list)
-            sample_list = valid_samples
-            sample_binary_list = binary_valid_samples
         
-        elif number_samples == 1:
-            valid_ct = 0
-            for sample_sublist in sample_list:
-                for sample in sample_sublist:
-                    valid, sample = check_sample(sample)
-                    if valid:
-                        valid_ct += 1 / len(sample_sublist)
-            valid_sample_ratio = valid_ct / len(self.val_dataloader)
+        def check_sample(sample):
+            """
+            Check if the sample is valid, i.e. connected, acyclical, and no splits.
+
+            :param sample: A list of predicted edge indices.
+            """
+            if len(sample) == 0:
+                return True, sample
+            
+            else:
+                # Check connectivity
+                def is_connected_sequence(edge_indices, graph):
+                    if len(edge_indices) <= 1:
+                        return True
+                    edges = self.train_dataset.indexed_edges
+                    subgraph_nodes = set()
+                    for idx in edge_indices:
+                        edge = edges[idx][0]  # get the node tuple for each edge
+                        subgraph_nodes.update(edge)
+
+                    # Create a subgraph with these nodes
+                    subgraph = graph.subgraph(subgraph_nodes)
+
+                    # Check if the subgraph is connected
+                    return nx.is_connected(subgraph)
+
+                # Check acyclical
+                def is_acyclical_sequence(edge_indices, graph):
+                    if len(edge_indices) <= 1:
+                        return True
+                    edges = self.train_dataset.indexed_edges
+                    subgraph_nodes = []
+                    subgraph_edges = []
+                    for idx in edge_indices:
+                        edge = edges[idx][0]  # get the node tuple for each edge
+                        subgraph_nodes.append(edge)
+                        subgraph_edges.append(edge)
+
+                    subgraph = nx.Graph()
+                    subgraph.add_edges_from(subgraph_edges)
+                    
+                    has_cycle = nx.cycle_basis(subgraph)
+                    return len(has_cycle) == 0
+                
+                # Check no splits
+                def is_not_split(edge_indices, graph):
+                    if len(edge_indices) <= 1:
+                        return True
+                    edges = self.train_dataset.indexed_edges
+                    subgraph_nodes = set()
+                    subgraph_edges = []
+                    for idx in edge_indices:
+                        edge = edges[idx][0]  # get the node tuple for each edge
+                        subgraph_nodes.update(edge)
+                        subgraph_edges.append(edge)
+
+                    # Create a directed version of the subgraph to check for cycles
+                    graph = nx.Graph()
+                    graph.add_nodes_from(subgraph_nodes)
+                    graph.add_edges_from(subgraph_edges)
+                    
+                    if any(graph.degree(node) > 2 for node in graph.nodes()):
+                        return False
+                    else:
+                        return True
+
+                connected = is_connected_sequence(sample, self.G)
+                acyclical = is_acyclical_sequence(sample, self.G)
+                no_splits = is_not_split(sample, self.G)
+                
+                #print("Connected", connected)
+                #print("Acyclical", acyclical)
+                #print("No splits", no_splits)
+                if connected and acyclical and no_splits:
+                    return True, sample
+                else:
+                    return False, sample
+        
+        def get_valid_samples(sample_list, number_samples):
+            valid_sample_ratio = 0
+            if number_samples > 1:
+                valid_samples = []
+                binary_valid_samples = []
+                valid_ids = []
+                valid_ct = 0
+                for i in range(len(sample_list)):
+                    valid_sample_list = []
+                    binary_valid_sample_list = []
+                    valid_id_list = []
+                    
+                    transposed_data = list(zip(*sample_list[i]))
+                    for j in range(len(transposed_data)):
+                        preds = transposed_data[j]
+                        valid_sample_len = 0
+                        valid_index = None
+                        binary_valid_sample = torch.zeros(self.num_edges, device='cpu')
+                        valid_sample = torch.tensor([])
+                        for i, sample in enumerate(preds):
+                            valid, sample = check_sample(sample)
+                            if valid and len(sample) > valid_sample_len:
+                                valid_sample_len = len(sample)
+                                valid_sample = sample
+                                binary_valid_sample[valid_sample] = 1
+                                valid_index = i
+                        if valid_index is None:
+                            random_index = torch.randint(0, len(preds), (1,)).item()
+                            random_sample = preds[random_index]
+                            binary_valid_sample[random_sample] = 1
+                            valid_id_list.append(valid_index)
+                            valid_sample_list.append(random_sample)
+                            binary_valid_sample_list.append(binary_valid_sample)
+                        else:
+                            valid_ct += 1 / len(transposed_data)
+                            valid_id_list.append(valid_index)
+                            valid_sample_list.append(valid_sample)
+                            binary_valid_sample_list.append(binary_valid_sample)
+                    
+                    binary_valid_sample_list = torch.stack(binary_valid_sample_list, dim=0)
+                    valid_ids.append(valid_id_list)
+                    valid_samples.append(valid_sample_list)
+                    binary_valid_samples.append(binary_valid_sample_list)
+                
+                valid_sample_ratio = valid_ct / len(sample_list)
+                return valid_samples, binary_valid_samples, valid_ids, valid_sample_ratio
+            elif number_samples == 1:
+                valid_ct = 0
+                for sample_sublist in sample_list:
+                    for sample in sample_sublist:
+                        valid, sample = check_sample(sample)
+                        if valid:
+                            valid_ct += 1 / len(sample_sublist)
+                valid_sample_ratio = valid_ct / len(self.val_dataloader)
+                return valid_sample_ratio
+                
         def calculate_fut_ratio(sample_list, ground_truth_fut):
             """
             Calculates the ratio of samples in `sample_list` that have at least n edges in common with the ground truth future trajectory for each n up to future_len.
@@ -749,17 +779,261 @@ class Graph_Diffusion_Model(nn.Module):
                     total_len += len(sample) / len(sample_sublist)
             return total_len / len(self.val_dataloader)
         
-        fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
-        tpr = calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary)
-        prec = calculate_sample_prec(sample_binary_list, ground_truth_fut_binary)
-        f1 = calculate_sample_f1(tpr, prec)
-        acc = calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary)
-        avg_sample_length = calculate_avg_sample_length(sample_list)
+        def build_node_sequence(edge_sequence, indexed_edges, start_point):
+            # Convert list of tuples to a tensor of shape [num_edges, 2]
+            if len(edge_sequence) == 0:
+                return []
+            edges = [list(edge[0]) for edge in indexed_edges]
+            edge_tensor = torch.tensor(edges, dtype=torch.long)[edge_sequence]
+            
+            # Initialize the list of nodes with the start point
+            node_sequence = [start_point]
+            
+            # Current node to find the next connected edge
+            current_node = start_point
+            
+            if current_node not in edge_tensor:
+                return []
+            # Continue until we have traversed all edges
+            while len(node_sequence) < len(edge_sequence) + 1:
+                for i in range(edge_tensor.size(0)):
+                    # Check if the current edge connects to the current node
+                    if edge_tensor[i, 0] == current_node:
+                        # Append the connected node and update the current node
+                        node_sequence.append(edge_tensor[i, 1].item())
+                        current_node = edge_tensor[i, 1].item()
+                    elif edge_tensor[i, 1] == current_node:
+                        # Append the connected node and update the current node
+                        node_sequence.append(edge_tensor[i, 0].item())
+                        current_node = edge_tensor[i, 0].item()
+
+            return node_sequence
         
-        if return_samples:
-            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, sample_list, valid_ids, ground_truth_hist, ground_truth_fut
-        else:
-            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio
+        def find_trajectory_endpoints(edge_sequence, edge_coordinates, indexed_edges):
+            """
+            Find the start and end points of a trajectory based on a sequence of edge indices,
+            accounting for the direction and connection of edges.
+            
+            Args:
+                edge_coordinates (torch.Tensor): Coordinates of all edges in the graph, shape (num_edges, 2, 2).
+                                                Each edge is represented by two points [point1, point2].
+                edge_sequence (torch.Tensor): Indices of edges forming the trajectory, shape (sequence_length).
+            
+            Returns:
+                tuple: Start point and end point of the trajectory.
+            """
+            edges = [list(edge[0]) for edge in indexed_edges]
+            # Get the coordinates of edges in the sequence
+            trajectory_edges = edge_coordinates[edge_sequence]
+            
+            # Determine the start point by checking the connection of the first edge with the second
+            if torch.norm(trajectory_edges[0, 0] - trajectory_edges[1, 0]) < torch.norm(trajectory_edges[0, 1] - trajectory_edges[1, 0]):
+                start_point_coord = trajectory_edges[0, 1]  # Closer to the second edge's start
+                start_point = edges[edge_sequence[0]][1]
+            else:
+                start_point_coord = trajectory_edges[0, 0]
+                start_point = edges[edge_sequence[0]][0]
+            
+            # Determine the end point by checking the connection of the last edge with the second to last
+            if torch.norm(trajectory_edges[-1, 1] - trajectory_edges[-2, 1]) < torch.norm(trajectory_edges[-1, 0] - trajectory_edges[-2, 1]):
+                end_point_coord = trajectory_edges[-1, 0]  # Closer to the second to last edge's end
+                end_point = edges[edge_sequence[-1]][0]
+            else:
+                end_point_coord = trajectory_edges[-1, 1]
+                end_point = edges[edge_sequence[-1]][1]
+            
+            return start_point_coord, end_point_coord, start_point, end_point
+        
+        def calculate_ade_fde(batched_preds, batched_gt_futs, batched_gt_hists, edge_coordinates, indexed_edges):
+            ade_list = []
+            fde_list = []
+            for batch_idx in tqdm(range(len(batched_gt_futs))):
+                for idx in range(len(batched_gt_futs[batch_idx])):
+                    pred = batched_preds[batch_idx][idx]
+                    pred_nodes = [indexed_edges[j][0] for j in pred]
+                    unique_pred_nodes = set()
+                    for node in pred_nodes:
+                        unique_pred_nodes.update(node)  # Add both elements of the tuple to the set
+
+                    # Convert the set back to a list
+                    unique_pred_nodes = list(unique_pred_nodes)
+                    gt_hist = batched_gt_hists[batch_idx][idx]
+                    start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
+                    gt_fut_ = batched_gt_futs[batch_idx][idx]
+                    gt_fut = gt_fut_[gt_fut_ != -1]
+                    gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
+                    
+
+                    ade = 0
+                    fde = 0
+                    if len(gt_fut) == 0 and len(pred) == 0:
+                        ade = 0
+                        fde = 0
+                    elif len(pred) == 0 and len(gt_fut) > 0:
+                        if len(gt_fut_nodes) == 0:
+                            continue
+                        for i in range(len(gt_fut)):
+                            ade += torch.norm(self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i+1]][1]['pos'])
+                        ade /= len(gt_fut)
+                        fde = torch.norm(self.train_dataset.nodes[end_point][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                    elif len(pred) > 0 and len(gt_fut) == 0:
+                        max_dist = float('-inf')
+                        farthest_pred_node = None
+                        for pred_node in unique_pred_nodes:
+                            ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                            dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                            if dist > max_dist:
+                                max_dist = dist
+                                farthest_pred_node = pred_node
+                        ade /= len(pred)
+                        fde = torch.norm(self.train_dataset.nodes[farthest_pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                    elif len(pred) > 0 and len(gt_fut) > 0:
+                        if len(gt_fut_nodes) == 0:
+                            continue
+                        min_dist_fde = float('inf')
+                        clostest_pred_node = None
+                        for i, pred_node in enumerate(unique_pred_nodes):
+                            min_dist = float('inf')
+                            closest_gt_fut_node = None
+                            for gt_fut_node in gt_fut_nodes:
+                                dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_node][1]['pos'])
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    closest_gt_fut_node = gt_fut_node
+                            ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[closest_gt_fut_node][1]['pos'])
+                            dist_fde = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                            if dist_fde < min_dist_fde:
+                                fde = dist_fde
+                                min_dist_fde = dist_fde
+                        if len(pred) > len(gt_fut):
+                            ade /= len(pred)
+                        else:
+                            ade /= len(gt_fut)
+                    ade_list.append(ade)
+                    fde_list.append(fde)
+            return torch.mean(torch.tensor(ade_list)), torch.mean(torch.tensor(fde_list))
+        
+        def calculate_ade_fde_valid(batched_preds, valid_ids, batched_gt_futs, batched_gt_hists, edge_coordinates, indexed_edges):
+            ade_list = []
+            fde_list = []
+            for batch_idx in tqdm(range(len(batched_gt_futs))):
+                for idx in range(len(batched_gt_futs[batch_idx])):
+                    pred = batched_preds[batch_idx][idx]
+                    pred_nodes = [indexed_edges[j][0] for j in pred]
+                    valid = valid_ids[batch_idx][idx]
+                    gt_hist = batched_gt_hists[batch_idx][idx]
+                    start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
+                    gt_fut_ = batched_gt_futs[batch_idx][idx]
+                    gt_fut = gt_fut_[gt_fut_ != -1]
+                    gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
+
+                    ade = 0
+                    fde = 0
+                    
+                    # No ground truth edges and no predicted edges
+                    if len(gt_fut) == 0 and len(pred) == 0:
+                        ade = 0
+                        fde = 0
+                    elif len(pred) == 0 and len(gt_fut) > 0:
+                        for i in range(len(gt_fut)):
+                            ade += torch.norm(self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i+1]][1]['pos'])
+                        ade /= len(gt_fut)
+                        fde = torch.norm(self.train_dataset.nodes[end_point][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                    elif len(pred) > 0 and len(gt_fut) == 0:
+                        if valid is not None:
+                            pred_save = pred
+                            pred_length = len(pred)
+                            closest_node = None
+                            min_dist = float('inf')
+                            for i, edge in enumerate(pred):
+                                for node in pred_nodes[i]:
+                                    dist = torch.norm(self.train_dataset.nodes[node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                                    if dist < min_dist:
+                                        min_dist = dist
+                                        closest_node = node
+                                        mask = pred != edge
+                                        pred = pred[mask]
+                            pred_nodes_sequence = build_node_sequence(pred_save, indexed_edges, closest_node)
+                            for i in range(len(pred_nodes_sequence) - 1):
+                                ade += torch.norm(self.train_dataset.nodes[pred_nodes_sequence[i]][1]['pos'] - self.train_dataset.nodes[pred_nodes_sequence[i+1]][1]['pos'])
+                            fde = torch.norm(self.train_dataset.nodes[end_point][1]['pos'] - self.train_dataset.nodes[pred_nodes_sequence[-1]][1]['pos'])
+                        else:
+                            continue
+                        ade /= pred_length
+                    elif len(pred) > 0 and len(gt_fut) > 0:
+                        if valid is not None:
+                            if len(pred) > len(gt_fut):
+                                pred_save = pred
+                                pred_length = len(pred)
+                                closest_node = None
+                                min_dist = float('inf')
+                                for i, edge in enumerate(pred):
+                                    for node in pred_nodes[i]:
+                                        dist = torch.norm(self.train_dataset.nodes[node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            closest_node = node
+                                            mask = pred != edge
+                                            pred = pred[mask]
+                                pred_nodes_sequence = build_node_sequence(pred_save, indexed_edges, closest_node)
+                                for i in range(len(pred_nodes_sequence)):
+                                    if i < len(gt_fut_nodes):
+                                        ade += torch.norm(self.train_dataset.nodes[pred_nodes_sequence[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'])
+                                    else:
+                                        ade += torch.norm(self.train_dataset.nodes[pred_nodes_sequence[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                                ade /= pred_length
+                                fde = torch.norm(self.train_dataset.nodes[pred_nodes_sequence[-1]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                            else:
+                                pred_save = pred
+                                pred_length = len(pred)
+                                closest_node = None
+                                min_dist = float('inf')
+                                for i, edge in enumerate(pred):
+                                    for node in pred_nodes[i]:
+                                        dist = torch.norm(self.train_dataset.nodes[node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            closest_node = node
+                                            mask = pred != edge
+                                            pred = pred[mask]
+                                pred_nodes_sequence = build_node_sequence(pred_save, indexed_edges, closest_node)
+                                for i in range(len(gt_fut_nodes)):
+                                    if i < len(pred_nodes_sequence):
+                                        ade += torch.norm(self.train_dataset.nodes[pred_nodes_sequence[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'])
+                                    else:
+                                        ade += torch.norm(self.train_dataset.nodes[pred_nodes_sequence[-1]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'])
+                                ade /= len(gt_fut)
+                                fde = torch.norm(self.train_dataset.nodes[pred_nodes_sequence[-1]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                        else:
+                            continue
+                            
+                    ade_list.append(ade)
+                    fde_list.append(fde)
+            return torch.mean(torch.tensor(ade_list)), torch.mean(torch.tensor(fde_list))
+        
+        if number_samples == 1:
+            valid_sample_ratio = get_valid_samples(sample_list, number_samples)
+            fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
+            tpr = calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary)
+            prec = calculate_sample_prec(sample_binary_list, ground_truth_fut_binary)
+            f1 = calculate_sample_f1(tpr, prec)
+            acc = calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary)
+            avg_sample_length = calculate_avg_sample_length(sample_list)
+            ade, fde = calculate_ade_fde(sample_list, ground_truth_fut, ground_truth_hist, self.train_dataset.edge_coordinates, self.train_dataset.indexed_edges)
+            
+            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, ade, fde
+        elif number_samples > 1:
+            valid_samples, binary_valid_samples, valid_ids, valid_sample_ratio = get_valid_samples(sample_list, number_samples)
+            
+            fut_ratio = calculate_fut_ratio(valid_samples, ground_truth_fut)
+            tpr = calculate_sample_tpr(binary_valid_samples, ground_truth_fut_binary)
+            prec = calculate_sample_prec(binary_valid_samples, ground_truth_fut_binary)
+            f1 = calculate_sample_f1(tpr, prec)
+            acc = calculate_sample_accuracy(binary_valid_samples, ground_truth_fut_binary)
+            avg_sample_length = calculate_avg_sample_length(valid_samples)
+            ade, fde = calculate_ade_fde_valid(valid_samples, valid_ids, ground_truth_fut, ground_truth_hist, self.train_dataset.edge_coordinates, self.train_dataset.indexed_edges)
+            
+            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, valid_samples, valid_ids, ade, fde
     
     def save_model(self):
         features = ''
@@ -2431,8 +2705,8 @@ test_config = {"batch_size": 20,
     "eval_every_steps": 60
   }
 
-wandb_config = {"exp_name": "synthetic_d3pm_test",
-                "run_name": "test_sum_pred_edges",
+wandb_config = {"exp_name": "test_residual",
+                "run_name": "test_residual",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
     "job_type": "test",
@@ -2449,14 +2723,18 @@ elif model_config["name"] == 'edge_encoder_residual':
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model).to(device)
 model.train()
 model_path = test_config["model_path"]
-sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, model_path=model_path, task='predict')
-torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/samples_raw.pth')
-fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, sample_list, valid_ids, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
-torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/samples.pth')
-torch.save(valid_ids, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/valid_ids.pth')
-torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/gt_hist.pth')
-torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/gt_fut.pth')
-print("ground_truth_hist", ground_truth_hist)
+# One-Shot samples
+model.get_samples(load_model=False, task='predict', number_samples=1, save=True)
+# Multiple samples
+model.get_samples(load_model=False, task='predict', save=True)
+#sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, model_path=model_path, task='predict')
+#torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/samples_raw.pth')
+#fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, sample_list, valid_ids, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)
+#torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/samples.pth')
+#torch.save(valid_ids, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/valid_ids.pth')
+#torch.save(ground_truth_hist, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/gt_hist.pth')
+#torch.save(ground_truth_fut, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/gt_fut.pth')
+'''print("ground_truth_hist", ground_truth_hist)
 print("ground_truth_fut", ground_truth_fut)
 print("valid sample list", sample_list)
 print("valid_ids", valid_ids)
@@ -2475,7 +2753,7 @@ print("\n")
 wandb.log({"Val Avg. Sample length, mult samples": avg_sample_length})
 print("Val Future ratio", fut_ratio)
 wandb.log({"Val Future ratio, mult samples": fut_ratio})
-print("\n")
+print("\n")'''
 
 
 # model.visualize_predictions(sample_list, ground_truth_hist, ground_truth_fut)
