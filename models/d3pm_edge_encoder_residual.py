@@ -129,7 +129,7 @@ class Edge_Encoder_Residual(nn.Module):
         for conv, res_layer in zip(self.convs, self.res_layers):
             res = F.relu(res_layer(x))
             x = F.relu(conv(x, edge_index))
-            x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)        
+            x = self.theta * x + res        # (batch_size * num_edges, hidden_channels * num_heads)
 
         logits = self.future_decoder(x) # (batch_size * num_edges, hidden_channels)
         logits = self.adjust_to_class_shape(logits) # (batch_size * num_edges, num_classes=2)

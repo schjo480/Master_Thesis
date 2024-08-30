@@ -282,3 +282,4 @@ wandb/run-20240502_141435-hec0m894/files/config.yaml
 experiments/synthetic_d3pm/synthetic_d3pm_8904672_0.out
 
 *wandb
+figures/*

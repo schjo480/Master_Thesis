@@ -604,6 +604,7 @@ class CategoricalDiffusion:
         new_edge_features[:, -1] = edge_attr.flatten()
         if 'num_pred_edges' in self.edge_features:
             new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
+            new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges) / self.num_edges
         
         for i in range(num_timesteps):
             t = torch.full([shape[0]], self.num_timesteps - 1 - i, dtype=torch.long, device=device)
@@ -611,7 +612,7 @@ class CategoricalDiffusion:
             x, pred_x_start_logits = self.p_sample(model_fn=model_fn, x=x, t=t, noise=noise, edge_features=new_edge_features, edge_index=edge_index, indices=indices)
             if 'num_pred_edges' in self.edge_features:
                 new_edge_features[:, -2] = x.flatten().float()
-                new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges)
+                new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges) / self.num_edges
             else:
                 new_edge_features[:, -1] = x.flatten().float()
 
@@ -661,7 +662,7 @@ class CategoricalDiffusion:
             if 'num_pred_edges' in self.edge_features:
                 new_edge_features[i * num_edges:(i + 1)*num_edges, -2] = x_t[i]
                 sum_x_t = torch.sum(x_t[i]).repeat(self.num_edges)
-                new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t
+                new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = sum_x_t / self.num_edges
             else:
                 new_edge_features[i * num_edges:(i + 1)*num_edges, -1] = x_t[i]
             
