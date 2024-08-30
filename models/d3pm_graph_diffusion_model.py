@@ -586,7 +586,6 @@ class Graph_Diffusion_Model(nn.Module):
             binary_valid_samples = []
             valid_ids = []
             valid_ct = 0
-            #for batch_idx in tqdm(range(len(sample_list))):
             for i in range(len(sample_list)):
                 valid_sample_list = []
                 binary_valid_sample_list = []
@@ -595,17 +594,19 @@ class Graph_Diffusion_Model(nn.Module):
                 transposed_data = list(zip(*sample_list[i]))
                 for j in range(len(transposed_data)):
                     preds = transposed_data[j]
+                    valid_sample_len = 0
+                    valid_index = None
+                    binary_valid_sample = torch.zeros(self.num_edges, device='cpu')
+                    valid_sample = torch.tensor([])
                     for i, sample in enumerate(preds):
-                        binary_valid_sample = torch.zeros(self.num_edges, device=sample.device)
-                        valid_index = None
-                        valid_sample = torch.tensor([])
                         valid, sample = check_sample(sample)
-                        if valid:
+                        if valid and len(sample) > valid_sample_len:
+                            print("Trigger")
+                            valid_sample_len = len(sample)
                             valid_sample = sample
                             binary_valid_sample[valid_sample] = 1
                             valid_index = i
                             valid_ct += 1 / len(transposed_data)
-                            break
                     if valid_index is None:
                         random_index = torch.randint(0, len(preds), (1,)).item()
                         random_sample = preds[random_index]
@@ -624,65 +625,6 @@ class Graph_Diffusion_Model(nn.Module):
                 binary_valid_samples.append(binary_valid_sample_list)
                 
             valid_sample_ratio = valid_ct / len(sample_list)
-            def get_most_predicted_numbers(sample_list):
-                """
-                Get the 'self.future_len' distinct numbers that are predicted the most amount of time from each list in the input list.
-
-                Args:
-                    sample_list (list): A list of lists containing predicted numbers.
-
-                Returns:
-                    list: A list of tensors containing the most predicted numbers.
-                """
-                if self.test_batch_size == 1:
-                    most_predicted_numbers = []
-                    most_predicted_binary = []
-                    for sample in sample_list:
-                        binary_sample = torch.zeros(self.num_edges)
-                        # Flatten the sample list
-                        flattened_sample = torch.cat(sample).flatten()
-                        # Count the occurrences of each number
-                        counts = torch.bincount(flattened_sample, minlength=self.num_edges)
-                        valid_indices = counts > 0
-                        non_zero_indices = torch.arange(self.num_edges)[valid_indices]
-                        sorted_non_zero_indices = non_zero_indices[torch.argsort(counts[non_zero_indices], descending=True)]
-                        most_predicted_indices = sorted_non_zero_indices[:min(self.future_len, len(sorted_non_zero_indices))]
-                        
-                        most_predicted_numbers.append([most_predicted_indices])
-                        binary_sample[most_predicted_indices] = 1
-                        most_predicted_binary.append(binary_sample.unsqueeze(0))
-                else:
-                    most_predicted_numbers = []
-                    most_predicted_binary = []
-                    for i in range(len(sample_list)):
-                        # Flatten the sample list
-                        transposed_data = list(zip(*sample_list[i]))
-                        # Concatenate the tensors in each group
-                        flattened_sample = [torch.cat(tensors) for tensors in transposed_data]
-                        # Initialize the list to hold binary representations for each batch item
-                        batch_binary_samples = []
-                        # Count the occurrences of each number
-                        most_predicted_numbers_int = []
-                        for s in flattened_sample:
-                            binary_sample = torch.zeros(self.num_edges, device=s.device)  # Ensure the binary_sample is on the correct device
-                            counts = torch.bincount(s, minlength=self.num_edges)
-                            valid_indices = counts > 0
-                            non_zero_indices = torch.arange(self.num_edges)[valid_indices]
-                            sorted_non_zero_indices = non_zero_indices[torch.argsort(counts[non_zero_indices], descending=True)]
-                            most_predicted_indices = sorted_non_zero_indices[:min(self.future_len, len(sorted_non_zero_indices))]
-                            most_predicted_numbers_int.append(most_predicted_indices)
-                            binary_sample[most_predicted_indices] = 1
-                            # Append the binary representation for this sample to the batch list
-                            batch_binary_samples.append(binary_sample)
-                        
-                        # Stack all binary samples for the current batch to match the desired shape (batch_size, num_edges)
-                        batch_binary_tensor = torch.stack(batch_binary_samples, dim=0)
-                        most_predicted_numbers.append(most_predicted_numbers_int)
-                        most_predicted_binary.append(batch_binary_tensor)
-
-                return most_predicted_numbers, most_predicted_binary
-
-            # sample_list, sample_binary_list = get_most_predicted_numbers(sample_list)
             sample_list = valid_samples
             sample_binary_list = binary_valid_samples
         
