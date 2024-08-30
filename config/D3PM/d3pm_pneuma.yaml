@@ -50,7 +50,7 @@ fixed:
     gradient_accumulation: False
     gradient_accumulation_steps: 1
     learning_rate_warmup_steps: 40 
-    num_epochs: 60
+    num_epochs: 70
     lr_decay: 0.99 # previously 0.9999
     log_loss_every_steps: 1
     log_metrics_every_steps: 2
@@ -78,22 +78,22 @@ grid:
   data.future_len:
     type: choice
     options:
-      # - 2
-      # - 5
+      - 2
+      - 5
       - 10
   data.edge_features:
     type: choice
     options:
       #- ['one_hot_edges', 'coordinates']
       - ['one_hot_edges', 'coordinates', 'pos_encoding']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      # - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       #- ['one_hot_edges', 'pw_distance', 'edge_length', 'edge_angles']
       #- ['coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
-      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
+      # - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
       
   diffusion_config.type:
     type: choice
