@@ -20,7 +20,7 @@ import time
 import torch.nn as nn
 import torch.nn.functional as F
 
-def make_diffusion(diffusion_config, model_config, num_edges, future_len, edge_features, device):
+def make_diffusion(diffusion_config, model_config, num_edges, future_len, edge_features, device, avg_future_len=None):
     """HParams -> diffusion object."""
     return CategoricalDiffusion(
         betas=get_diffusion_betas(diffusion_config, device),
@@ -34,7 +34,8 @@ def make_diffusion(diffusion_config, model_config, num_edges, future_len, edge_f
         model_name=model_config['name'],
         future_len=future_len,
         edge_features=edge_features,
-        device=device
+        device=device,
+        avg_future_len=avg_future_len
 )
 
 
@@ -98,7 +99,7 @@ class CategoricalDiffusion:
 
     def __init__(self, *, betas, model_prediction, model_output,
                transition_mat_type, transition_bands, loss_type, hybrid_coeff,
-               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, edge_features=None, device=None):
+               num_edges, torch_dtype=torch.float32, model_name=None, future_len=None, edge_features=None, device=None, avg_future_len=None):
 
         self.model_prediction = model_prediction  # *x_start*, xprev
         self.model_output = model_output  # logits or *logistic_pars*
@@ -111,7 +112,10 @@ class CategoricalDiffusion:
         # Data \in {0, ..., num_edges-1}
         self.num_classes = 2 # 0 or 1
         self.num_edges = num_edges
-        self.future_len = future_len
+        if future_len > 0:
+            self.future_len = future_len
+        else:
+            self.future_len = avg_future_len
         self.edge_features = edge_features
         # self.class_weights = torch.tensor([self.future_len / self.num_edges, 1 - self.future_len / self.num_edges], dtype=torch.float64)
         self.class_weights = torch.tensor([0.5, 0.5], dtype=torch.float64)
