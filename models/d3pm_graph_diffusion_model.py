@@ -123,7 +123,7 @@ class Graph_Diffusion_Model(nn.Module):
             None
         """
         torch.autograd.set_detect_anomaly(True)
-        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, edge_features=self.edge_features, device=self.device)
+        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, edge_features=self.edge_features, device=self.device, avg_future_len=self.avg_future_len)
         def model_fn(x, edge_index, t, indices=None):
             if self.model_config['name'] == 'edge_encoder_mlp':
                 return self.model.forward(x, t=t, indices=indices)
@@ -303,7 +303,8 @@ class Graph_Diffusion_Model(nn.Module):
                                                  num_edges=self.num_edges, 
                                                  future_len=self.future_len,
                                                  edge_features=self.edge_features,
-                                                 device=self.device).p_sample_loop(model_fn=model_fn,
+                                                 device=self.device,
+                                                 avg_future_len=self.avg_future_len).p_sample_loop(model_fn=model_fn,
                                                                                    shape=(bs, self.num_edges),
                                                                                    edge_features=edge_features,
                                                                                    edge_index=edge_index,
@@ -328,7 +329,8 @@ class Graph_Diffusion_Model(nn.Module):
                                                     num_edges=self.num_edges, 
                                                     future_len=self.future_len,
                                                     edge_features=self.edge_features,
-                                                    device=self.device).p_sample_loop(model_fn=model_fn,
+                                                    device=self.device,
+                                                    avg_future_len=self.avg_future_len).p_sample_loop(model_fn=model_fn,
                                                                                     shape=(bs, self.num_edges), 
                                                                                     edge_features=edge_features,
                                                                                     edge_index=edge_index,
@@ -384,7 +386,7 @@ class Graph_Diffusion_Model(nn.Module):
                     torch.save(valid_ids, save_path + f'valid_ids_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                     
                 torch.save(ground_truth_hist, save_path + f'gt_hist_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
-                torch.save(ground_truth_fut, save_path + f'gt_hist_fut_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                torch.save(ground_truth_fut, save_path + f'gt_fut_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
             else:
                 ### TODO: Debugging ###
                 # ground_truth_fut is a list (of length len(val_dataloader)) of tensors with shape (batch_size, future_len)
@@ -416,7 +418,7 @@ class Graph_Diffusion_Model(nn.Module):
         
         else:
             raise NotImplementedError(task)
-    
+
     def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=None, return_samples=False):
         """
         Evaluate the model's performance.
@@ -442,16 +444,11 @@ class Graph_Diffusion_Model(nn.Module):
                 def is_connected_sequence(edge_indices, graph):
                     if len(edge_indices) <= 1:
                         return True
-                    edges = self.train_dataset.indexed_edges
-                    subgraph_nodes = set()
-                    for idx in edge_indices:
-                        edge = edges[idx][0]  # get the node tuple for each edge
-                        subgraph_nodes.update(edge)
+                    edges = [self.train_dataset.indexed_edges[idx][0] for idx in edge_indices]  # Adjust this if your graph structure differs
 
-                    # Create a subgraph with these nodes
-                    subgraph = graph.subgraph(subgraph_nodes)
-
-                    # Check if the subgraph is connected
+                    # Create a subgraph from these edges
+                    subgraph = nx.Graph()
+                    subgraph.add_edges_from(edges)
                     return nx.is_connected(subgraph)
 
                 # Check acyclical
@@ -830,12 +827,16 @@ class Graph_Diffusion_Model(nn.Module):
                         ade = 0
                         fde = 0
                     elif len(pred) == 0 and len(gt_fut) > 0:
+                        if len(gt_fut_nodes) == 0:
+                            continue
                         for i in range(len(gt_fut)):
                             ade += torch.norm(self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i+1]][1]['pos'])
                         ade /= len(gt_fut)
                         fde = torch.norm(self.train_dataset.nodes[end_point][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
                     elif len(pred) > 0 and len(gt_fut) == 0:
                         if valid is not None:
+                            if len(gt_fut_nodes) == 0:
+                                continue
                             pred_save = pred
                             pred_length = len(pred)
                             closest_node = None
@@ -857,6 +858,8 @@ class Graph_Diffusion_Model(nn.Module):
                         ade /= pred_length
                     elif len(pred) > 0 and len(gt_fut) > 0:
                         if valid is not None:
+                            if len(gt_fut_nodes) == 0:
+                                continue
                             if len(pred) > len(gt_fut):
                                 pred_save = pred
                                 pred_length = len(pred)
@@ -908,7 +911,10 @@ class Graph_Diffusion_Model(nn.Module):
         
         if number_samples == 1:
             valid_sample_ratio = get_valid_samples(sample_list, number_samples)
-            fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
+            if self.future_len > 0:
+                fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
+            else:
+                fut_ratio = 0
             tpr = calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary)
             prec = calculate_sample_prec(sample_binary_list, ground_truth_fut_binary)
             f1 = calculate_sample_f1(tpr, prec)
@@ -919,8 +925,10 @@ class Graph_Diffusion_Model(nn.Module):
             return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, ade, fde
         elif number_samples > 1:
             valid_samples, binary_valid_samples, valid_ids, valid_sample_ratio = get_valid_samples(sample_list, number_samples)
-            
-            fut_ratio = calculate_fut_ratio(valid_samples, ground_truth_fut)
+            if self.future_len > 0:
+                fut_ratio = calculate_fut_ratio(valid_samples, ground_truth_fut)
+            else:
+                fut_ratio = 0
             tpr = calculate_sample_tpr(binary_valid_samples, ground_truth_fut_binary)
             prec = calculate_sample_prec(binary_valid_samples, ground_truth_fut_binary)
             f1 = calculate_sample_f1(tpr, prec)
@@ -967,6 +975,7 @@ class Graph_Diffusion_Model(nn.Module):
         print("Loading Training Dataset...")
         # self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
         self.train_dataset = TrajectoryGeoDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.avg_future_len = self.train_dataset.avg_future_len
         self.G = self.train_dataset.build_graph()
         self.nodes = self.G.nodes
         self.edges = self.G.edges(data=True)
@@ -985,6 +994,8 @@ class Graph_Diffusion_Model(nn.Module):
         if 'edge_angles' in self.edge_features:
             self.num_edge_features += 1
         if 'num_pred_edges' in self.edge_features:
+            self.num_edge_features += 1
+        if 'future_len' in self.edge_features:
             self.num_edge_features += 1
         self.train_data_loader = DataLoader(self.train_dataset, 
                                             batch_size=self.batch_size, 

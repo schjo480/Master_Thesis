@@ -12,7 +12,7 @@ slurm:
     gres: gpu:1     # num GPUs
     mem: 64G          # memory
     cpus-per-task: 8  # num cores
-    time: 1-03:00     # max time, D-HH:MM
+    time: 0-22:00     # max time, D-HH:MM
 
 fixed:
   data:
@@ -50,7 +50,7 @@ fixed:
     gradient_accumulation: False
     gradient_accumulation_steps: 1
     learning_rate_warmup_steps: 40 
-    num_epochs: 70
+    num_epochs: 50
     lr_decay: 0.99 # previously 0.9999
     log_loss_every_steps: 1
     log_metrics_every_steps: 2
@@ -78,27 +78,27 @@ grid:
   data.future_len:
     type: choice
     options:
+      #- 0 #for longest future, only in combination with 'future_len' in edge features
       - 2
-      - 5
+      #- 5
       - 10
   data.edge_features:
     type: choice
     options:
-      #- ['one_hot_edges', 'coordinates']
+      - ['one_hot_edges', 'coordinates']
       - ['one_hot_edges', 'coordinates', 'pos_encoding']
-      # - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
-      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
-      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
-      #- ['one_hot_edges', 'pw_distance', 'edge_length', 'edge_angles']
-      #- ['coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
-      # - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
+      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       
   diffusion_config.type:
     type: choice
     options:
-      # - 'linear'
+      - 'linear'
       - 'cosine'
   model.transition_mat_type:
     type: choice
