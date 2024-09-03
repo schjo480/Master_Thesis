@@ -912,7 +912,10 @@ class Graph_Diffusion_Model(nn.Module):
         
         if number_samples == 1:
             valid_sample_ratio = get_valid_samples(sample_list, number_samples)
-            fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
+            if self.future_len > 0:
+                fut_ratio = calculate_fut_ratio(sample_list, ground_truth_fut)
+            else:
+                fut_ratio = 0
             tpr = calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary)
             prec = calculate_sample_prec(sample_binary_list, ground_truth_fut_binary)
             f1 = calculate_sample_f1(tpr, prec)
@@ -923,8 +926,10 @@ class Graph_Diffusion_Model(nn.Module):
             return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, ade, fde
         elif number_samples > 1:
             valid_samples, binary_valid_samples, valid_ids, valid_sample_ratio = get_valid_samples(sample_list, number_samples)
-            
-            fut_ratio = calculate_fut_ratio(valid_samples, ground_truth_fut)
+            if self.future_len > 0:
+                fut_ratio = calculate_fut_ratio(valid_samples, ground_truth_fut)
+            else:
+                fut_ratio = 0
             tpr = calculate_sample_tpr(binary_valid_samples, ground_truth_fut_binary)
             prec = calculate_sample_prec(binary_valid_samples, ground_truth_fut_binary)
             f1 = calculate_sample_f1(tpr, prec)
@@ -976,7 +981,10 @@ class Graph_Diffusion_Model(nn.Module):
         self.nodes = self.G.nodes
         self.edges = self.G.edges(data=True)
         self.num_edges = self.G.number_of_edges()
-        self.num_edge_features = 2  # Binary History and noised binary future
+        if 'one_hot_edges' in self.edge_features:
+            self.num_edge_features = 2  # Binary History and noised binary future
+        else:
+            self.num_edge_features = 1
         if 'coordinates' in self.edge_features:
             self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:
@@ -1217,6 +1225,7 @@ class TrajectoryGeoDataset(Dataset):
             connected_fut = True
         else:
             edges = [self.indexed_edges[idx][0] for idx in future_indices_check]  # Adjust this if your graph structure differs
+
             # Create a subgraph from these edges
             subgraph = nx.Graph()
             subgraph.add_edges_from(edges)
@@ -1238,6 +1247,8 @@ class TrajectoryGeoDataset(Dataset):
                 print("History not connected")
             if not connected_fut:
                 print("Future not connected")
+            print("History indices:", history_indices)
+            print("Future indices:", future_indices_check)
             self.ct += 1
             self.__getitem__((idx + 1) % len(self.trajectories))
             
@@ -1303,11 +1314,13 @@ class TrajectoryGeoDataset(Dataset):
             if torch.isnan(cosines).any():
                 cosines = torch.nan_to_num(cosines, nan=0.0)
         if 'future_len' in self.edge_features:
-            future_len = torch.tensor([traj_len / self.longest_future], device=self.device).float().repeat(self.num_edges).unsqueeze(1)
-            history_edge_features = torch.cat((history_edge_features, future_len), dim=1)
+            future_len_feature = torch.tensor([traj_len / self.longest_future], device=self.device).float().repeat(self.num_edges).unsqueeze(1)
+            history_edge_features = torch.cat((history_edge_features, future_len_feature), dim=1)
             
         history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
         history_edge_features = torch.nan_to_num(history_edge_features, nan=0.0)
+        if 'one_hot_edges' not in self.edge_features:
+            history_edge_features = history_edge_features[:, 1:]
         
         return history_edge_features, future_edge_features
     
@@ -2568,7 +2581,7 @@ data_config = {"dataset": "synthetic_20_traj",
     "history_len": 5,
     "future_len": 0,
     "num_classes": 2,
-    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'future_len'] # , 'road_type'
+    "edge_features": ['coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'future_len'] # , 'road_type'
     }
 
 diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'

@@ -980,7 +980,10 @@ class Graph_Diffusion_Model(nn.Module):
         self.nodes = self.G.nodes
         self.edges = self.G.edges(data=True)
         self.num_edges = self.G.number_of_edges()
-        self.num_edge_features = 2  # Binary History and noised binary future
+        if 'one_hot_edges' in self.edge_features:
+            self.num_edge_features = 2  # Binary History and noised binary future
+        else:
+            self.num_edge_features = 1
         if 'coordinates' in self.edge_features:
             self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:

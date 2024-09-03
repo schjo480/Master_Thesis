@@ -274,6 +274,8 @@ class TrajectoryGeoDataset(Dataset):
             
         history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
         history_edge_features = torch.nan_to_num(history_edge_features, nan=0.0)
+        if 'one_hot_edges' not in self.edge_features:
+            history_edge_features = history_edge_features[:, 1:]
         
         return history_edge_features, future_edge_features
     
