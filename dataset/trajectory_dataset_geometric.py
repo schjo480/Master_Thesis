@@ -99,48 +99,64 @@ class TrajectoryGeoDataset(Dataset):
         future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
         future_indices_check = future_indices[future_indices >= 0]
         
-        # Check if datapoint is valid
-        # 1. Check if history and future are connected
-        edges = [self.indexed_edges[idx][0] for idx in torch.cat((history_indices, future_indices_check), dim=0)]  # Adjust this if your graph structure differs
+        if self.history_len > 0:
+            # Check if datapoint is valid
+            # 1. Check if history and future are connected
+            edges = [self.indexed_edges[idx][0] for idx in torch.cat((history_indices, future_indices_check), dim=0)]  # Adjust this if your graph structure differs
 
-        # Create a subgraph from these edges
-        subgraph = nx.Graph()
-        subgraph.add_edges_from(edges)
-        connected = nx.is_connected(subgraph)
-        
-        # 2. Check if neither history nor future contain loops
-        if len(future_indices_check) <= 1:
-            acyclic_fut = True
-        else:
+            # Create a subgraph from these edges
+            subgraph = nx.Graph()
+            subgraph.add_edges_from(edges)
+            connected = nx.is_connected(subgraph)
+            
+            # 2. Check if neither history nor future contain loops
+            if len(future_indices_check) <= 1:
+                acyclic_fut = True
+            else:
+                subgraph_nodes = []
+                subgraph_edges = []
+                for idx in future_indices_check:
+                    edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                    subgraph_nodes.append(edge)
+                    subgraph_edges.append(edge)
+                subgraph = nx.Graph()
+                subgraph.add_edges_from(subgraph_edges)
+                has_cycle = nx.cycle_basis(subgraph)
+                acyclic_fut = len(has_cycle) == 0
+            
             subgraph_nodes = []
             subgraph_edges = []
-            for idx in future_indices_check:
+            for idx in history_indices:
                 edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
                 subgraph_nodes.append(edge)
                 subgraph_edges.append(edge)
             subgraph = nx.Graph()
             subgraph.add_edges_from(subgraph_edges)
             has_cycle = nx.cycle_basis(subgraph)
-            acyclic_fut = len(has_cycle) == 0
-        
-        subgraph_nodes = []
-        subgraph_edges = []
-        for idx in history_indices:
-            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
-            subgraph_nodes.append(edge)
-            subgraph_edges.append(edge)
-        subgraph = nx.Graph()
-        subgraph.add_edges_from(subgraph_edges)
-        has_cycle = nx.cycle_basis(subgraph)
-        acyclic_hist = len(has_cycle) == 0
-        
-        # 3. Check if neither history nor future contain splits
-        if len(future_indices_check) <= 1:
-            no_splits_fut = True
-        else:
+            acyclic_hist = len(has_cycle) == 0
+            
+            # 3. Check if neither history nor future contain splits
+            if len(future_indices_check) <= 1:
+                no_splits_fut = True
+            else:
+                subgraph_nodes = set()
+                subgraph_edges = []
+                for idx in future_indices_check:
+                    edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
+                    subgraph_nodes.update(edge)
+                    subgraph_edges.append(edge)
+                # Create a directed version of the subgraph to check for cycles
+                subgraph = nx.Graph()
+                subgraph.add_nodes_from(subgraph_nodes)
+                subgraph.add_edges_from(subgraph_edges)
+                if any(subgraph.degree(node) > 2 for node in subgraph.nodes()):
+                    no_splits_fut = False
+                else:
+                    no_splits_fut = True
+            
             subgraph_nodes = set()
             subgraph_edges = []
-            for idx in future_indices_check:
+            for idx in history_indices:
                 edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
                 subgraph_nodes.update(edge)
                 subgraph_edges.append(edge)
@@ -149,66 +165,62 @@ class TrajectoryGeoDataset(Dataset):
             subgraph.add_nodes_from(subgraph_nodes)
             subgraph.add_edges_from(subgraph_edges)
             if any(subgraph.degree(node) > 2 for node in subgraph.nodes()):
-                no_splits_fut = False
+                no_splits_hist = False
             else:
-                no_splits_fut = True
-        
-        subgraph_nodes = set()
-        subgraph_edges = []
-        for idx in history_indices:
-            edge = self.indexed_edges[idx][0]  # get the node tuple for each edge
-            subgraph_nodes.update(edge)
-            subgraph_edges.append(edge)
-        # Create a directed version of the subgraph to check for cycles
-        subgraph = nx.Graph()
-        subgraph.add_nodes_from(subgraph_nodes)
-        subgraph.add_edges_from(subgraph_edges)
-        if any(subgraph.degree(node) > 2 for node in subgraph.nodes()):
-            no_splits_hist = False
-        else:
-            no_splits_hist = True
-        
-        # 4. Check if history is connected and future is connected
-        edges = [self.indexed_edges[idx][0] for idx in history_indices]  # Adjust this if your graph structure differs
-
-        # Create a subgraph from these edges
-        subgraph = nx.Graph()
-        subgraph.add_edges_from(edges)
-        connected_hist = nx.is_connected(subgraph)
-        
-        if len(future_indices_check) <= 1:
-            connected_fut = True
-        else:
-            edges = [self.indexed_edges[idx][0] for idx in future_indices_check]  # Adjust this if your graph structure differs
+                no_splits_hist = True
+            
+            # 4. Check if history is connected and future is connected
+            edges = [self.indexed_edges[idx][0] for idx in history_indices]  # Adjust this if your graph structure differs
 
             # Create a subgraph from these edges
             subgraph = nx.Graph()
             subgraph.add_edges_from(edges)
-            connected_fut = nx.is_connected(subgraph)
-        
-        if not (connected and acyclic_fut and acyclic_hist and no_splits_fut and no_splits_hist and connected_hist and connected_fut):
-            print("Invalid trajectory, skipping...")
-            if not connected:
-                print("History and Future not connected")
-            if not acyclic_fut:
-                print("Future contains a cycle")
-            if not acyclic_hist:
-                print("History contains a cycle")
-            if not no_splits_fut:
-                print("Future contains a split")
-            if not no_splits_hist:
-                print("History contains a split")
-            if not connected_hist:
-                print("History not connected")
-            if not connected_fut:
-                print("Future not connected")
-            print("History indices:", history_indices)
-            print("Future indices:", future_indices_check)
-            self.ct += 1
-            self.__getitem__((idx + 1) % len(self.trajectories))
+            connected_hist = nx.is_connected(subgraph)
             
+            if len(future_indices_check) <= 1:
+                connected_fut = True
+            else:
+                edges = [self.indexed_edges[idx][0] for idx in future_indices_check]  # Adjust this if your graph structure differs
+
+                # Create a subgraph from these edges
+                subgraph = nx.Graph()
+                subgraph.add_edges_from(edges)
+                connected_fut = nx.is_connected(subgraph)
+            
+            if not (connected and acyclic_fut and acyclic_hist and no_splits_fut and no_splits_hist and connected_hist and connected_fut):
+                #print("Invalid trajectory, skipping...")
+                if not connected:
+                    print("History and Future not connected")
+                if not acyclic_fut:
+                    print("Future contains a cycle")
+                if not acyclic_hist:
+                    print("History contains a cycle")
+                if not no_splits_fut:
+                    print("Future contains a split")
+                if not no_splits_hist:
+                    print("History contains a split")
+                if not connected_hist:
+                    print("History not connected")
+                if not connected_fut:
+                    print("Future not connected")
+                #print("History indices:", history_indices)
+                #print("Future indices:", future_indices_check)
+                self.ct += 1
+                self.__getitem__((idx + 1) % len(self.trajectories))
+        else:
+            # Check if datapoint is valid
+            # 1. Check if history and future are connected
+            edges = [self.indexed_edges[idx][0] for idx in edge_idxs]  # Adjust this if your graph structure differs
+
+            # Create a subgraph from these edges
+            subgraph = nx.Graph()
+            subgraph.add_edges_from(edges)
+            connected = nx.is_connected(subgraph)
+            if not connected:
+                self.ct += 1
+                self.__getitem__((idx + 1) % len(self.trajectories))
         # Extract and generate features
-        history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, traj_len, self.edge_coordinates)
+        history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, traj_len, edge_idxs)
         data = MyData(x=history_edge_features,          # (batch_size * num_edges, num_edge_features)
                     edge_index=self.edge_index,         # (2, num_edges)
                     y=future_edge_features,             # (batch_size, num_edges, 1)
@@ -218,10 +230,12 @@ class TrajectoryGeoDataset(Dataset):
         
         return data
 
-    def generate_edge_features(self, history_indices, future_indices, traj_len, history_edge_orientations=None, future_edge_orientations=None):
+    def generate_edge_features(self, history_indices, future_indices, traj_len, edge_idxs):
         # Binary on/off edges
         valid_history_mask = history_indices >= 0
         valid_future_mask = future_indices >= 0
+        '''if 'start_end' in self.edge_features:
+            valid_future_mask = valid_future_mask[1:-1]'''
         
         history_one_hot_edges = torch.nn.functional.one_hot(history_indices[valid_history_mask], num_classes=len(self.edges))
         future_one_hot_edges = torch.nn.functional.one_hot(future_indices[valid_future_mask], num_classes=len(self.edges))
@@ -233,45 +247,95 @@ class TrajectoryGeoDataset(Dataset):
         # Basic History edge features = coordinates, binary encoding
         history_edge_features = history_one_hot_edges.view(-1, 1).float()
         future_edge_features = future_one_hot_edges.view(-1, 1).float()
-        if 'coordinates' in self.edge_features:
-            history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
-        if 'edge_orientations' in self.edge_features:
-            history_edge_features = torch.cat((history_edge_features, history_edge_orientations.float()), dim=1)
-        if 'road_type' in self.edge_features:
-            history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
-        if 'pw_distance' in self.edge_features:
-            last_history_edge_coords = self.edge_coordinates[history_indices[-1]]
-            edge_middles = (self.edge_coordinates[:, 0, :] + self.edge_coordinates[:, 1, :]) / 2
-            last_history_edge_middle = (last_history_edge_coords[0, :] + last_history_edge_coords[1, :]) / 2  # Last edge in the history_indices
-            distances = torch.norm(edge_middles - last_history_edge_middle, dim=1, keepdim=True)
-            history_edge_features = torch.cat((history_edge_features, distances.float()), dim=1)
-        if 'edge_length' in self.edge_features:
-            edge_lengths = torch.norm(self.edge_coordinates[:, 0, :] - self.edge_coordinates[:, 1, :], dim=1, keepdim=True)
-            history_edge_features = torch.cat((history_edge_features, edge_lengths.float()), dim=1)
-        if 'edge_angles' in self.edge_features:
-            start, end = self.find_trajectory_endpoints(history_indices)
-            v1 = end - start
-            starts = self.edge_coordinates[:, 0, :]
-            ends = self.edge_coordinates[:, 1, :]
-            vectors = ends - starts
-            
-            # Calculate the dot product of v1 with each vector
-            dot_products = torch.sum(v1 * vectors, dim=1)
-            
-            # Calculate magnitudes of v1 and all vectors
-            v1_mag = torch.norm(v1)
-            vector_mags = torch.norm(vectors, dim=1)
-            
-            # Calculate the cosine of the angles
-            cosines = dot_products / (v1_mag * vector_mags)
-            cosines = cosines.unsqueeze(1)
-            history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
-            if torch.isnan(cosines).any():
-                cosines = torch.nan_to_num(cosines, nan=0.0)
-        if 'future_len' in self.edge_features:
-            future_len_feature = torch.tensor([traj_len / self.longest_future], device=self.device).float().repeat(self.num_edges).unsqueeze(1)
-            history_edge_features = torch.cat((history_edge_features, future_len_feature), dim=1)
-            
+        if 'start_end' in self.edge_features:
+            start_edge = edge_idxs[0]
+            end_edge = edge_idxs[edge_idxs >= 0][-1]
+            start_node, end_node = self.find_trajectory_endpoints(edge_idxs[edge_idxs >= 0])
+            if self.edge_coordinates[start_edge][0][0] == start_node[0] and self.edge_coordinates[start_edge][0][1] == start_node[1]:
+                history_edge_features[start_edge, 0] = 1
+            else:
+                history_edge_features[start_edge, 0] = -1
+            if self.edge_coordinates[start_edge][1][0] == end_node[0] and self.edge_coordinates[start_edge][1][1] == end_node[1]:
+                history_edge_features[end_edge, 0] = 1
+            else:
+                history_edge_features[end_edge, 0] = -1    
+                
+                    
+            if 'coordinates' in self.edge_features:
+                history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            if 'road_type' in self.edge_features:
+                history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
+            if 'pw_distance' in self.edge_features:
+                start_edge_coords = self.edge_coordinates[start_edge]
+                end_edge_coords = self.edge_coordinates[end_edge]
+                edge_middles = (self.edge_coordinates[:, 0, :] + self.edge_coordinates[:, 1, :]) / 2
+                start_edge_middle = (start_edge_coords[0, :] + start_edge_coords[1, :]) / 2
+                end_edge_middle = (end_edge_coords[0, :] + end_edge_coords[1, :]) / 2
+                start_distances = torch.norm(edge_middles - start_edge_middle, dim=1, keepdim=True)
+                end_distances = torch.norm(edge_middles - end_edge_middle, dim=1, keepdim=True)
+                history_edge_features = torch.cat((history_edge_features, start_distances.float(), end_distances.float()), dim=1)
+            if 'edge_length' in self.edge_features:
+                edge_lengths = torch.norm(self.edge_coordinates[:, 0, :] - self.edge_coordinates[:, 1, :], dim=1, keepdim=True)
+                history_edge_features = torch.cat((history_edge_features, edge_lengths.float()), dim=1)
+            if 'edge_angles' in self.edge_features:
+                start, end = self.find_trajectory_endpoints(edge_idxs[edge_idxs >= 0])
+                v1 = end - start
+                starts = self.edge_coordinates[:, 0, :]
+                ends = self.edge_coordinates[:, 1, :]
+                vectors = ends - starts
+                
+                # Calculate the dot product of v1 with each vector
+                dot_products = torch.sum(v1 * vectors, dim=1)
+                
+                # Calculate magnitudes of v1 and all vectors
+                v1_mag = torch.norm(v1)
+                vector_mags = torch.norm(vectors, dim=1)
+                
+                # Calculate the cosine of the angles
+                cosines = dot_products / (v1_mag * vector_mags)
+                cosines = cosines.unsqueeze(1)
+                history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
+                if torch.isnan(cosines).any():
+                    cosines = torch.nan_to_num(cosines, nan=0.0)
+
+        else:
+            if 'coordinates' in self.edge_features:
+                history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+            if 'road_type' in self.edge_features:
+                history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
+            if 'pw_distance' in self.edge_features:
+                last_history_edge_coords = self.edge_coordinates[history_indices[-1]]
+                edge_middles = (self.edge_coordinates[:, 0, :] + self.edge_coordinates[:, 1, :]) / 2
+                last_history_edge_middle = (last_history_edge_coords[0, :] + last_history_edge_coords[1, :]) / 2  # Last edge in the history_indices
+                distances = torch.norm(edge_middles - last_history_edge_middle, dim=1, keepdim=True)
+                history_edge_features = torch.cat((history_edge_features, distances.float()), dim=1)
+            if 'edge_length' in self.edge_features:
+                edge_lengths = torch.norm(self.edge_coordinates[:, 0, :] - self.edge_coordinates[:, 1, :], dim=1, keepdim=True)
+                history_edge_features = torch.cat((history_edge_features, edge_lengths.float()), dim=1)
+            if 'edge_angles' in self.edge_features:
+                start, end = self.find_trajectory_endpoints(history_indices)
+                v1 = end - start
+                starts = self.edge_coordinates[:, 0, :]
+                ends = self.edge_coordinates[:, 1, :]
+                vectors = ends - starts
+                
+                # Calculate the dot product of v1 with each vector
+                dot_products = torch.sum(v1 * vectors, dim=1)
+                
+                # Calculate magnitudes of v1 and all vectors
+                v1_mag = torch.norm(v1)
+                vector_mags = torch.norm(vectors, dim=1)
+                
+                # Calculate the cosine of the angles
+                cosines = dot_products / (v1_mag * vector_mags)
+                cosines = cosines.unsqueeze(1)
+                history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
+                if torch.isnan(cosines).any():
+                    cosines = torch.nan_to_num(cosines, nan=0.0)
+            if 'future_len' in self.edge_features:
+                future_len_feature = torch.tensor([traj_len / self.longest_future], device=self.device).float().repeat(self.num_edges).unsqueeze(1)
+                history_edge_features = torch.cat((history_edge_features, future_len_feature), dim=1)
+                
         history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
         history_edge_features = torch.nan_to_num(history_edge_features, nan=0.0)
         if 'one_hot_edges' not in self.edge_features:
