@@ -348,13 +348,13 @@ class Graph_Diffusion_Model(nn.Module):
                     
                     # Append the list of tensors for this batch to the main sample list
                     sample_list.append(current_samples)
+                    
                 else:
                     raise ValueError("Number of samples must be greater than 0.")
                 
                 ground_truth_hist.append(history_edge_indices.detach().to('cpu'))
                 ground_truth_fut.append(future_trajectory_indices.detach().to('cpu'))
                 ground_truth_fut_binary.append(future_binary.detach().to('cpu'))
-            
             if save:
                 features = ''
                 for feature in self.edge_features:
@@ -799,7 +799,7 @@ class Graph_Diffusion_Model(nn.Module):
 
             return node_sequence
         
-        def find_trajectory_endpoints(edge_sequence, edge_coordinates, indexed_edges):
+        def find_trajectory_endpoints(edge_sequence, edge_coordinates, indexed_edges, gt_fut=None):
             """
             Find the start and end points of a trajectory based on a sequence of edge indices,
             accounting for the direction and connection of edges.
@@ -813,6 +813,9 @@ class Graph_Diffusion_Model(nn.Module):
                 tuple: Start point and end point of the trajectory.
             """
             edges = [list(edge[0]) for edge in indexed_edges]
+            if len(edge_sequence) <= 1:
+                edge_sequence = torch.cat((edge_sequence, torch.tensor([gt_fut[0]])), 0)
+            
             # Get the coordinates of edges in the sequence
             trajectory_edges = edge_coordinates[edge_sequence]
             
@@ -842,9 +845,9 @@ class Graph_Diffusion_Model(nn.Module):
                     for idx in range(len(batched_gt_futs[batch_idx])):
                         preds = batched_preds[batch_idx]
                         gt_hist = batched_gt_hists[batch_idx][idx]
-                        start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
                         gt_fut_ = batched_gt_futs[batch_idx][idx]
                         gt_fut = gt_fut_[gt_fut_ != -1]
+                        start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges, gt_fut)
                         gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
                         
                         best_ade = 1
@@ -919,6 +922,7 @@ class Graph_Diffusion_Model(nn.Module):
                     for idx in range(len(batched_gt_futs[batch_idx])):
                         pred = batched_preds[batch_idx][idx]
                         pred_nodes = [indexed_edges[j][0] for j in pred]
+                        
                         unique_pred_nodes = set()
                         for node in pred_nodes:
                             unique_pred_nodes.update(node)  # Add both elements of the tuple to the set
@@ -926,11 +930,10 @@ class Graph_Diffusion_Model(nn.Module):
                         # Convert the set back to a list
                         unique_pred_nodes = list(unique_pred_nodes)
                         gt_hist = batched_gt_hists[batch_idx][idx]
-                        start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
                         gt_fut_ = batched_gt_futs[batch_idx][idx]
                         gt_fut = gt_fut_[gt_fut_ != -1]
+                        start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges, gt_fut)
                         gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
-                        
 
                         ade = 0
                         fde = 0
@@ -977,6 +980,7 @@ class Graph_Diffusion_Model(nn.Module):
                                 ade /= len(pred)
                             else:
                                 ade /= len(gt_fut)
+
                         ade_list.append(ade)
                         fde_list.append(fde)
                 return torch.mean(torch.tensor(ade_list)), torch.mean(torch.tensor(fde_list))
@@ -989,10 +993,10 @@ class Graph_Diffusion_Model(nn.Module):
                     pred = batched_preds[batch_idx][idx]
                     pred_nodes = [indexed_edges[j][0] for j in pred]
                     valid = valid_ids[batch_idx][idx]
-                    gt_hist = batched_gt_hists[batch_idx][idx]
-                    start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
+                    gt_hist = batched_gt_hists[batch_idx][idx]                    
                     gt_fut_ = batched_gt_futs[batch_idx][idx]
                     gt_fut = gt_fut_[gt_fut_ != -1]
+                    start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges, gt_fut)
                     gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
 
                     ade = 0
@@ -1172,7 +1176,10 @@ class Graph_Diffusion_Model(nn.Module):
         if 'road_type' in self.edge_features:
             self.num_edge_features += self.train_dataset.num_road_types
         if 'pw_distance' in self.edge_features:
-            self.num_edge_features += 1
+            if 'start_end' in self.edge_features:
+                self.num_edge_features += 2
+            else:
+                self.num_edge_features += 1
         if 'edge_length' in self.edge_features:
             self.num_edge_features += 1
         if 'edge_angles' in self.edge_features:
