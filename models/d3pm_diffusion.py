@@ -694,3 +694,4 @@ class CategoricalDiffusion:
             raise NotImplementedError(self.loss_type)
 
         return losses
+    

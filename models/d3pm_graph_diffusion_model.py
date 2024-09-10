@@ -14,6 +14,7 @@ import time
 import wandb
 import networkx as nx
 
+
 class Graph_Diffusion_Model(nn.Module):
     def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model, pretrained=False):
         super(Graph_Diffusion_Model, self).__init__()
@@ -373,7 +374,7 @@ class Graph_Diffusion_Model(nn.Module):
                     wandb.log({"One-Shot FDE": fde})
                 elif number_samples > 1:
                     torch.save(sample_list, save_path + f'samples_raw_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
-                    fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, valid_samples, valid_ids, ade, fde = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=number_samples)
+                    fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, valid_samples, valid_ids, ade, fde, best_f1, best_tpr, best_ade, best_fde = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=number_samples)
                     wandb.log({"Valid Sample F1 Score": f1})
                     wandb.log({"Valid Sample Accuracy": acc})
                     wandb.log({"Valid Sample TPR": tpr})
@@ -382,6 +383,10 @@ class Graph_Diffusion_Model(nn.Module):
                     wandb.log({"Valid Sample Valid sample ratio": valid_sample_ratio})
                     wandb.log({"Valid Sample ADE": ade})
                     wandb.log({"Valid Sample FDE": fde})
+                    wandb.log({"Best Sample F1 Score": best_f1})
+                    wandb.log({"Best Sample TPR": best_tpr})
+                    wandb.log({"Best Sample ADE": best_ade})
+                    wandb.log({"Best Sample FDE": best_fde})
                     torch.save(valid_samples, save_path + f'samples_valid_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                     torch.save(valid_ids, save_path + f'valid_ids_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                     
@@ -591,7 +596,7 @@ class Graph_Diffusion_Model(nn.Module):
                 ratios = {n: 0 for n in counts}
             return ratios
         
-        def calculate_sample_f1(tpr, prec):
+        def calculate_sample_f1(tpr, prec, best=False):
             """
             Calculates the F1 score for a given list of samples and ground truth futures.
 
@@ -603,13 +608,21 @@ class Graph_Diffusion_Model(nn.Module):
                 float: The F1 score.
 
             """
-            if (prec + tpr) > 0:
-                f1_score = 2 * (prec * tpr) / (prec + tpr)
+            if best:
+                best_f1_scores = []
+                for recall_set, precision_set in zip(tpr, prec):
+                    for r_values, p_values in zip(recall_set, precision_set):
+                        f1_scores = [2 * r * p / (r + p) if (r + p) != 0 else 0 for r, p in zip(r_values, p_values)]
+                        best_f1_scores.append(max(f1_scores))
+                return sum(best_f1_scores) / len(best_f1_scores)
             else:
-                f1_score = 0
-            return f1_score
+                if (prec + tpr) > 0:
+                    f1_score = 2 * (prec * tpr) / (prec + tpr)
+                else:
+                    f1_score = 0
+                return f1_score
         
-        def calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary):
+        def calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary, valid_id=None, valid=False):
             """
             Calculate the accuracy of the samples.
 
@@ -620,14 +633,23 @@ class Graph_Diffusion_Model(nn.Module):
             Returns:
                 float: The accuracy of the samples.
             """
-            acc = 0
-            for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
-                ground_truth = ground_truth_sublist.flatten()
-                sample = sample_sublist.flatten()
-                acc += torch.sum(sample == ground_truth).item() / ground_truth.size(0)
-            return acc / len(self.val_dataloader)
+            if valid:
+                acc = []
+                for i, (sample_sublist, ground_truth_sublist) in enumerate(zip(sample_binary_list, ground_truth_fut_binary)):
+                    for j, (sample, ground_truth) in enumerate(zip(sample_sublist, ground_truth_sublist)):
+                        if valid_id[i][j] is not None:
+                            if torch.sum(sample) > 0:
+                                acc.append(torch.sum(sample * ground_truth).item() / self.num_edges)
+                return sum(acc) / len(acc)
+            else:
+                acc = 0
+                for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
+                    ground_truth = ground_truth_sublist.flatten()
+                    sample = sample_sublist.flatten()
+                    acc += torch.sum(sample == ground_truth).item() / ground_truth.size(0)
+                return acc / len(self.val_dataloader)
         
-        def calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary):
+        def calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary, valid_id=None, valid=False, best=False):
             """
             Calculate the true positive rate of the samples.
 
@@ -638,24 +660,90 @@ class Graph_Diffusion_Model(nn.Module):
             Returns:
                 float: The true positive rate of the samples.
             """
-            tpr = 0
-            for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
-                ground_truth = ground_truth_sublist.flatten()
-                sample = sample_sublist.flatten()
-                if torch.sum(ground_truth) > 0:
-                    tpr += torch.sum(sample * ground_truth).item() / torch.sum(ground_truth).item()
-            return tpr / len(self.val_dataloader)
+            if valid:
+                tpr = []
+                for i, (sample_sublist, ground_truth_sublist) in enumerate(zip(sample_binary_list, ground_truth_fut_binary)):
+                    for j, (sample, ground_truth) in enumerate(zip(sample_sublist, ground_truth_sublist)):
+                        if valid_id[i][j] is not None:
+                            if torch.sum(sample) > 0:
+                                tpr.append(torch.sum(sample * ground_truth).item() / torch.sum(ground_truth).item())
+                return sum(tpr) / len(tpr)
+            else:
+                all_tprs = []
+                if best:
+                    tpr = []
+                    for i in range(len(sample_binary_list)):
+                        batch_tpr = []
+                        transposed_data = list(zip(*sample_binary_list[i]))
+                        for j in range(len(transposed_data)):
+                            preds = transposed_data[j]
+                            best_tpr = 0
+                            tpr_sublist = []
+                            for sample in preds:
+                                if torch.sum(ground_truth_fut_binary[i][j]) > 0:
+                                    tpr_int = torch.sum(sample * ground_truth_fut_binary[i][j]).item() / torch.sum(ground_truth_fut_binary[i][j]).item()
+                                else:
+                                    tpr_int = 0
+                                
+                                tpr_sublist.append(tpr_int)
+                                if tpr_int > best_tpr:
+                                    best_tpr = tpr_int
+                            tpr.append(best_tpr)
+                            batch_tpr.append(tpr_sublist)
+                        all_tprs.append(batch_tpr)
+                    return sum(tpr) / len(tpr), all_tprs
+                else:
+                    tpr = 0
+                    for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
+                        ground_truth = ground_truth_sublist.flatten()
+                        sample = sample_sublist.flatten()
+                        if torch.sum(ground_truth) > 0:
+                            tpr += torch.sum(sample * ground_truth).item() / torch.sum(ground_truth).item()
+                    return tpr / len(self.val_dataloader)
         
-        def calculate_sample_prec(sample_binary_list, ground_truth_fut_binary):
-            prec = 0
-            for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
-                ground_truth = ground_truth_sublist.flatten()
-                sample = sample_sublist.flatten()
-                if torch.sum(sample) > 0:
-                    prec += torch.sum(sample * ground_truth).item() / torch.sum(sample).item()
-            return prec / len(self.val_dataloader)
+        def calculate_sample_prec(sample_binary_list, ground_truth_fut_binary, valid_id=None, valid=False, best=False):
+            if valid:
+                prec = []
+                for i, (sample_sublist, ground_truth_sublist) in enumerate(zip(sample_binary_list, ground_truth_fut_binary)):
+                    for j, (sample, ground_truth) in enumerate(zip(sample_sublist, ground_truth_sublist)):
+                        if valid_id[i][j] is not None:
+                            if torch.sum(sample) > 0:
+                                prec.append(torch.sum(sample * ground_truth).item() / torch.sum(sample).item())
+                return sum(prec) / len(prec)
+            else:
+                all_prec = []
+                if best:
+                    prec = []
+                    for i in range(len(sample_binary_list)):
+                        batch_prec = []
+                        transposed_data = list(zip(*sample_binary_list[i]))
+                        for j in range(len(transposed_data)):
+                            preds = transposed_data[j]
+                            best_prec = 0
+                            prec_sublist = []
+                            for sample in preds:
+                                if torch.sum(sample) > 0:
+                                    prec_int = torch.sum(sample * ground_truth_fut_binary[i][j]).item() / torch.sum(sample).item()
+                                else:
+                                    prec_int = 0
+                                
+                                prec_sublist.append(prec_int)
+                                if prec_int > best_prec:
+                                    best_prec = prec_int
+                            prec.append(best_prec)
+                            batch_prec.append(prec_sublist)
+                        all_prec.append(batch_prec)
+                    return sum(prec) / len(prec), all_prec
+                else:
+                    prec = 0
+                    for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
+                        ground_truth = ground_truth_sublist.flatten()
+                        sample = sample_sublist.flatten()
+                        if torch.sum(sample) > 0:
+                            prec += torch.sum(sample * ground_truth).item() / torch.sum(sample).item()
+                    return prec / len(self.val_dataloader)
         
-        def calculate_avg_sample_length(sample_list):
+        def calculate_avg_sample_length(sample_list, valid_id=None, valid=False):
             """
             Calculate the average sample length.
 
@@ -665,11 +753,21 @@ class Graph_Diffusion_Model(nn.Module):
             Returns:
                 float: The average sample length.
             """
-            total_len = 0
-            for sample_sublist in sample_list:
-                for sample in sample_sublist:
-                    total_len += len(sample) / len(sample_sublist)
-            return total_len / len(self.val_dataloader)
+            if valid:
+                total_len = 0
+                ct = 0
+                for i, sample_sublist in enumerate(sample_list):
+                    for j, sample in enumerate(sample_sublist):
+                        if valid_id[i][j] is not None:
+                            total_len += len(sample)
+                            ct += 1
+                return total_len / ct
+            else:
+                total_len = 0
+                for sample_sublist in sample_list:
+                    for sample in sample_sublist:
+                        total_len += len(sample) / len(sample_sublist)
+                return total_len / len(self.val_dataloader)
         
         def build_node_sequence(edge_sequence, indexed_edges, start_point):
             # Convert list of tuples to a tensor of shape [num_edges, 2]
@@ -736,74 +834,152 @@ class Graph_Diffusion_Model(nn.Module):
             
             return start_point_coord, end_point_coord, start_point, end_point
         
-        def calculate_ade_fde(batched_preds, batched_gt_futs, batched_gt_hists, edge_coordinates, indexed_edges):
-            ade_list = []
-            fde_list = []
-            for batch_idx in tqdm(range(len(batched_gt_futs))):
-                for idx in range(len(batched_gt_futs[batch_idx])):
-                    pred = batched_preds[batch_idx][idx]
-                    pred_nodes = [indexed_edges[j][0] for j in pred]
-                    unique_pred_nodes = set()
-                    for node in pred_nodes:
-                        unique_pred_nodes.update(node)  # Add both elements of the tuple to the set
+        def calculate_ade_fde(batched_preds, batched_gt_futs, batched_gt_hists, edge_coordinates, indexed_edges, best=False):
+            if best:
+                ade_list = []
+                fde_list = []
+                for batch_idx in tqdm(range(len(batched_gt_futs))):
+                    for idx in range(len(batched_gt_futs[batch_idx])):
+                        preds = batched_preds[batch_idx]
+                        gt_hist = batched_gt_hists[batch_idx][idx]
+                        start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
+                        gt_fut_ = batched_gt_futs[batch_idx][idx]
+                        gt_fut = gt_fut_[gt_fut_ != -1]
+                        gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
+                        
+                        best_ade = 1
+                        best_fde = 1
+                        for pred in preds:
+                            ade = 0
+                            fde = 0
+                            sample = pred[idx]
+                            pred_nodes = [indexed_edges[j][0] for j in sample]
+                            unique_pred_nodes = set()
+                            for node in pred_nodes:
+                                unique_pred_nodes.update(node)  # Add both elements of the tuple to the set
+                            # Convert the set back to a list
+                            unique_pred_nodes = list(unique_pred_nodes)
 
-                    # Convert the set back to a list
-                    unique_pred_nodes = list(unique_pred_nodes)
-                    gt_hist = batched_gt_hists[batch_idx][idx]
-                    start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
-                    gt_fut_ = batched_gt_futs[batch_idx][idx]
-                    gt_fut = gt_fut_[gt_fut_ != -1]
-                    gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
-                    
+                            if len(gt_fut) == 0 and len(sample) == 0:
+                                ade = 0
+                                fde = 0
+                            elif len(sample) == 0 and len(gt_fut) > 0:
+                                if len(gt_fut_nodes) == 0:
+                                    continue
+                                for i in range(len(gt_fut)):
+                                    ade += torch.norm(self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i+1]][1]['pos'])
+                                ade /= len(gt_fut)
+                                fde = torch.norm(self.train_dataset.nodes[end_point][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                            elif len(sample) > 0 and len(gt_fut) == 0:
+                                max_dist = float('-inf')
+                                farthest_pred_node = None
+                                for pred_node in unique_pred_nodes:
+                                    ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                                    dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                                    if dist > max_dist:
+                                        max_dist = dist
+                                        farthest_pred_node = pred_node
+                                ade /= len(sample)
+                                fde = torch.norm(self.train_dataset.nodes[farthest_pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                            elif len(sample) > 0 and len(gt_fut) > 0:
+                                if len(gt_fut_nodes) == 0:
+                                    continue
+                                min_dist_fde = float('inf')
+                                clostest_pred_node = None
+                                for i, pred_node in enumerate(unique_pred_nodes):
+                                    min_dist = float('inf')
+                                    closest_gt_fut_node = None
+                                    for gt_fut_node in gt_fut_nodes:
+                                        dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_node][1]['pos'])
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            closest_gt_fut_node = gt_fut_node
+                                    ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[closest_gt_fut_node][1]['pos'])
+                                    dist_fde = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                                    if dist_fde < min_dist_fde:
+                                        fde = dist_fde
+                                        min_dist_fde = dist_fde
+                                if len(sample) > len(gt_fut):
+                                    ade /= len(sample)
+                                else:
+                                    ade /= len(gt_fut)
+                            if ade.item() < best_ade:
+                                best_ade = ade.item()
+                            if fde.item() < best_fde:
+                                best_fde = fde.item()
+                        if len(gt_fut_nodes) > 0:
+                            ade_list.append(best_ade)
+                            fde_list.append(best_fde)
+                return torch.mean(torch.tensor(ade_list)), torch.mean(torch.tensor(fde_list))
+            
+            else:
+                ade_list = []
+                fde_list = []
+                for batch_idx in tqdm(range(len(batched_gt_futs))):
+                    for idx in range(len(batched_gt_futs[batch_idx])):
+                        pred = batched_preds[batch_idx][idx]
+                        pred_nodes = [indexed_edges[j][0] for j in pred]
+                        unique_pred_nodes = set()
+                        for node in pred_nodes:
+                            unique_pred_nodes.update(node)  # Add both elements of the tuple to the set
 
-                    ade = 0
-                    fde = 0
-                    if len(gt_fut) == 0 and len(pred) == 0:
+                        # Convert the set back to a list
+                        unique_pred_nodes = list(unique_pred_nodes)
+                        gt_hist = batched_gt_hists[batch_idx][idx]
+                        start_point_coords, end_point_coords, start_point, end_point = find_trajectory_endpoints(gt_hist, edge_coordinates, indexed_edges)
+                        gt_fut_ = batched_gt_futs[batch_idx][idx]
+                        gt_fut = gt_fut_[gt_fut_ != -1]
+                        gt_fut_nodes = build_node_sequence(gt_fut, indexed_edges, end_point)
+                        
+
                         ade = 0
                         fde = 0
-                    elif len(pred) == 0 and len(gt_fut) > 0:
-                        if len(gt_fut_nodes) == 0:
-                            continue
-                        for i in range(len(gt_fut)):
-                            ade += torch.norm(self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i+1]][1]['pos'])
-                        ade /= len(gt_fut)
-                        fde = torch.norm(self.train_dataset.nodes[end_point][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
-                    elif len(pred) > 0 and len(gt_fut) == 0:
-                        max_dist = float('-inf')
-                        farthest_pred_node = None
-                        for pred_node in unique_pred_nodes:
-                            ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
-                            dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
-                            if dist > max_dist:
-                                max_dist = dist
-                                farthest_pred_node = pred_node
-                        ade /= len(pred)
-                        fde = torch.norm(self.train_dataset.nodes[farthest_pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
-                    elif len(pred) > 0 and len(gt_fut) > 0:
-                        if len(gt_fut_nodes) == 0:
-                            continue
-                        min_dist_fde = float('inf')
-                        clostest_pred_node = None
-                        for i, pred_node in enumerate(unique_pred_nodes):
-                            min_dist = float('inf')
-                            closest_gt_fut_node = None
-                            for gt_fut_node in gt_fut_nodes:
-                                dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_node][1]['pos'])
-                                if dist < min_dist:
-                                    min_dist = dist
-                                    closest_gt_fut_node = gt_fut_node
-                            ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[closest_gt_fut_node][1]['pos'])
-                            dist_fde = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
-                            if dist_fde < min_dist_fde:
-                                fde = dist_fde
-                                min_dist_fde = dist_fde
-                        if len(pred) > len(gt_fut):
-                            ade /= len(pred)
-                        else:
+                        if len(gt_fut) == 0 and len(pred) == 0:
+                            ade = 0
+                            fde = 0
+                        elif len(pred) == 0 and len(gt_fut) > 0:
+                            if len(gt_fut_nodes) == 0:
+                                continue
+                            for i in range(len(gt_fut)):
+                                ade += torch.norm(self.train_dataset.nodes[gt_fut_nodes[i]][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[i+1]][1]['pos'])
                             ade /= len(gt_fut)
-                    ade_list.append(ade)
-                    fde_list.append(fde)
-            return torch.mean(torch.tensor(ade_list)), torch.mean(torch.tensor(fde_list))
+                            fde = torch.norm(self.train_dataset.nodes[end_point][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                        elif len(pred) > 0 and len(gt_fut) == 0:
+                            max_dist = float('-inf')
+                            farthest_pred_node = None
+                            for pred_node in unique_pred_nodes:
+                                ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                                dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                                if dist > max_dist:
+                                    max_dist = dist
+                                    farthest_pred_node = pred_node
+                            ade /= len(pred)
+                            fde = torch.norm(self.train_dataset.nodes[farthest_pred_node][1]['pos'] - self.train_dataset.nodes[end_point][1]['pos'])
+                        elif len(pred) > 0 and len(gt_fut) > 0:
+                            if len(gt_fut_nodes) == 0:
+                                continue
+                            min_dist_fde = float('inf')
+                            clostest_pred_node = None
+                            for i, pred_node in enumerate(unique_pred_nodes):
+                                min_dist = float('inf')
+                                closest_gt_fut_node = None
+                                for gt_fut_node in gt_fut_nodes:
+                                    dist = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_node][1]['pos'])
+                                    if dist < min_dist:
+                                        min_dist = dist
+                                        closest_gt_fut_node = gt_fut_node
+                                ade += torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[closest_gt_fut_node][1]['pos'])
+                                dist_fde = torch.norm(self.train_dataset.nodes[pred_node][1]['pos'] - self.train_dataset.nodes[gt_fut_nodes[-1]][1]['pos'])
+                                if dist_fde < min_dist_fde:
+                                    fde = dist_fde
+                                    min_dist_fde = dist_fde
+                            if len(pred) > len(gt_fut):
+                                ade /= len(pred)
+                            else:
+                                ade /= len(gt_fut)
+                        ade_list.append(ade)
+                        fde_list.append(fde)
+                return torch.mean(torch.tensor(ade_list)), torch.mean(torch.tensor(fde_list))
         
         def calculate_ade_fde_valid(batched_preds, valid_ids, batched_gt_futs, batched_gt_hists, edge_coordinates, indexed_edges):
             ade_list = []
@@ -929,14 +1105,19 @@ class Graph_Diffusion_Model(nn.Module):
                 fut_ratio = calculate_fut_ratio(valid_samples, ground_truth_fut)
             else:
                 fut_ratio = 0
-            tpr = calculate_sample_tpr(binary_valid_samples, ground_truth_fut_binary)
-            prec = calculate_sample_prec(binary_valid_samples, ground_truth_fut_binary)
+            tpr = calculate_sample_tpr(binary_valid_samples, ground_truth_fut_binary, valid_ids, valid=True)
+            prec = calculate_sample_prec(binary_valid_samples, ground_truth_fut_binary, valid_ids, valid=True)
             f1 = calculate_sample_f1(tpr, prec)
-            acc = calculate_sample_accuracy(binary_valid_samples, ground_truth_fut_binary)
-            avg_sample_length = calculate_avg_sample_length(valid_samples)
+            acc = calculate_sample_accuracy(binary_valid_samples, ground_truth_fut_binary, valid_ids, valid=True)
+            avg_sample_length = calculate_avg_sample_length(valid_samples, valid_ids, valid=True)
             ade, fde = calculate_ade_fde_valid(valid_samples, valid_ids, ground_truth_fut, ground_truth_hist, self.train_dataset.edge_coordinates, self.train_dataset.indexed_edges)
+            # Get best metrics out of all samples
+            best_tpr, all_tpr = calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary, best=True)
+            best_prec, all_prec = calculate_sample_prec(sample_binary_list, ground_truth_fut_binary, best=True)
+            best_f1 = calculate_sample_f1(all_tpr, all_prec, best=True)
+            best_ade, best_fde = calculate_ade_fde(sample_list, ground_truth_fut, ground_truth_hist, self.train_dataset.edge_coordinates, self.train_dataset.indexed_edges, best=True)
             
-            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, valid_samples, valid_ids, ade, fde
+            return fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, valid_samples, valid_ids, ade, fde, best_f1, best_tpr, best_ade, best_fde
     
     def save_model(self):
         features = ''

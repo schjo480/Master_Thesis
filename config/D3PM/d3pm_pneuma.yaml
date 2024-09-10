@@ -1,7 +1,7 @@
 seml:
   executable: main_seml.py
-  name: pneuma_d3pm_residual
-  output_dir: experiments/pneuma_d3pm_residual
+  name: pneuma_d3pm_mlp
+  output_dir: experiments/pneuma_d3pm_mlp
   project_root_dir: ../..
   conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm
 
@@ -11,7 +11,7 @@ slurm:
     partition: gpu_gtx1080
     gres: gpu:1     # num GPUs
     mem: 64G          # memory
-    cpus-per-task: 8  # num cores
+    cpus-per-task: 5  # num cores
     time: 0-22:00     # max time, D-HH:MM
 
 fixed:
@@ -28,7 +28,7 @@ fixed:
     num_timesteps: 100
   
   model:
-    name: edge_encoder_residual
+    name: edge_encoder_mlp
     dropout: 0.1
     hidden_channels: 64
     time_embedding_dim: 16
@@ -65,12 +65,12 @@ fixed:
     eval_every_steps: 10
     
   wandb:
-    exp_name: "pneuma_residual"
+    exp_name: "pneuma_mlp"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
     job_type: "train"
     notes: ""
-    tags: ["pneuma", "edge_encoder_residual"]
+    tags: ["pneuma", "edge_encoder_mlp"]
 
   eval: False
 
@@ -78,22 +78,22 @@ grid:
   data.future_len:
     type: choice
     options:
-      #- 0 #for longest future, only in combination with 'future_len' in edge features
-      - 2
+      - 0 #for longest future, only in combination with 'future_len' in edge features
+      #- 2
       #- 5
-      - 10
+      #- 10
   data.edge_features:
     type: choice
     options:
-      - ['one_hot_edges', 'coordinates']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
-      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
-      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
+      #- ['one_hot_edges', 'coordinates']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
+      #- ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       
   diffusion_config.type:
     type: choice
