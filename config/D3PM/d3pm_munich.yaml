@@ -3,7 +3,7 @@ seml:
   name: munich_d3pm_residual
   output_dir: experiments/munich_d3pm_residual
   project_root_dir: ../..
-  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm
+  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm_new
 
 slurm:
   experiments_per_job: 1
@@ -18,7 +18,7 @@ fixed:
   data:
     dataset: munich
     train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_train.h5'
-    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_val.h5'
+    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_test.h5'
     history_len: 5
     num_classes: 2
 
@@ -68,11 +68,11 @@ fixed:
     exp_name: "munich_residual"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
-    job_type: "train"
+    job_type: "test"
     notes: ""
     tags: ["munich", "edge_encoder_residual"]
 
-  eval: False
+  eval: True
 
 grid:
   data.future_len:
@@ -85,15 +85,16 @@ grid:
   data.edge_features:
     type: choice
     options:
-      - ['one_hot_edges', 'coordinates']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
       - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
-      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len', 'start_end']
+      #- ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       
   diffusion_config.type:
     type: choice
@@ -105,6 +106,12 @@ grid:
     options:
       - 'custom'
       - 'marginal_prior'
+
+  testing.conditional_future_len: 
+    type: choice
+    options:
+      - None
+      #- 10
 
 random:
   samples: 1

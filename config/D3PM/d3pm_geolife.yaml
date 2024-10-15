@@ -3,23 +3,23 @@ seml:
   name: geolife_d3pm_residual
   output_dir: experiments/geolife_d3pm_residual
   project_root_dir: ../..
-  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm
+  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm_new
 
 slurm:
   experiments_per_job: 1
   sbatch_options:
-    partition: gpu_gtx1080
-    gres: gpu:1     # num GPUs
+    partition: gpu_gtx_1080
+    gres: gpu:gtx_1080:1     # num GPUs
     mem: 64G          # memory
     cpus-per-task: 5  # num cores
-    time: 0-22:00     # max time, D-HH:MM
+    time: 3-01:00     # max time, D-HH:MM
 
 fixed:
   data:
     dataset: geolife
     train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/geolife_train.h5'
-    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/geolife_val.h5'
-    history_len: 5
+    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/geolife_test.h5'
+    history_len: 2
     num_classes: 2
 
   diffusion_config:
@@ -45,7 +45,7 @@ fixed:
   training:
     lr: 0.009
     device: cuda
-    batch_size: 8
+    batch_size: 6
     optimizer: adam
     gradient_accumulation: False
     gradient_accumulation_steps: 1
@@ -59,7 +59,7 @@ fixed:
     pretrained: False
 
   testing:
-    batch_size: 4
+    batch_size: 3
     model_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/synthetic_d3pm_without_last_two_relu_longer_training/synthetic_d3pm_without_last_two_relu_longer_training.pth'
     number_samples: 10
     eval_every_steps: 10
@@ -68,11 +68,11 @@ fixed:
     exp_name: "geolife_residual"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
-    job_type: "train"
+    job_type: "test"
     notes: ""
     tags: ["geolife", "edge_encoder_residual"]
 
-  eval: False
+  eval: True
 
 grid:
   data.future_len:
@@ -92,7 +92,8 @@ grid:
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
       #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len', 'start_end']
       #- ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       
   diffusion_config.type:
@@ -105,6 +106,12 @@ grid:
     options:
       - 'custom'
       - 'marginal_prior'
+
+  testing.conditional_future_len: 
+    type: choice
+    options:
+      - None
+      - 10
 
 random:
   samples: 1

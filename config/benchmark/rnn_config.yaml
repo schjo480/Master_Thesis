@@ -1,0 +1,75 @@
+seml:
+  executable: main_benchmark.py
+  name: pneuma_benchmark
+  output_dir: experiments/pneuma_benchmark
+  project_root_dir: ../..
+  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm_new
+
+slurm:
+  experiments_per_job: 1
+  sbatch_options:
+    partition: gpu_gtx1080
+    gres: gpu:1     # num GPUs
+    mem: 64G          # memory
+    cpus-per-task: 5  # num cores
+    time: 0-22:00     # max time, D-HH:MM
+
+fixed:
+  data_config:
+    dataset: pneuma
+    train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_train.h5'
+    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_val.h5'
+    test_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_test.h5'
+    num_edge_features: 8
+    history_len: 5
+
+  model_config:
+    dropout: 0.1
+    hidden_size: 128
+    num_layers: 3
+  
+  training_config:
+    lr: 0.0004
+    device: cuda
+    batch_size: 64
+    optimizer: adam
+    num_epochs: 60
+    lr_decay: 0.99 # previously 0.9999
+    log_loss_every_steps: 1
+
+  testing_config:
+    batch_size: 64
+    true_future: False
+    
+  wandb_config:
+    exp_name: "pneuma_rnn"
+    project: "trajectory_prediction_using_denoising_diffusion_models"
+    entity: "joeschmit99"
+    job_type: "train"
+    notes: "benchmark"
+    tags: ["pneuma", "benchmark"]
+
+  eval: False
+
+grid:
+  model_config.model_type:
+    type: choice
+    options: 
+      - 'rnn'
+      - 'lstm'
+      - 'gru'
+  data_config.future_len:
+    type: choice
+    options:
+      #- 0 #for longest future, only in combination with 'future_len' in edge features
+      - 2
+      #- 5
+      #- 10
+  data_config.edge_features:
+    type: choice
+    options:
+      - ['one_hot_edges', 'coordinates', 'pw_distance', 'edge_length', 'edge_angles']
+
+random:
+  samples: 1
+  seed: 7059

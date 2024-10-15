@@ -55,6 +55,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.test_batch_size = self.test_config['batch_size']
         self.model_path = self.test_config['model_path']
         self.eval_every_steps = self.test_config['eval_every_steps']
+        self.conditional_future_len = self.test_config['conditional_future_len']
         
         # WandB
         self.wandb_config = wandb_config
@@ -176,8 +177,13 @@ class Graph_Diffusion_Model(nn.Module):
             else:
                 for data in self.train_data_loader:
                     edge_features = data.x      # (batch_size * num_edges, num_edge_features)
+                    
                     history_indices = data.history_indices  # (batch_size, history_len)
+                    print("History indices", history_indices)
+                    print("Future indices", data.future_indices)
+                    print("Edge features", edge_features)
                     x_start = data.y[:, :, 0]   # (batch_size, num_edges)
+                    print("x_start", torch.argwhere(x_start > 0))
                     edge_index = data.edge_index    # (2, batch_size * num_edges)
                                         
                     self.optimizer.zero_grad()
@@ -185,6 +191,7 @@ class Graph_Diffusion_Model(nn.Module):
                     # Get loss and predictions
                     loss, preds = dif.training_losses(model_fn, x_start=x_start, edge_features=edge_features, edge_index=edge_index, indices=history_indices)
                     total_loss += loss
+                    print("Preds", preds)
                     # Gradient calculation and optimization
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.3)
@@ -192,7 +199,8 @@ class Graph_Diffusion_Model(nn.Module):
                     
                     if epoch % self.log_metrics_every_steps == 0:
                         acc += torch.sum(preds == x_start).item() / (x_start.size(0) * x_start.size(1))
-                        tpr += torch.sum(preds * x_start).item() / torch.sum(x_start).item()
+                        if torch.sum(x_start).item() > 0:
+                            tpr += torch.sum(preds * x_start).item() / torch.sum(x_start).item()
                         if torch.sum(preds) > 0:
                             prec += torch.sum(preds * x_start).item() / torch.sum(preds).item()
                         ground_truth_fut.append(x_start.detach().to('cpu'))
@@ -248,7 +256,7 @@ class Graph_Diffusion_Model(nn.Module):
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
             
-    def get_samples(self, load_model=False, model_path=None, task='predict', save=False, number_samples=None):
+    def get_samples(self, load_model=False, model_path=None, task='predict', save=False, number_samples=None, test=False):
         """
         Retrieves samples from the model.
 
@@ -285,13 +293,17 @@ class Graph_Diffusion_Model(nn.Module):
         ground_truth_fut_binary = []
         
         if task == 'predict':
-            for data in tqdm(self.val_dataloader):
+            for ct, data in tqdm(enumerate(self.val_dataloader)):
+                if ct == 1:
+                    break
                 edge_features = data.x
                 bs = edge_features.size(0) // self.num_edges
                 history_edge_indices = data.history_indices
                 future_trajectory_indices = data.future_indices
                 future_binary = data.y[:, :, 0]
                 edge_index = data.edge_index
+                print("History indices", history_edge_indices)
+                print("Future indices", future_trajectory_indices)
             
                 if number_samples > 1:
                     sample_sublist_binary = []
@@ -359,7 +371,12 @@ class Graph_Diffusion_Model(nn.Module):
                 features = ''
                 for feature in self.edge_features:
                     features += feature + '_'
+                
                 save_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{self.wandb_config['exp_name']}' + '/' + f'{self.model_config['transition_mat_type']}' + '_' + f'{self.diffusion_config['type']}/'
+                if test:
+                    save_path = save_path + 'test_'
+                if self.future_len == 0:
+                    save_path = save_path + f'cond_fut_len_{self.test_config['conditional_future_len']}_'
                 if number_samples == 1:
                     torch.save(sample_list, save_path + f'samples_one_shot_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                     print(f"Samples saved at {save_path}samples_one_shot_{features}hist{self.history_len}_fut_{self.future_len}.pth)!")
@@ -389,7 +406,7 @@ class Graph_Diffusion_Model(nn.Module):
                     wandb.log({"Best Sample FDE": best_fde})
                     torch.save(valid_samples, save_path + f'samples_valid_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                     torch.save(valid_ids, save_path + f'valid_ids_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
-                    
+                
                 torch.save(ground_truth_hist, save_path + f'gt_hist_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                 torch.save(ground_truth_fut, save_path + f'gt_fut_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
             else:
@@ -638,9 +655,11 @@ class Graph_Diffusion_Model(nn.Module):
                 for i, (sample_sublist, ground_truth_sublist) in enumerate(zip(sample_binary_list, ground_truth_fut_binary)):
                     for j, (sample, ground_truth) in enumerate(zip(sample_sublist, ground_truth_sublist)):
                         if valid_id[i][j] is not None:
-                            if torch.sum(sample) > 0:
-                                acc.append(torch.sum(sample * ground_truth).item() / self.num_edges)
-                return sum(acc) / len(acc)
+                            acc.append(torch.sum(sample * ground_truth).item() / self.num_edges)
+                if len(acc) > 0:
+                    return sum(acc) / len(acc)
+                else:
+                    return 0
             else:
                 acc = 0
                 for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
@@ -665,9 +684,12 @@ class Graph_Diffusion_Model(nn.Module):
                 for i, (sample_sublist, ground_truth_sublist) in enumerate(zip(sample_binary_list, ground_truth_fut_binary)):
                     for j, (sample, ground_truth) in enumerate(zip(sample_sublist, ground_truth_sublist)):
                         if valid_id[i][j] is not None:
-                            if torch.sum(sample) > 0:
+                            if torch.sum(ground_truth) > 0:
                                 tpr.append(torch.sum(sample * ground_truth).item() / torch.sum(ground_truth).item())
-                return sum(tpr) / len(tpr)
+                if len(tpr) > 0:
+                    return sum(tpr) / len(tpr)
+                else:
+                    return 0
             else:
                 all_tprs = []
                 if best:
@@ -691,7 +713,10 @@ class Graph_Diffusion_Model(nn.Module):
                             tpr.append(best_tpr)
                             batch_tpr.append(tpr_sublist)
                         all_tprs.append(batch_tpr)
-                    return sum(tpr) / len(tpr), all_tprs
+                    if len(tpr) > 0:
+                        return sum(tpr) / len(tpr), all_tprs
+                    else:
+                        return 0, all_tprs
                 else:
                     tpr = 0
                     for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
@@ -709,7 +734,10 @@ class Graph_Diffusion_Model(nn.Module):
                         if valid_id[i][j] is not None:
                             if torch.sum(sample) > 0:
                                 prec.append(torch.sum(sample * ground_truth).item() / torch.sum(sample).item())
-                return sum(prec) / len(prec)
+                if len(prec) > 0:
+                    return sum(prec) / len(prec)
+                else:
+                    return 0
             else:
                 all_prec = []
                 if best:
@@ -733,7 +761,10 @@ class Graph_Diffusion_Model(nn.Module):
                             prec.append(best_prec)
                             batch_prec.append(prec_sublist)
                         all_prec.append(batch_prec)
-                    return sum(prec) / len(prec), all_prec
+                    if len(prec) > 0:
+                        return sum(prec) / len(prec), all_prec
+                    else:
+                        return 0, all_prec
                 else:
                     prec = 0
                     for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
@@ -761,7 +792,10 @@ class Graph_Diffusion_Model(nn.Module):
                         if valid_id[i][j] is not None:
                             total_len += len(sample)
                             ct += 1
-                return total_len / ct
+                if ct > 0:
+                    return total_len / ct
+                else:
+                    return 0
             else:
                 total_len = 0
                 for sample_sublist in sample_list:
@@ -906,10 +940,10 @@ class Graph_Diffusion_Model(nn.Module):
                                     ade /= len(sample)
                                 else:
                                     ade /= len(gt_fut)
-                            if ade.item() < best_ade:
-                                best_ade = ade.item()
-                            if fde.item() < best_fde:
-                                best_fde = fde.item()
+                            if ade < best_ade:
+                                best_ade = ade
+                            if fde < best_fde:
+                                best_fde = fde
                         if len(gt_fut_nodes) > 0:
                             ade_list.append(best_ade)
                             fde_list.append(best_fde)
@@ -1135,7 +1169,7 @@ class Graph_Diffusion_Model(nn.Module):
         print(f"Model saved at {save_path}")
         
     def load_model(self, model_path):
-        self.model.load_state_dict(torch.load(model_path))
+        self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         self.log.info("Model loaded!")
     
     def _build_optimizer(self):
@@ -1216,7 +1250,7 @@ class Graph_Diffusion_Model(nn.Module):
         return edge_index.to(self.device, non_blocking=True)
     
     def _build_val_dataloader(self):
-        self.val_dataset = TrajectoryGeoDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.val_dataset = TrajectoryGeoDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device, conditional_future_len=self.conditional_future_len)
         self.val_dataloader = DataLoader(self.val_dataset, 
                                          batch_size=self.test_batch_size, 
                                          shuffle=False, 
@@ -1229,7 +1263,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.model = self.model(self.model_config, self.history_len, self.future_len, self.num_classes,
                                 num_edges=self.num_edges, hidden_channels=self.hidden_channels, edge_features=self.edge_features, num_edge_features=self.num_edge_features, num_timesteps=self.num_timesteps, pos_encoding_dim=self.pos_encoding_dim)
         print("> Model built!")
-
+  
 import torch
 from torch_geometric.data import Dataset, Data
 import h5py
@@ -1246,7 +1280,7 @@ class MyData(Data):
             return super().__cat_dim__(key, value, *args, **kwargs)  # Default behaviour
 
 class TrajectoryGeoDataset(Dataset):
-    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None):
+    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None, conditional_future_len=None):
         super().__init__()
         self.ct = 0
         self.file_path = file_path
@@ -1268,6 +1302,7 @@ class TrajectoryGeoDataset(Dataset):
         self.avg_future_len = sum([len(traj['edge_idxs']) for traj in self.trajectories]) / len(self.trajectories) - self.history_len
         if self.future_len <= 0:
             self.future_len = self.longest_future
+        self.conditional_future_len = conditional_future_len
 
     @staticmethod
     def load_new_format(file_path, edge_features, device):
@@ -1319,19 +1354,26 @@ class TrajectoryGeoDataset(Dataset):
     def __getitem__(self, idx):
         trajectory = self.trajectories[idx]
         edge_idxs = trajectory['edge_idxs']
-        traj_len = len(edge_idxs) - self.history_len
-        if 'edge_orientations' in self.edge_features:
-            edge_orientations = trajectory['edge_orientations']
+        if self.conditional_future_len is not None:
+            traj_len = self.conditional_future_len
+        else:
+            traj_len = len(edge_idxs) - self.history_len
         
         padding_length = max(self.history_len + self.future_len - len(edge_idxs), 0)
         edge_idxs = torch.nn.functional.pad(edge_idxs, (0, padding_length), value=-1)
 
         # Split into history and future
-        history_indices = edge_idxs[:self.history_len]
-        future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
-        future_indices_check = future_indices[future_indices >= 0]
+        if 'start_end' in self.edge_features:
+            history_indices = torch.cat((torch.tensor([edge_idxs[0]], device=self.device), torch.tensor([edge_idxs[edge_idxs >= 0][-1]], device=self.device)))
+            future_indices = edge_idxs[1:-2]
+            future_indices_check = future_indices[future_indices >= 0]
+        else:
+            
+            history_indices = edge_idxs[:self.history_len]
+            future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
+            future_indices_check = future_indices[future_indices >= 0]
         
-        if self.history_len > 0:
+        if self.history_len > 0 and 'start_end' not in self.edge_features:
             # Check if datapoint is valid
             # 1. Check if history and future are connected
             edges = [self.indexed_edges[idx][0] for idx in torch.cat((history_indices, future_indices_check), dim=0)]  # Adjust this if your graph structure differs
@@ -1439,7 +1481,7 @@ class TrajectoryGeoDataset(Dataset):
                 #print("Future indices:", future_indices_check)
                 self.ct += 1
                 self.__getitem__((idx + 1) % len(self.trajectories))
-        else:
+        elif 'start_end' not in self.edge_features:
             # Check if datapoint is valid
             # 1. Check if history and future are connected
             edges = [self.indexed_edges[idx][0] for idx in edge_idxs]  # Adjust this if your graph structure differs
@@ -1451,6 +1493,7 @@ class TrajectoryGeoDataset(Dataset):
             if not connected:
                 self.ct += 1
                 self.__getitem__((idx + 1) % len(self.trajectories))
+        
         # Extract and generate features
         history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, traj_len, edge_idxs)
         data = MyData(x=history_edge_features,          # (batch_size * num_edges, num_edge_features)
@@ -1466,8 +1509,6 @@ class TrajectoryGeoDataset(Dataset):
         # Binary on/off edges
         valid_history_mask = history_indices >= 0
         valid_future_mask = future_indices >= 0
-        '''if 'start_end' in self.edge_features:
-            valid_future_mask = valid_future_mask[1:-1]'''
         
         history_one_hot_edges = torch.nn.functional.one_hot(history_indices[valid_history_mask], num_classes=len(self.edges))
         future_one_hot_edges = torch.nn.functional.one_hot(future_indices[valid_future_mask], num_classes=len(self.edges))
@@ -1483,18 +1524,45 @@ class TrajectoryGeoDataset(Dataset):
             start_edge = edge_idxs[0]
             end_edge = edge_idxs[edge_idxs >= 0][-1]
             start_node, end_node = self.find_trajectory_endpoints(edge_idxs[edge_idxs >= 0])
+            history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
             if self.edge_coordinates[start_edge][0][0] == start_node[0] and self.edge_coordinates[start_edge][0][1] == start_node[1]:
                 history_edge_features[start_edge, 0] = 1
+                history_edge_features[start_edge, 1] = 1
             else:
-                history_edge_features[start_edge, 0] = -1
+                history_edge_features[start_edge, 0] = 1
+                history_edge_features[start_edge, 1] = -1
             if self.edge_coordinates[start_edge][1][0] == end_node[0] and self.edge_coordinates[start_edge][1][1] == end_node[1]:
                 history_edge_features[end_edge, 0] = 1
+                history_edge_features[end_edge, 1] = 1
             else:
-                history_edge_features[end_edge, 0] = -1    
+                history_edge_features[end_edge, 0] = 1    
+                history_edge_features[end_edge, 1] = -1
                 
                     
             if 'coordinates' in self.edge_features:
-                history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+                if 'munich' in self.file_path or 'tdrive' in self.file_path or 'geolife' in self.file_path:
+                    # Get the coordinates of the history edges
+                    history_edge_coords = self.edge_coordinates[history_indices[valid_history_mask]]  # Shape: (num_valid_history_edges, 2, coordinate_dim)
+
+                    # Compute midpoints of the history edges
+                    history_edge_midpoints = (history_edge_coords[:, 0, :] + history_edge_coords[:, 1, :]) / 2  # Shape: (num_valid_history_edges, coordinate_dim)
+
+                    # Calculate the mean coordinate
+                    mean_coordinate = history_edge_midpoints.mean(dim=0)  # Shape: (coordinate_dim,)
+
+                    # **Recenter All Edge Coordinates**
+                    mean_coordinate = mean_coordinate.view(1, 1, -1)  # Reshape to (1, 1, coordinate_dim) for broadcasting
+                    recentered_edge_coordinates = self.edge_coordinates - mean_coordinate  # Shape: (num_edges, 2, coordinate_dim)
+
+                    # **Normalize the Recentered Coordinates to 0-1 Range**
+                    # Flatten the recentered coordinates
+                    recentered_edge_coords_flat = recentered_edge_coordinates.view(len(self.edges), -1)  # Shape: (num_edges, 2 * coordinate_dim)
+
+                    history_edge_features = torch.cat((history_edge_features, recentered_edge_coords_flat.float()), dim=1)
+
+                else:
+                    history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+                
             if 'road_type' in self.edge_features:
                 history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
             if 'pw_distance' in self.edge_features:
@@ -1532,7 +1600,28 @@ class TrajectoryGeoDataset(Dataset):
 
         else:
             if 'coordinates' in self.edge_features:
-                history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+                if 'munich' in self.file_path or 'tdrive' in self.file_path or 'geolife' in self.file_path:
+                    # Get the coordinates of the history edges
+                    history_edge_coords = self.edge_coordinates[history_indices[valid_history_mask]]  # Shape: (num_valid_history_edges, 2, coordinate_dim)
+
+                    # Compute midpoints of the history edges
+                    history_edge_midpoints = (history_edge_coords[:, 0, :] + history_edge_coords[:, 1, :]) / 2  # Shape: (num_valid_history_edges, coordinate_dim)
+
+                    # Calculate the mean coordinate
+                    mean_coordinate = history_edge_midpoints.mean(dim=0)  # Shape: (coordinate_dim,)
+
+                    # **Recenter All Edge Coordinates**
+                    mean_coordinate = mean_coordinate.view(1, 1, -1)  # Reshape to (1, 1, coordinate_dim) for broadcasting
+                    recentered_edge_coordinates = self.edge_coordinates - mean_coordinate  # Shape: (num_edges, 2, coordinate_dim)
+
+                    # **Normalize the Recentered Coordinates to 0-1 Range**
+                    # Flatten the recentered coordinates
+                    recentered_edge_coords_flat = recentered_edge_coordinates.view(len(self.edges), -1)  # Shape: (num_edges, 2 * coordinate_dim)
+
+                    history_edge_features = torch.cat((history_edge_features, recentered_edge_coords_flat.float()), dim=1)
+
+                else:
+                    history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
             if 'road_type' in self.edge_features:
                 history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
             if 'pw_distance' in self.edge_features:
@@ -1561,9 +1650,9 @@ class TrajectoryGeoDataset(Dataset):
                 # Calculate the cosine of the angles
                 cosines = dot_products / (v1_mag * vector_mags)
                 cosines = cosines.unsqueeze(1)
-                history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
                 if torch.isnan(cosines).any():
                     cosines = torch.nan_to_num(cosines, nan=0.0)
+                history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
             if 'future_len' in self.edge_features:
                 future_len_feature = torch.tensor([traj_len / self.longest_future], device=self.device).float().repeat(self.num_edges).unsqueeze(1)
                 history_edge_features = torch.cat((history_edge_features, future_len_feature), dim=1)
@@ -1574,6 +1663,7 @@ class TrajectoryGeoDataset(Dataset):
             history_edge_features = history_edge_features[:, 1:]
         
         return history_edge_features, future_edge_features
+    
     
     def find_trajectory_endpoints(self, edge_sequence):
         """
@@ -2747,6 +2837,9 @@ class CategoricalDiffusion:
                 new_edge_features[:, -1] = torch.sum(x, dim=1).repeat_interleave(self.num_edges) / self.num_edges
             else:
                 new_edge_features[:, -1] = x.flatten().float()
+            
+            if i == 0:
+                print(f"Sampled x at timestep {i}:", torch.argwhere(x > 0))
 
         if return_x_init:
             return x_init, x
@@ -2787,6 +2880,7 @@ class CategoricalDiffusion:
         
         # Replace true future with noised future
         x_t = x_t.float()   # (bs, num_edges)
+        print("Noised x", torch.argwhere(x_t > 0))
         new_edge_features = edge_features.clone()
         if 'num_pred_edges' in self.edge_features:
             new_edge_features = torch.cat((new_edge_features, torch.zeros((new_edge_features.size(0), 1), device=new_edge_features.device)), dim=1)
@@ -2826,14 +2920,13 @@ class CategoricalDiffusion:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
-    
-data_config = {"dataset": "synthetic_20_traj",
-    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_20_traj.h5',
-    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/synthetic_20_traj.h5',
+data_config = {"dataset": "pneuma_reduced",
+    "train_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_test.h5',
+    "val_data_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_test.h5',
     "history_len": 5,
     "future_len": 0,
     "num_classes": 2,
-    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'future_len'] # , 'road_type'
+    "edge_features": ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len'] # , 'road_type'
     }
 
 diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
@@ -2844,7 +2937,6 @@ diffusion_config = {"type": 'cosine', # Options: 'linear', 'cosine', 'jsd'
 model_config = {"name": "edge_encoder_residual",
     "hidden_channels": 64,
     "time_embedding_dim": 16,
-    "condition_dim": 32,
     "pos_encoding_dim": 16,
     "num_heads": 3,
     "num_layers": 3,
@@ -2852,19 +2944,19 @@ model_config = {"name": "edge_encoder_residual",
     "dropout": 0.1,
     "model_output": "logits",
     "model_prediction": "x_start",  # Options: 'x_start','xprev'
-    "transition_mat_type": 'custom',  # Options: 'gaussian', 'uniform', 'absorbing', 'marginal_prior', 'custom'
+    "transition_mat_type": 'marginal_prior',  # Options: 'gaussian', 'uniform', 'absorbing', 'marginal_prior', 'custom'
     "transition_bands": 0,
     "loss_type": "cross_entropy_x_start",  # Options: kl, cross_entropy_x_start, hybrid
     "hybrid_coeff": 0.001,  # Only used for hybrid loss type.
     }
 
-train_config = {"batch_size": 10,
+train_config = {"batch_size": 2,
                 "pretrain": False,
     "optimizer": "adam",
     "lr": 0.009,
     "gradient_accumulation": False,
     "gradient_accumulation_steps": 16,
-    "num_epochs": 40,
+    "num_epochs": 80,
     "learning_rate_warmup_steps": 80, # previously 10000
     "lr_decay": 0.999, # previously 0.9999
     "log_loss_every_steps": 1,
@@ -2872,13 +2964,14 @@ train_config = {"batch_size": 10,
     "save_model": False,
     "save_model_every_steps": 5}
 
-test_config = {"batch_size": 20,
-    "model_path": '/ceph/hdd/students/schmitj/experiments/synthetic_d3pm_test/synthetic_d3pm_test_edge_encoder_residual__hist5_fut5_marginal_prior_cosine_hidden_dim_64_time_dim_16_condition_dim_32.pth',
-    "number_samples": 4,
-    "eval_every_steps": 60
+test_config = {"batch_size": 2,
+    "model_path": '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/pneuma_residual/pneuma_residual_edge_encoder_residualone_hot_edges_coordinates_pos_encoding_pw_distance_edge_length_edge_angles_num_pred_edges_future_len___hist5_fut0_marginal_prior_cosine_hidden_dim_64_time_dim_16.pth',
+    "number_samples": 1,
+    "eval_every_steps": 40,
+    "conditional_future_len": None
   }
 
-wandb_config = {"exp_name": "test_residual",
+wandb_config = {"exp_name": "pneuma_residual",
                 "run_name": "test_residual",
     "project": "trajectory_prediction_using_denoising_diffusion_models",
     "entity": "joeschmit99",
@@ -2894,12 +2987,22 @@ elif model_config["name"] == 'edge_encoder_residual':
     encoder_model = Edge_Encoder_Residual
 
 model = Graph_Diffusion_Model(data_config, diffusion_config, model_config, train_config, test_config, wandb_config, encoder_model).to(device)
-model.train()
-model_path = test_config["model_path"]
+#print(model.train_dataset.edge_index)
+features = ''
+for feature in data_config['edge_features']:
+    features += feature + '_'
+exp_name = wandb_config['exp_name']
+model_dir = os.path.join("/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments", exp_name)
+model_path = os.path.join(model_dir, 
+                            exp_name + '_' + model_config['name'] + features + '_' + f'_hist{data_config['history_len']}' + f'_fut{data_config['future_len']}_' + model_config['transition_mat_type'] + '_' +  diffusion_config['type'] +
+                            f'_hidden_dim_{model_config['hidden_channels']}_time_dim_{str(model_config['time_embedding_dim'])}.pth')
+#model.load_model(model_path)
+#model.train()
+#model_path = test_config["model_path"]
 # One-Shot samples
-model.get_samples(load_model=False, task='predict', number_samples=1, save=True)
+model.get_samples(load_model=True, model_path=model_path, task='predict', number_samples=1, save=False)
 # Multiple samples
-model.get_samples(load_model=False, task='predict', save=True)
+#model.get_samples(load_model=False, task='predict', save=True)
 #sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary = model.get_samples(load_model=False, model_path=model_path, task='predict')
 #torch.save(sample_list, '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/test/samples_raw.pth')
 #fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, sample_list, valid_ids, ground_truth_hist, ground_truth_fut = model.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, return_samples=True)

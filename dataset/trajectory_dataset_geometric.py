@@ -14,7 +14,7 @@ class MyData(Data):
             return super().__cat_dim__(key, value, *args, **kwargs)  # Default behaviour
 
 class TrajectoryGeoDataset(Dataset):
-    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None):
+    def __init__(self, file_path, history_len, future_len, edge_features=None, device=None, embedding_dim=None, conditional_future_len=None):
         super().__init__()
         self.ct = 0
         self.file_path = file_path
@@ -36,6 +36,7 @@ class TrajectoryGeoDataset(Dataset):
         self.avg_future_len = sum([len(traj['edge_idxs']) for traj in self.trajectories]) / len(self.trajectories) - self.history_len
         if self.future_len <= 0:
             self.future_len = self.longest_future
+        self.conditional_future_len = conditional_future_len
 
     @staticmethod
     def load_new_format(file_path, edge_features, device):
@@ -87,19 +88,26 @@ class TrajectoryGeoDataset(Dataset):
     def __getitem__(self, idx):
         trajectory = self.trajectories[idx]
         edge_idxs = trajectory['edge_idxs']
-        traj_len = len(edge_idxs) - self.history_len
-        if 'edge_orientations' in self.edge_features:
-            edge_orientations = trajectory['edge_orientations']
+        if self.conditional_future_len is not None:
+            traj_len = self.conditional_future_len
+        else:
+            traj_len = len(edge_idxs) - self.history_len
         
         padding_length = max(self.history_len + self.future_len - len(edge_idxs), 0)
         edge_idxs = torch.nn.functional.pad(edge_idxs, (0, padding_length), value=-1)
 
         # Split into history and future
-        history_indices = edge_idxs[:self.history_len]
-        future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
-        future_indices_check = future_indices[future_indices >= 0]
+        if 'start_end' in self.edge_features:
+            history_indices = torch.cat((torch.tensor([edge_idxs[0]], device=self.device), torch.tensor([edge_idxs[edge_idxs >= 0][-1]], device=self.device)))
+            future_indices = edge_idxs[1:-2]
+            future_indices_check = future_indices[future_indices >= 0]
+        else:
+            
+            history_indices = edge_idxs[:self.history_len]
+            future_indices = edge_idxs[self.history_len:self.history_len + self.future_len]
+            future_indices_check = future_indices[future_indices >= 0]
         
-        if self.history_len > 0:
+        if self.history_len > 0 and 'start_end' not in self.edge_features:
             # Check if datapoint is valid
             # 1. Check if history and future are connected
             edges = [self.indexed_edges[idx][0] for idx in torch.cat((history_indices, future_indices_check), dim=0)]  # Adjust this if your graph structure differs
@@ -207,7 +215,7 @@ class TrajectoryGeoDataset(Dataset):
                 #print("Future indices:", future_indices_check)
                 self.ct += 1
                 self.__getitem__((idx + 1) % len(self.trajectories))
-        else:
+        elif 'start_end' not in self.edge_features:
             # Check if datapoint is valid
             # 1. Check if history and future are connected
             edges = [self.indexed_edges[idx][0] for idx in edge_idxs]  # Adjust this if your graph structure differs
@@ -219,6 +227,7 @@ class TrajectoryGeoDataset(Dataset):
             if not connected:
                 self.ct += 1
                 self.__getitem__((idx + 1) % len(self.trajectories))
+        
         # Extract and generate features
         history_edge_features, future_edge_features = self.generate_edge_features(history_indices, future_indices, traj_len, edge_idxs)
         data = MyData(x=history_edge_features,          # (batch_size * num_edges, num_edge_features)
@@ -234,8 +243,6 @@ class TrajectoryGeoDataset(Dataset):
         # Binary on/off edges
         valid_history_mask = history_indices >= 0
         valid_future_mask = future_indices >= 0
-        '''if 'start_end' in self.edge_features:
-            valid_future_mask = valid_future_mask[1:-1]'''
         
         history_one_hot_edges = torch.nn.functional.one_hot(history_indices[valid_history_mask], num_classes=len(self.edges))
         future_one_hot_edges = torch.nn.functional.one_hot(future_indices[valid_future_mask], num_classes=len(self.edges))
@@ -251,18 +258,45 @@ class TrajectoryGeoDataset(Dataset):
             start_edge = edge_idxs[0]
             end_edge = edge_idxs[edge_idxs >= 0][-1]
             start_node, end_node = self.find_trajectory_endpoints(edge_idxs[edge_idxs >= 0])
+            history_edge_features = torch.cat((history_edge_features, torch.zeros_like(future_edge_features)), dim=1)
             if self.edge_coordinates[start_edge][0][0] == start_node[0] and self.edge_coordinates[start_edge][0][1] == start_node[1]:
                 history_edge_features[start_edge, 0] = 1
+                history_edge_features[start_edge, 1] = 1
             else:
-                history_edge_features[start_edge, 0] = -1
+                history_edge_features[start_edge, 0] = 1
+                history_edge_features[start_edge, 1] = -1
             if self.edge_coordinates[start_edge][1][0] == end_node[0] and self.edge_coordinates[start_edge][1][1] == end_node[1]:
                 history_edge_features[end_edge, 0] = 1
+                history_edge_features[end_edge, 1] = 1
             else:
-                history_edge_features[end_edge, 0] = -1    
+                history_edge_features[end_edge, 0] = 1    
+                history_edge_features[end_edge, 1] = -1
                 
                     
             if 'coordinates' in self.edge_features:
-                history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+                if 'munich' in self.file_path or 'tdrive' in self.file_path or 'geolife' in self.file_path:
+                    # Get the coordinates of the history edges
+                    history_edge_coords = self.edge_coordinates[history_indices[valid_history_mask]]  # Shape: (num_valid_history_edges, 2, coordinate_dim)
+
+                    # Compute midpoints of the history edges
+                    history_edge_midpoints = (history_edge_coords[:, 0, :] + history_edge_coords[:, 1, :]) / 2  # Shape: (num_valid_history_edges, coordinate_dim)
+
+                    # Calculate the mean coordinate
+                    mean_coordinate = history_edge_midpoints.mean(dim=0)  # Shape: (coordinate_dim,)
+
+                    # **Recenter All Edge Coordinates**
+                    mean_coordinate = mean_coordinate.view(1, 1, -1)  # Reshape to (1, 1, coordinate_dim) for broadcasting
+                    recentered_edge_coordinates = self.edge_coordinates - mean_coordinate  # Shape: (num_edges, 2, coordinate_dim)
+
+                    # **Normalize the Recentered Coordinates to 0-1 Range**
+                    # Flatten the recentered coordinates
+                    recentered_edge_coords_flat = recentered_edge_coordinates.view(len(self.edges), -1)  # Shape: (num_edges, 2 * coordinate_dim)
+
+                    history_edge_features = torch.cat((history_edge_features, recentered_edge_coords_flat.float()), dim=1)
+
+                else:
+                    history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+                
             if 'road_type' in self.edge_features:
                 history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
             if 'pw_distance' in self.edge_features:
@@ -300,7 +334,28 @@ class TrajectoryGeoDataset(Dataset):
 
         else:
             if 'coordinates' in self.edge_features:
-                history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
+                if 'munich' in self.file_path or 'tdrive' in self.file_path or 'geolife' in self.file_path:
+                    # Get the coordinates of the history edges
+                    history_edge_coords = self.edge_coordinates[history_indices[valid_history_mask]]  # Shape: (num_valid_history_edges, 2, coordinate_dim)
+
+                    # Compute midpoints of the history edges
+                    history_edge_midpoints = (history_edge_coords[:, 0, :] + history_edge_coords[:, 1, :]) / 2  # Shape: (num_valid_history_edges, coordinate_dim)
+
+                    # Calculate the mean coordinate
+                    mean_coordinate = history_edge_midpoints.mean(dim=0)  # Shape: (coordinate_dim,)
+
+                    # **Recenter All Edge Coordinates**
+                    mean_coordinate = mean_coordinate.view(1, 1, -1)  # Reshape to (1, 1, coordinate_dim) for broadcasting
+                    recentered_edge_coordinates = self.edge_coordinates - mean_coordinate  # Shape: (num_edges, 2, coordinate_dim)
+
+                    # **Normalize the Recentered Coordinates to 0-1 Range**
+                    # Flatten the recentered coordinates
+                    recentered_edge_coords_flat = recentered_edge_coordinates.view(len(self.edges), -1)  # Shape: (num_edges, 2 * coordinate_dim)
+
+                    history_edge_features = torch.cat((history_edge_features, recentered_edge_coords_flat.float()), dim=1)
+
+                else:
+                    history_edge_features = torch.cat((history_edge_features, torch.flatten(self.edge_coordinates, start_dim=1).float()), dim=1)
             if 'road_type' in self.edge_features:
                 history_edge_features = torch.cat((history_edge_features, self.road_type.float()), dim=1)
             if 'pw_distance' in self.edge_features:
@@ -329,9 +384,9 @@ class TrajectoryGeoDataset(Dataset):
                 # Calculate the cosine of the angles
                 cosines = dot_products / (v1_mag * vector_mags)
                 cosines = cosines.unsqueeze(1)
-                history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
                 if torch.isnan(cosines).any():
                     cosines = torch.nan_to_num(cosines, nan=0.0)
+                history_edge_features = torch.cat((history_edge_features, cosines.float()), dim=1)
             if 'future_len' in self.edge_features:
                 future_len_feature = torch.tensor([traj_len / self.longest_future], device=self.device).float().repeat(self.num_edges).unsqueeze(1)
                 history_edge_features = torch.cat((history_edge_features, future_len_feature), dim=1)
@@ -342,6 +397,7 @@ class TrajectoryGeoDataset(Dataset):
             history_edge_features = history_edge_features[:, 1:]
         
         return history_edge_features, future_edge_features
+    
     
     def find_trajectory_endpoints(self, edge_sequence):
         """

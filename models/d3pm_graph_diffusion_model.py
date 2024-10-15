@@ -55,6 +55,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.test_batch_size = self.test_config['batch_size']
         self.model_path = self.test_config['model_path']
         self.eval_every_steps = self.test_config['eval_every_steps']
+        self.conditional_future_len = self.test_config['conditional_future_len']
         
         # WandB
         self.wandb_config = wandb_config
@@ -187,12 +188,13 @@ class Graph_Diffusion_Model(nn.Module):
                     total_loss += loss
                     # Gradient calculation and optimization
                     loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.3)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
                     self.optimizer.step()
                     
                     if epoch % self.log_metrics_every_steps == 0:
                         acc += torch.sum(preds == x_start).item() / (x_start.size(0) * x_start.size(1))
-                        tpr += torch.sum(preds * x_start).item() / torch.sum(x_start).item()
+                        if torch.sum(x_start).item() > 0:
+                            tpr += torch.sum(preds * x_start).item() / torch.sum(x_start).item()
                         if torch.sum(preds) > 0:
                             prec += torch.sum(preds * x_start).item() / torch.sum(preds).item()
                         ground_truth_fut.append(x_start.detach().to('cpu'))
@@ -248,7 +250,7 @@ class Graph_Diffusion_Model(nn.Module):
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
             
-    def get_samples(self, load_model=False, model_path=None, task='predict', save=False, number_samples=None):
+    def get_samples(self, load_model=False, model_path=None, task='predict', save=False, number_samples=None, test=False):
         """
         Retrieves samples from the model.
 
@@ -359,7 +361,12 @@ class Graph_Diffusion_Model(nn.Module):
                 features = ''
                 for feature in self.edge_features:
                     features += feature + '_'
+                
                 save_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{self.wandb_config['exp_name']}' + '/' + f'{self.model_config['transition_mat_type']}' + '_' + f'{self.diffusion_config['type']}/'
+                if test:
+                    save_path = save_path + 'test_'
+                if self.future_len == 0:
+                    save_path = save_path + f'cond_fut_len_{self.test_config['conditional_future_len']}_'
                 if number_samples == 1:
                     torch.save(sample_list, save_path + f'samples_one_shot_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                     print(f"Samples saved at {save_path}samples_one_shot_{features}hist{self.history_len}_fut_{self.future_len}.pth)!")
@@ -638,9 +645,11 @@ class Graph_Diffusion_Model(nn.Module):
                 for i, (sample_sublist, ground_truth_sublist) in enumerate(zip(sample_binary_list, ground_truth_fut_binary)):
                     for j, (sample, ground_truth) in enumerate(zip(sample_sublist, ground_truth_sublist)):
                         if valid_id[i][j] is not None:
-                            if torch.sum(sample) > 0:
-                                acc.append(torch.sum(sample * ground_truth).item() / self.num_edges)
-                return sum(acc) / len(acc)
+                            acc.append(torch.sum(sample * ground_truth).item() / self.num_edges)
+                if len(acc) > 0:
+                    return sum(acc) / len(acc)
+                else:
+                    return 0
             else:
                 acc = 0
                 for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
@@ -665,9 +674,12 @@ class Graph_Diffusion_Model(nn.Module):
                 for i, (sample_sublist, ground_truth_sublist) in enumerate(zip(sample_binary_list, ground_truth_fut_binary)):
                     for j, (sample, ground_truth) in enumerate(zip(sample_sublist, ground_truth_sublist)):
                         if valid_id[i][j] is not None:
-                            if torch.sum(sample) > 0:
+                            if torch.sum(ground_truth) > 0:
                                 tpr.append(torch.sum(sample * ground_truth).item() / torch.sum(ground_truth).item())
-                return sum(tpr) / len(tpr)
+                if len(tpr) > 0:
+                    return sum(tpr) / len(tpr)
+                else:
+                    return 0
             else:
                 all_tprs = []
                 if best:
@@ -691,7 +703,10 @@ class Graph_Diffusion_Model(nn.Module):
                             tpr.append(best_tpr)
                             batch_tpr.append(tpr_sublist)
                         all_tprs.append(batch_tpr)
-                    return sum(tpr) / len(tpr), all_tprs
+                    if len(tpr) > 0:
+                        return sum(tpr) / len(tpr), all_tprs
+                    else:
+                        return 0, all_tprs
                 else:
                     tpr = 0
                     for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
@@ -709,7 +724,10 @@ class Graph_Diffusion_Model(nn.Module):
                         if valid_id[i][j] is not None:
                             if torch.sum(sample) > 0:
                                 prec.append(torch.sum(sample * ground_truth).item() / torch.sum(sample).item())
-                return sum(prec) / len(prec)
+                if len(prec) > 0:
+                    return sum(prec) / len(prec)
+                else:
+                    return 0
             else:
                 all_prec = []
                 if best:
@@ -733,7 +751,10 @@ class Graph_Diffusion_Model(nn.Module):
                             prec.append(best_prec)
                             batch_prec.append(prec_sublist)
                         all_prec.append(batch_prec)
-                    return sum(prec) / len(prec), all_prec
+                    if len(prec) > 0:
+                        return sum(prec) / len(prec), all_prec
+                    else:
+                        return 0, all_prec
                 else:
                     prec = 0
                     for sample_sublist, ground_truth_sublist in zip(sample_binary_list, ground_truth_fut_binary):
@@ -761,7 +782,10 @@ class Graph_Diffusion_Model(nn.Module):
                         if valid_id[i][j] is not None:
                             total_len += len(sample)
                             ct += 1
-                return total_len / ct
+                if ct > 0:
+                    return total_len / ct
+                else:
+                    return 0
             else:
                 total_len = 0
                 for sample_sublist in sample_list:
@@ -906,10 +930,10 @@ class Graph_Diffusion_Model(nn.Module):
                                     ade /= len(sample)
                                 else:
                                     ade /= len(gt_fut)
-                            if ade.item() < best_ade:
-                                best_ade = ade.item()
-                            if fde.item() < best_fde:
-                                best_fde = fde.item()
+                            if ade < best_ade:
+                                best_ade = ade
+                            if fde < best_fde:
+                                best_fde = fde
                         if len(gt_fut_nodes) > 0:
                             ade_list.append(best_ade)
                             fde_list.append(best_fde)
@@ -1216,7 +1240,7 @@ class Graph_Diffusion_Model(nn.Module):
         return edge_index.to(self.device, non_blocking=True)
     
     def _build_val_dataloader(self):
-        self.val_dataset = TrajectoryGeoDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
+        self.val_dataset = TrajectoryGeoDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device, conditional_future_len=self.conditional_future_len)
         self.val_dataloader = DataLoader(self.val_dataset, 
                                          batch_size=self.test_batch_size, 
                                          shuffle=False, 

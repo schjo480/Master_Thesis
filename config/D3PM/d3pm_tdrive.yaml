@@ -3,7 +3,7 @@ seml:
   name: tdrive_d3pm_residual
   output_dir: experiments/tdrive_d3pm_residual
   project_root_dir: ../..
-  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm
+  conda_environment: /ceph/hdd/students/schmitj/miniconda3/envs/d3pm_new
 
 slurm:
   experiments_per_job: 1
@@ -12,13 +12,13 @@ slurm:
     gres: gpu:1     # num GPUs
     mem: 64G          # memory
     cpus-per-task: 5  # num cores
-    time: 0-22:00     # max time, D-HH:MM
+    time: 1-22:00     # max time, D-HH:MM
 
 fixed:
   data:
     dataset: tdrive
     train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_train.h5'
-    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_val.h5'
+    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/tdrive_test.h5'
     history_len: 5
     num_classes: 2
 
@@ -30,11 +30,11 @@ fixed:
   model:
     name: edge_encoder_residual
     dropout: 0.1
-    hidden_channels: 64
-    time_embedding_dim: 16
+    hidden_channels: 16
+    time_embedding_dim: 4
     num_heads: 3
-    num_layers: 3
-    pos_encoding_dim: 16
+    num_layers: 2
+    pos_encoding_dim: 4
     model_output: logits
     theta: 1.0 # controls strength of conv layers in residual model
     model_prediction: x_start  # Options: 'x_start','xprev'
@@ -45,7 +45,7 @@ fixed:
   training:
     lr: 0.009
     device: cuda
-    batch_size: 8
+    batch_size: 2
     optimizer: adam
     gradient_accumulation: False
     gradient_accumulation_steps: 1
@@ -68,43 +68,50 @@ fixed:
     exp_name: "tdrive_residual"
     project: "trajectory_prediction_using_denoising_diffusion_models"
     entity: "joeschmit99"
-    job_type: "train"
+    job_type: "test"
     notes: ""
     tags: ["tdrive", "edge_encoder_residual"]
 
-  eval: False
+  eval: True
 
 grid:
   data.future_len:
     type: choice
     options:
-      #- 0 #for longest future, only in combination with 'future_len' in edge features
-      - 2
+      - 0 #for longest future, only in combination with 'future_len' in edge features
+      #- 2
       #- 5
-      - 10
+      #- 10
   data.edge_features:
     type: choice
     options:
-      - ['one_hot_edges', 'coordinates']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
-      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
-      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
-      - ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
+      #- ['one_hot_edges', 'coordinates']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'edge_length']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
+      - ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len']
+      #- ['one_hot_edges', 'coordinates', 'pos_encoding', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges', 'future_len', 'start_end']
+      #- ['coordinates', 'pw_distance', 'edge_length', 'edge_angles', 'num_pred_edges']
       
   diffusion_config.type:
     type: choice
     options:
-      - 'linear'
+      #- 'linear'
       - 'cosine'
   model.transition_mat_type:
     type: choice
     options:
       - 'custom'
       - 'marginal_prior'
+
+  testing.conditional_future_len: 
+    type: choice
+    options:
+      - None
+      - 10
 
 random:
   samples: 1
