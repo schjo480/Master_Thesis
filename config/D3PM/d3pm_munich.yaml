@@ -1,5 +1,5 @@
 seml:
-  executable: main_seml.py
+  executable: main_diffusion.py
   name: munich_d3pm_residual
   output_dir: experiments/munich_d3pm_residual
   project_root_dir: ../..
@@ -18,7 +18,7 @@ fixed:
   data:
     dataset: munich
     train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_train.h5'
-    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_test.h5'
+    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/munich_val.h5'
     history_len: 5
     num_classes: 2
 
@@ -72,7 +72,7 @@ fixed:
     notes: ""
     tags: ["munich", "edge_encoder_residual"]
 
-  eval: True
+  eval: False
 
 grid:
   data.future_len:
@@ -81,7 +81,7 @@ grid:
       #- 0 #for longest future, only in combination with 'future_len' in edge features
       - 2
       #- 5
-      - 10
+      #- 10
   data.edge_features:
     type: choice
     options:
@@ -100,11 +100,11 @@ grid:
     type: choice
     options:
       - 'linear'
-      - 'cosine'
+      #- 'cosine'
   model.transition_mat_type:
     type: choice
     options:
-      - 'custom'
+      #- 'custom'
       - 'marginal_prior'
 
   testing.conditional_future_len: 

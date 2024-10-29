@@ -3,34 +3,12 @@ import networkx as nx
 import h5py
 from tqdm import tqdm
 from collections import deque
-
-@staticmethod
-def load_new_format(file_path, edge_features, device):
-    paths = []
-    with h5py.File(file_path, 'r') as new_hf:
-        node_coordinates = new_hf['graph']['node_coordinates'][:]
-        # Normalize the coordinates to (0, 1) if any of the coordinates is larger than 1
-        if node_coordinates.max() > 1:
-            max_values = node_coordinates.max(0)[0]
-            min_values = node_coordinates.min(0)[0]
-            node_coordinates[:, 0] = (node_coordinates[:, 0] - min_values[0]) / (max_values[0] - min_values[0])
-            node_coordinates[:, 1] = (node_coordinates[:, 1] - min_values[1]) / (max_values[1] - min_values[1])
-        edges = new_hf['graph']['edges'][:]
-        edge_coordinates = node_coordinates[edges]
-        nodes = [(i, {'pos': pos}) for i, pos in enumerate(node_coordinates)]
-        edges = [tuple(edge) for edge in edges]
-        for i in tqdm(new_hf['trajectories'].keys()):
-            path_group = new_hf['trajectories'][i]
-            path = {attr: path_group[attr][()] for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
-            paths.append(path)
-        if 'road_type' in edge_features:
-            onehot_encoded_road_type = new_hf['graph']['road_type'][:]
-            return paths, nodes, edges, edge_coordinates, onehot_encoded_road_type
-        else:
-            return paths, nodes, edges, edge_coordinates
+import sys
+sys.path.append('/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction')
+from dataset.trajectory_dataset_rnn import TrajectoryDataset
 
 class Markov_Model():
-    def __init__(self, history_len, future_len, edges, node_positions, use_padding=False, use_actual_future_len=False):
+    def __init__(self, history_len, future_len, edges, node_positions, use_padding=False):
         """
         Initializes the Markov Model.
         :param history_len: Fixed number of prior states (nodes) to consider.
@@ -38,14 +16,12 @@ class Markov_Model():
         :param edges: List of edges in the graph.
         :param node_positions: Dictionary mapping node IDs to their coordinates.
         :param use_padding: Boolean indicating whether to pad shorter paths with stop tokens.
-        :param use_actual_future_len: Boolean indicating whether to predict using actual future lengths of paths.
         """
         self.history_len = history_len
         self.future_len = future_len
         self.edges = edges
         self.node_positions = node_positions
         self.use_padding = use_padding
-        self.use_actual_future_len = use_actual_future_len
         self.weights = {}
         # Determine the number of nodes
         self.num_nodes = max(node_positions.keys()) + 1  # Assuming nodes are indexed from 0
@@ -301,67 +277,6 @@ class Markov_Model():
 
         return sequence_accuracy, node_accuracy, ade, fde
 
-
-    
-    '''def test(self, test_paths):
-        """
-        Evaluates the model's predictions on test paths.
-        :param test_paths: Test paths as list of node sequences.
-        :return: Tuple containing sequence accuracy, node-wise accuracy, and ADE of the predictions.
-        """
-        correct_sequence_predictions = 0
-        total_sequences = 0
-        correct_node_predictions = 0
-        total_node_predictions = 0
-        total_distance = 0  # For calculating ADE
-        total_final_distance = 0    # For calculating FDE
-
-        path_edges = [list(path['edge_idxs']) for path in test_paths]
-        test_paths = self.convert_edge_indices_to_node_paths(path_edges)
-        for path in test_paths:
-            for i in range(len(path) - self.history_len - self.future_len + 1):
-                prefix = tuple(path[i:i+self.history_len])
-                actual_next_nodes = path[i+self.history_len:i+self.history_len+self.future_len]
-                predicted_next_nodes = self.predict(prefix)
-                # Ensure the predicted list is the same length as actual
-                predicted_next_nodes = predicted_next_nodes[:len(actual_next_nodes)]
-                # Check if the entire sequence of predictions is correct
-                if predicted_next_nodes == actual_next_nodes:
-                    correct_sequence_predictions += 1
-                total_sequences += 1
-                # Calculate the displacement errors and node-wise accuracy
-                for pred_node, actual_node in zip(predicted_next_nodes, actual_next_nodes):
-                    # Node-wise accuracy
-                    total_node_predictions += 1
-                    if pred_node == actual_node:
-                        correct_node_predictions += 1
-                    # ADE calculation
-                    pred_pos = self.node_positions[pred_node]
-                    actual_pos = self.node_positions[actual_node]
-                    distance = np.linalg.norm(pred_pos - actual_pos)
-                    total_distance += distance
-                if len(predicted_next_nodes) == self.future_len:
-                    final_pred_node = predicted_next_nodes[-1]
-                    final_actual_node = actual_next_nodes[-1]
-                    final_pred_pos = self.node_positions[final_pred_node]
-                    final_actual_pos = self.node_positions[final_actual_node]
-                    final_distance = np.linalg.norm(final_pred_pos - final_actual_pos)
-                    total_final_distance += final_distance
-
-        # Calculate Average Displacement Error (ADE)
-        if total_sequences > 0 and total_node_predictions > 0:
-            ade = total_distance / total_node_predictions
-            fde = total_final_distance / total_sequences
-            sequence_accuracy = correct_sequence_predictions / total_sequences
-            node_accuracy = correct_node_predictions / total_node_predictions
-        else:
-            ade = 0
-            fde = 0
-            sequence_accuracy = 0
-            node_accuracy = 0
-
-        return sequence_accuracy, node_accuracy, ade, fde
-'''
     def convert_edge_indices_to_node_paths(self, path_edges):
         """
         Converts paths of edge indices to paths of node indices, handling potential reversal of the first edge.
@@ -413,11 +328,11 @@ class Markov_Model():
         return node_paths
 
 
+# === Define Dataset and Model parameters ===
 dataset = 'geolife'
 history_len = 6
 future_len = 100
-use_actual_future_len = True
-paths, nodes, edges, edge_coordinates = load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_train.h5', edge_features=[], device='cpu')
+paths, nodes, edges, edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_train.h5', edge_features=[], device='cpu')
 node_positions = {node_id: data['pos'] for node_id, data in nodes}
 # Build Graph
 G = nx.Graph()
@@ -433,11 +348,10 @@ markov = Markov_Model(
     edges=edges,
     node_positions=node_positions,
     use_padding=True,  # Enable padding
-    use_actual_future_len=use_actual_future_len
 )
 markov.train(G, paths)
-val_paths, test_nodes, val_edges, val_edge_coordinates = load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_val.h5', edge_features=[], device='cpu')
-test_paths, test_nodes, test_edges, test_edge_coordinates = load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_test.h5', edge_features=[], device='cpu')
+val_paths, test_nodes, val_edges, val_edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_val.h5', edge_features=[], device='cpu')
+test_paths, test_nodes, test_edges, test_edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_test.h5', edge_features=[], device='cpu')
 
 sequence_accuracy, accuracy, ade, fde = markov.test(paths)
 #print("Train Sequence Accuracy:", sequence_accuracy)

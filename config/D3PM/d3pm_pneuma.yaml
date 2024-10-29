@@ -1,5 +1,5 @@
 seml:
-  executable: main_seml.py
+  executable: main_diffusion.py
   name: pneuma_d3pm_residual
   output_dir: experiments/pneuma_d3pm_residual
   project_root_dir: ../..
