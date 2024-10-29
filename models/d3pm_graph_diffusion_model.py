@@ -16,7 +16,8 @@ import networkx as nx
 
 
 class Graph_Diffusion_Model(nn.Module):
-    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, model, pretrained=False):
+    def __init__(self, data_config, diffusion_config, model_config, train_config, test_config, wandb_config, 
+                 model, pretrained=False):
         super(Graph_Diffusion_Model, self).__init__()
         
         # Data
@@ -46,9 +47,7 @@ class Graph_Diffusion_Model(nn.Module):
         self.lr_decay_parameter = self.train_config['lr_decay']
         self.learning_rate_warmup_steps = self.train_config['learning_rate_warmup_steps']
         self.num_epochs = self.train_config['num_epochs']
-        self.gradient_accumulation = self.train_config['gradient_accumulation']
-        self.gradient_accumulation_steps = self.train_config['gradient_accumulation_steps']
-        self.batch_size = self.train_config['batch_size'] if not self.gradient_accumulation else self.train_config['batch_size'] * self.gradient_accumulation_steps
+        self.batch_size = self.train_config['batch_size']
         
         # Testing
         self.test_config = test_config
@@ -94,6 +93,7 @@ class Graph_Diffusion_Model(nn.Module):
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
+        
         # Build Components
         self._build_train_dataloader()
         self._build_val_dataloader()
@@ -106,12 +106,13 @@ class Graph_Diffusion_Model(nn.Module):
             for feature in self.edge_features:
                 features += feature + '_'
             pretrained_model_path = os.path.join(self.model_dir, 
-                                    self.exp_name + '_' + self.model_config['name'] + features + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
+                                    self.exp_name + '_' + self.model_config['name'] + features + '_' + 
+                                    f'_hist{self.history_len}' + f'_fut{self.future_len}_' + 
+                                    self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
                                     f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}.pth')
             self.load_model(pretrained_model_path)
         
         # Move model to GPU
-        
         self.model.to(self.device, non_blocking=True)
         print("Device", self.device)
         
@@ -119,13 +120,21 @@ class Graph_Diffusion_Model(nn.Module):
         """
         Trains the diffusion-based trajectory prediction model.
 
-        This function performs the training of the diffusion-based trajectory prediction model. It iterates over the specified number of epochs and updates the model's parameters based on the training data. The training process includes forward propagation, loss calculation, gradient computation, and parameter updates.
+        This function performs the training of the diffusion-based trajectory prediction model. It iterates over
+        the specified number of epochs and updates the model's parameters based on the training data. The training
+        process includes forward propagation, loss calculation, gradient computation, and parameter updates.
 
         Returns:
             None
         """
-        torch.autograd.set_detect_anomaly(True)
-        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, future_len=self.future_len, edge_features=self.edge_features, device=self.device, avg_future_len=self.avg_future_len)
+        # Detect potential anomalies
+        #torch.autograd.set_detect_anomaly(True)
+        # Create diffusion object
+        dif = make_diffusion(self.diffusion_config, self.model_config, num_edges=self.num_edges, 
+                             future_len=self.future_len, edge_features=self.edge_features, 
+                             device=self.device, avg_future_len=self.avg_future_len)
+        
+        # Define model function passed to diffusion object
         def model_fn(x, edge_index, t, indices=None):
             if self.model_config['name'] == 'edge_encoder_mlp':
                 return self.model.forward(x, t=t, indices=indices)
@@ -143,62 +152,30 @@ class Graph_Diffusion_Model(nn.Module):
             ground_truth_fut = []
             pred_fut = []
 
-            if self.gradient_accumulation:
-                for data in self.train_data_loader:
-                    edge_features = data["edge_features"]
-                    history_indices = data["history_indices"]
-                    future_edge_indices_one_hot = data["future_edge_features"][:, :, 0]
-                    
-                    self.optimizer.zero_grad()
-                    for i in range(min(self.gradient_accumulation_steps, edge_features.size(0))):
-                        # Calculate history condition c
-                        if self.model_config['name'] == 'edge_encoder':
-                            c = self.model.forward(x=edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i])
-                        elif self.model_config['name'] == 'edge_encoder_residual':
-                            c = self.model.forward(x=edge_features[i].unsqueeze(0), edge_index=self.edge_index, indices=history_indices[i])
-                        elif self.model_config['name'] == 'edge_encoder_mlp':
-                            c = self.model.forward(x=edge_features[i].unsqueeze(0), indices=history_indices[i])
-                        else:
-                            raise NotImplementedError(self.model_config['name'])
-                        
-                        x_start = future_edge_indices_one_hot[i].unsqueeze(0)   # (1, num_edges)
-                        # Get loss and predictions
-                        loss, preds = dif.training_losses(model_fn, c, x_start=x_start, edge_features=edge_features[i].unsqueeze(0), edge_index=self.edge_index, line_graph=None)   # preds are of shape (num_edges,)
-                        
-                        total_loss += loss / self.gradient_accumulation_steps
-                        (loss / self.gradient_accumulation_steps).backward() # Gradient accumulation
-                        
-                        if epoch % 10 == 0:
-                            ground_truth_fut.append(x_start.detach().to('cpu'))
-                            pred_fut.append(preds.detach().to('cpu'))
-                        
-                    self.optimizer.step()
-                    
-            else:
-                for data in self.train_data_loader:
-                    edge_features = data.x      # (batch_size * num_edges, num_edge_features)
-                    history_indices = data.history_indices  # (batch_size, history_len)
-                    x_start = data.y[:, :, 0]   # (batch_size, num_edges)
-                    edge_index = data.edge_index    # (2, batch_size * num_edges)
-                                        
-                    self.optimizer.zero_grad()
-                    
-                    # Get loss and predictions
-                    loss, preds = dif.training_losses(model_fn, x_start=x_start, edge_features=edge_features, edge_index=edge_index, indices=history_indices)
-                    total_loss += loss
-                    # Gradient calculation and optimization
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
-                    self.optimizer.step()
-                    
-                    if epoch % self.log_metrics_every_steps == 0:
-                        acc += torch.sum(preds == x_start).item() / (x_start.size(0) * x_start.size(1))
-                        if torch.sum(x_start).item() > 0:
-                            tpr += torch.sum(preds * x_start).item() / torch.sum(x_start).item()
-                        if torch.sum(preds) > 0:
-                            prec += torch.sum(preds * x_start).item() / torch.sum(preds).item()
-                        ground_truth_fut.append(x_start.detach().to('cpu'))
-                        pred_fut.append(preds.detach().to('cpu'))
+            for data in self.train_data_loader:
+                edge_features = data.x      # (batch_size * num_edges, num_edge_features)
+                history_indices = data.history_indices  # (batch_size, history_len)
+                x_start = data.y[:, :, 0]   # (batch_size, num_edges)
+                edge_index = data.edge_index    # (2, batch_size * num_edges)
+                                    
+                self.optimizer.zero_grad()
+                
+                # Get loss and predictions
+                loss, preds = dif.training_losses(model_fn, x_start=x_start, edge_features=edge_features, edge_index=edge_index, indices=history_indices)
+                total_loss += loss
+                # Gradient calculation and optimization
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
+                self.optimizer.step()
+                
+                if epoch % self.log_metrics_every_steps == 0:
+                    acc += torch.sum(preds == x_start).item() / (x_start.size(0) * x_start.size(1))
+                    if torch.sum(x_start).item() > 0:
+                        tpr += torch.sum(preds * x_start).item() / torch.sum(x_start).item()
+                    if torch.sum(preds) > 0:
+                        prec += torch.sum(preds * x_start).item() / torch.sum(preds).item()
+                    ground_truth_fut.append(x_start.detach().to('cpu'))
+                    pred_fut.append(preds.detach().to('cpu'))
             self.scheduler.step()
             
             # Log Loss
@@ -250,9 +227,10 @@ class Graph_Diffusion_Model(nn.Module):
             if self.train_config['save_model'] and (epoch + 1) % self.train_config['save_model_every_steps'] == 0:
                 self.save_model()
             
-    def get_samples(self, load_model=False, model_path=None, task='predict', save=False, number_samples=None, test=False):
+    def get_samples(self, load_model=False, model_path=None, task='predict', save=False, number_samples=None,
+                    test=False):
         """
-        Retrieves samples from the model.
+        Retrieves samples from the model and calculates metrics.
 
         Args:
             load_model (bool, optional): Whether to load a pre-trained model. Defaults to False.
@@ -400,44 +378,71 @@ class Graph_Diffusion_Model(nn.Module):
                 torch.save(ground_truth_hist, save_path + f'gt_hist_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
                 torch.save(ground_truth_fut, save_path + f'gt_fut_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
             else:
-                ### TODO: Debugging ###
-                # ground_truth_fut is a list (of length len(val_dataloader)) of tensors with shape (batch_size, future_len)
-                # ground_truth_fut_binary is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
-                
-                # For num_samples = 1 and batch_size > 1: (works ok!)
-                # sample_binary_list is a list (of length len(val_dataloader)) of tensors with shape (batch_size, num_edges)
-                # (sample_list is a list (of length len(val_dataloader)) of lists (of length batch_size) of tensors with size (num_edges == 1) (i.e could be empty tensors))
-                
-                # For num_samples > 1 and batch_size > 1: (Problem with calculating statistics after training)
-                # sample_binary_list is a list (of length len(val_dataloader)) of lists (of length number_samples) of tensors with shape (batch_size, num_edges)
-                # sample_list is a list (of length len(val_dataloader) of lists (of length number_samples) of lists (of length batch_size) of tensors with size (num_edges == 1) (i.e could be empty tensors)
-                
-                # For num_samples = 1 and batch_size = 1: (Problem with calculating statistics during training)
-                # sample_binary_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of tensors with shape (batch_size=1, num_edges)
-                # sample_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of tensors with size (num_edges == 1) (i.e could be empty tensors), no batch dimension as in ground_truth_fut
-                
-                # For num_samples > 1 and batch_size = 1: (Problem with calculating statistics after training)
-                # sample_binary_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of lists (of length number_samples) of tensors with shape (batch_size=1, num_edges)
-                # sample_list is a list (of length len(val_dataloader), i.e. number of trajectories here) of lists (of length number_samples) of tensors with size (num_edges == 1) (i.e could be empty tensors), no batch dimension as in ground_truth_fut
-                
                 return sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary
-        
-        elif task == 'generate':
-            # Generate realistic trajectories without condition
-            # Edge encoder model needs to be able to funciton with no edge_attr and no condition
-            # Add generate mode to p_logits, p_sample, and p_sample_loop
-            return
-        
         else:
             raise NotImplementedError(task)
 
-    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=None, return_samples=False):
+    def eval(self, sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary,
+             number_samples=None):
         """
-        Evaluate the model's performance.
+        Evaluate the model's predictions against ground truth trajectories and compute various performance metrics.
 
-        :param sample_list: A list of predicted edge indices.
-        :param ground_truth_hist: A list of actual history edge indices.
-        :param ground_truth_fut: A list of actual future edge indices.
+        Args:
+            sample_binary_list (list of torch.Tensor): List containing binary representations of the predicted samples. Each tensor has shape (batch_size, num_edges, 1).
+            sample_list (list of lists): List containing predicted edge sequences for each sample. Each inner list contains lists of edge indices for each trajectory in the batch.
+            ground_truth_hist (list): List containing ground truth history trajectories. Each element corresponds to a trajectory in the batch.
+            ground_truth_fut (list): List containing ground truth future trajectories. Each element corresponds to a trajectory in the batch.
+            ground_truth_fut_binary (list of torch.Tensor): List containing binary representations of the ground truth future trajectories. Each tensor has shape (batch_size, num_edges, 1).
+            number_samples (int, optional): Number of samples generated for evaluation. If None, defaults to the value specified in the test configuration.
+
+        Returns:
+            If number_samples == 1:
+                tuple: A tuple containing the following metrics:
+                    - fut_ratio (dict): Ratios of samples that have at least 'n' edges in common with the ground truth future trajectories for n from 1 to future length.
+                    - f1 (float): F1 score computed from the true positive rate and precision.
+                    - acc (float): Accuracy of the samples compared to the ground truth.
+                    - tpr (float): True positive rate (recall) of the samples.
+                    - avg_sample_length (float): Average length of the predicted samples.
+                    - valid_sample_ratio (float): Ratio of valid samples over all samples.
+                    - ade (float): Average Displacement Error between predicted and ground truth trajectories.
+                    - fde (float): Final Displacement Error between predicted and ground truth trajectories.
+            If number_samples > 1:
+                tuple: A tuple containing the following metrics:
+                    - fut_ratio (dict): Ratios of samples that have at least 'n' edges in common with the ground truth future trajectories for n from 1 to future length.
+                    - f1 (float): F1 score computed from the true positive rate and precision.
+                    - acc (float): Accuracy of the samples compared to the ground truth.
+                    - tpr (float): True positive rate (recall) of the samples.
+                    - avg_sample_length (float): Average length of the valid predicted samples.
+                    - valid_sample_ratio (float): Ratio of valid samples over all samples.
+                    - valid_samples (list): List of valid predicted samples after post-processing.
+                    - valid_ids (list): List of indices indicating which samples are valid.
+                    - ade (float): Average Displacement Error between valid predicted and ground truth trajectories.
+                    - fde (float): Final Displacement Error between valid predicted and ground truth trajectories.
+                    - best_f1 (float): Best F1 score achieved among all samples.
+                    - best_tpr (float): Best true positive rate achieved among all samples.
+                    - best_ade (float): Best Average Displacement Error achieved among all samples.
+                    - best_fde (float): Best Final Displacement Error achieved among all samples.
+
+        Notes:
+            - The method performs several computations to evaluate the quality of the predicted trajectories, including:
+                - Validity checks to ensure trajectories are connected, acyclic, and have no splits.
+                - Calculation of true positive rate, precision, F1 score, accuracy, and displacement errors.
+                - Optionally, for multiple samples, selects the best-performing samples based on the metrics.
+
+        Helper Functions:
+            - check_sample(sample): Checks if a sample trajectory is valid (connected, acyclic, no splits).
+            - get_valid_samples(sample_list, number_samples): Filters and selects valid samples from the generated samples.
+            - calculate_fut_ratio(sample_list, ground_truth_fut): Computes the ratio of samples matching ground truth future edges.
+            - calculate_sample_f1(tpr, prec, best=False): Calculates the F1 score from true positive rate and precision.
+            - calculate_sample_accuracy(sample_binary_list, ground_truth_fut_binary, valid_id=None, valid=False): Computes the accuracy of the samples.
+            - calculate_sample_tpr(sample_binary_list, ground_truth_fut_binary, valid_id=None, valid=False, best=False): Calculates the true positive rate of the samples.
+            - calculate_sample_prec(sample_binary_list, ground_truth_fut_binary, valid_id=None, valid=False, best=False): Calculates the precision of the samples.
+            - calculate_avg_sample_length(sample_list, valid_id=None, valid=False): Calculates the average length of the samples.
+            - calculate_ade_fde(batched_preds, batched_gt_futs, batched_gt_hists, edge_coordinates, indexed_edges, best=False): Calculates the Average and Final Displacement Errors.
+            - calculate_ade_fde_valid(...): Similar to calculate_ade_fde but for valid samples.
+            - build_node_sequence(edge_sequence, indexed_edges, start_point): Constructs a node sequence from an edge sequence.
+            - find_trajectory_endpoints(...): Determines the start and end points of a trajectory.
+
         """
         if number_samples is None:
             number_samples = self.test_config['number_samples']
@@ -1163,6 +1168,18 @@ class Graph_Diffusion_Model(nn.Module):
         self.log.info("Model loaded!")
     
     def _build_optimizer(self):
+        """
+        Build the optimizer and learning rate scheduler for training the model.
+
+        This method initializes the optimizer (Adam) with the model's parameters and sets up a learning rate scheduler using a lambda function for learning rate decay and warm-up.
+
+        Args:
+            None
+
+        Attributes:
+            self.optimizer (torch.optim.Optimizer): The optimizer instance used for training.
+            self.scheduler (torch.optim.lr_scheduler.LambdaLR): The learning rate scheduler instance.
+        """
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         
         def lr_lambda(epoch):
@@ -1175,14 +1192,8 @@ class Graph_Diffusion_Model(nn.Module):
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         print("> Optimizer and Scheduler built!")
         
-        """print("Parameters to optimize:")
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                print(name)"""
-        
     def _build_train_dataloader(self):
         print("Loading Training Dataset...")
-        # self.train_dataset = TrajectoryDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
         self.train_dataset = TrajectoryGeoDataset(self.train_data_path, self.history_len, self.future_len, self.edge_features, device=self.device)
         self.avg_future_len = self.train_dataset.avg_future_len
         self.G = self.train_dataset.build_graph()
@@ -1192,7 +1203,7 @@ class Graph_Diffusion_Model(nn.Module):
         if 'one_hot_edges' in self.edge_features:
             self.num_edge_features = 2  # Binary History and noised binary future
         else:
-            self.num_edge_features = 1
+            self.num_edge_features = 1  # Only noised binary future
         if 'coordinates' in self.edge_features:
             self.num_edge_features += 4
         if 'edge_orientations' in self.edge_features:
@@ -1221,23 +1232,6 @@ class Graph_Diffusion_Model(nn.Module):
                                             follow_batch=['x', 'y', 'history_indices', 'future_indices'])
                         
         print("> Training Dataset loaded!\n")
-        
-    def _build_edge_index(self):
-        print("Building edge index for line graph...")
-        edge_index = torch.tensor([[e[0], e[1]] for e in self.edges], dtype=torch.long).t().contiguous()
-        edge_to_index = {tuple(e[:2]): e[2]['index'] for e in self.edges}
-        line_graph_edges = []
-        edge_list = edge_index.t().tolist()
-        for i, (u1, v1) in tqdm(enumerate(edge_list), total=len(edge_list), desc="Processing edges"):
-            for j, (u2, v2) in enumerate(edge_list):
-                if i != j and (u1 == u2 or u1 == v2 or v1 == u2 or v1 == v2):
-                    line_graph_edges.append((edge_to_index[(u1, v1)], edge_to_index[(u2, v2)]))
-
-        # Create the edge index for the line graph
-        edge_index = torch.tensor(line_graph_edges, dtype=torch.long).t().contiguous()
-        print("> Edge index built!\n")
-        
-        return edge_index.to(self.device, non_blocking=True)
     
     def _build_val_dataloader(self):
         self.val_dataset = TrajectoryGeoDataset(self.val_data_path, self.history_len, self.future_len, self.edge_features, device=self.device, conditional_future_len=self.conditional_future_len)

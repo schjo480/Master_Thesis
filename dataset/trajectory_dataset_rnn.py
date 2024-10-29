@@ -8,6 +8,9 @@ import networkx as nx
 import numpy as np
 
 class TrajectoryDataset(Dataset):
+    """
+    Dataset class for trajectory prediction using RNNs.
+    """
     def __init__(self, file_path, edge_features, device, history_len, future_len, true_future, mode='train'):
         self.edge_features = edge_features
         self.device = device
@@ -25,11 +28,23 @@ class TrajectoryDataset(Dataset):
         self.num_edges = len(self.edges)
         self.stop_token = len(self.edges)
         self.padding_value = len(self.edges) + 1
-        self.adjacency_matrix = self.creat_adjaency_matrix()
+        self.adjacency_matrix = self.create_adjaency_matrix()
         self.true_future = true_future
 
     @staticmethod
-    def load_new_format(file_path, edge_features, device):
+    def load_new_format(file_path, device):
+        """
+        Load trajectory data in a new format from a file.
+        Args:
+            file_path (str): The path to the .h5 file containing the trajectory data.
+            device (torch.device): The device to load the data onto.
+        Returns:
+            tuple: A tuple containing the following elements:
+                - paths (list): A list of dictionaries representing the paths.
+                - nodes (list): A list of tuples representing the nodes.
+                - edges (list): A list of tuples representing the edges.
+                - edge_coordinates (torch.Tensor): A tensor representing the edge coordinates.
+        """
         paths = []
         with h5py.File(file_path, 'r') as new_hf:
             node_coordinates = torch.tensor(new_hf['graph']['node_coordinates'][:], dtype=torch.float, device=device)
@@ -47,16 +62,25 @@ class TrajectoryDataset(Dataset):
                 path_group = new_hf['trajectories'][i]
                 path = {attr: torch.tensor(path_group[attr][()], device=device) for attr in path_group.keys() if attr in ['coordinates', 'edge_idxs', 'edge_orientations']}
                 paths.append(path)
-            if 'road_type' in edge_features:
-                onehot_encoded_road_type = new_hf['graph']['road_type'][:]
-                return paths, nodes, edges, edge_coordinates, onehot_encoded_road_type
-            else:
-                return paths, nodes, edges, edge_coordinates
-
+            return paths, nodes, edges, edge_coordinates
+    
     def __len__(self):
         return len(self.trajectories)
 
     def __getitem__(self, idx):
+        """
+        Retrieves the item at the given index from the dataset.
+        Parameters:
+            idx (int): The index of the item to retrieve.
+        Returns:
+            tuple: A tuple containing the input sequence, target sequence, padding value, masks, and feature tensor.
+                - input_seq (torch.Tensor): The input edge sequence.
+                - target_seq (torch.Tensor): The target edge sequence.
+                - padding_value: The padding value.
+                - masks (torch.Tensor): The masks for each sequence.
+                - feature_tensor (torch.Tensor): The feature tensor.
+        """
+        
         if self.mode == 'train':
             edge_idxs = self.trajectories[idx]['edge_idxs']
             # Append stop token if the sequence is shorter than the desired length
@@ -87,7 +111,12 @@ class TrajectoryDataset(Dataset):
         
         return input_seq, target_seq, self.padding_value, masks, feature_tensor
 
-    def creat_adjaency_matrix(self):
+    def create_adjaency_matrix(self):
+        """
+        Returns:
+            torch.Tensor: The adjacency matrix for the edges in the graph.
+        """
+        
         edge_to_nodes = {}
         G = nx.Graph()
         G.add_nodes_from(self.nodes)
