@@ -70,8 +70,7 @@ Install required packages using requirements.txt:
 The first step is to prepare the dataset by creating the train, validation, and test splits.
 
 1. **Data Location**:
-- The data is stored in .h5 files located in the data/ directory.
-- Ensure you have access to these files or update the paths accordingly.
+- The data should be stored in .h5 files located in a data/ directory.
 
 2. **Create Train/Val/Test Splits**:
 
@@ -80,9 +79,8 @@ The first step is to prepare the dataset by creating the train, validation, and 
     ```bash
     notebooks/train_val_test_split.ipynb
     ```
-- This notebook processes the raw data and splits it into training, validation, and test sets.
-
-- Open the notebook and run all cells to generate the split datasets.
+- This notebook processes the raw data and splits it into training, validation, and test sets. There additionally is the option to split the sets based on trajectory coordinates.
+- Run the notebook to generate the split datasets.
 
 ## Training
 To train the model, run the main_diffusion.py script with the appropriate configuration file.
