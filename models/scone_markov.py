@@ -332,7 +332,7 @@ class Markov_Model():
 dataset = 'geolife'
 history_len = 6
 future_len = 100
-paths, nodes, edges, edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_train.h5', edge_features=[], device='cpu')
+paths, nodes, edges, edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_train.h5', device='cpu')
 node_positions = {node_id: data['pos'] for node_id, data in nodes}
 # Build Graph
 G = nx.Graph()
@@ -350,8 +350,8 @@ markov = Markov_Model(
     use_padding=True,  # Enable padding
 )
 markov.train(G, paths)
-val_paths, test_nodes, val_edges, val_edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_val.h5', edge_features=[], device='cpu')
-test_paths, test_nodes, test_edges, test_edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_test.h5', edge_features=[], device='cpu')
+val_paths, test_nodes, val_edges, val_edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_val.h5', device='cpu')
+test_paths, test_nodes, test_edges, test_edge_coordinates = TrajectoryDataset.load_new_format(f'/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/{dataset}_test.h5', device='cpu')
 
 sequence_accuracy, accuracy, ade, fde = markov.test(paths)
 #print("Train Sequence Accuracy:", sequence_accuracy)

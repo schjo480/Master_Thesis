@@ -18,7 +18,7 @@ fixed:
   data:
     dataset: pneuma
     train_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_train.h5'
-    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_test.h5'
+    val_data_path: '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/data/pneuma_test.h5' # change to val during training
     history_len: 5
     num_classes: 2
 
@@ -35,20 +35,12 @@ fixed:
     num_heads: 3
     num_layers: 3
     pos_encoding_dim: 16
-    model_output: logits
     theta: 1.0 # controls strength of conv layers in residual model
-    model_prediction: x_start  # Options: 'x_start','xprev'
-    transition_bands: null
-    loss_type: cross_entropy_x_start  # Options: kl, cross_entropy_x_start, hybrid
-    hybrid_coeff: 0.001  # Only used for hybrid loss type.
   
   training:
     lr: 0.009
-    device: cuda
     batch_size: 64
     optimizer: adam
-    gradient_accumulation: False
-    gradient_accumulation_steps: 1
     learning_rate_warmup_steps: 40 
     num_epochs: 50
     lr_decay: 0.99 # previously 0.9999

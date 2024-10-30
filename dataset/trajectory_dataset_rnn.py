@@ -17,12 +17,7 @@ class TrajectoryDataset(Dataset):
         self.mode = mode
         self.history_len = history_len
         self.future_len = future_len
-        if 'road_type' in self.edge_features:
-            self.trajectories, self.nodes, self.edges, self.edge_coordinates, self.road_type = self.load_new_format(file_path, self.edge_features, self.device)
-            self.road_type = torch.tensor(self.road_type, dtype=torch.float64, device=self.device)
-            self.num_road_types = self.road_type.size(1)
-        else:
-            self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.edge_features, self.device)
+        self.trajectories, self.nodes, self.edges, self.edge_coordinates = self.load_new_format(file_path, self.device)
 
         self.edge_coordinates = torch.cat((self.edge_coordinates, torch.zeros((2, self.edge_coordinates.size(1), 2), device=self.device)))  # Padding for stop token and padding token
         self.num_edges = len(self.edges)

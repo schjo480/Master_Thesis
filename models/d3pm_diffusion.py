@@ -11,7 +11,6 @@ def make_diffusion(diffusion_config, model_config, num_edges, future_len, edge_f
     return CategoricalDiffusion(
         betas=get_diffusion_betas(diffusion_config, device),
         transition_mat_type=model_config['transition_mat_type'],
-        transition_bands=model_config['transition_bands'],
         num_edges=num_edges,
         model_name=model_config['name'],
         future_len=future_len,
@@ -80,7 +79,7 @@ class CategoricalDiffusion:
     """
 
     def __init__(self, *, betas,
-               transition_mat_type, transition_bands, num_edges, torch_dtype=torch.float32, 
+               transition_mat_type, num_edges, torch_dtype=torch.float32, 
                model_name=None, future_len=None, edge_features=None, device=None, avg_future_len=None):
 
         self.torch_dtype = torch_dtype
@@ -98,7 +97,6 @@ class CategoricalDiffusion:
         # self.class_weights = torch.tensor([self.future_len / self.num_edges, 1 - self.future_len / self.num_edges], dtype=torch.float64)
         self.class_weights = torch.tensor([0.5, 0.5], dtype=torch.float64)
         self.class_probs = torch.tensor([1 - self.future_len / self.num_edges, self.future_len / self.num_edges], dtype=torch.float64)
-        self.transition_bands = transition_bands
         self.transition_mat_type = transition_mat_type
         self.eps = 1.e-6
 

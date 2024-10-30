@@ -75,8 +75,11 @@ class Graph_Diffusion_Model(nn.Module):
 
         # Logging
         self.dataset = self.data_config['dataset']
-        self.model_dir = os.path.join("experiments", self.exp_name)
-        os.makedirs(self.model_dir,exist_ok=True)
+        # Determine the project's root directory
+        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.model_dir = os.path.join(self.project_root, "experiments", self.exp_name)
+        print("Model dir", self.model_dir)
+        os.makedirs(self.model_dir, exist_ok=True)
         log_name = '{}.log'.format(time.strftime('%Y-%m-%d-%H-%M'))
         log_name = f"{self.dataset}_{log_name}"
         
@@ -87,9 +90,9 @@ class Graph_Diffusion_Model(nn.Module):
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(formatter)
         self.log.addHandler(file_handler)
-        
         self.log_loss_every_steps = self.train_config['log_loss_every_steps']
         self.log_metrics_every_steps = self.train_config['log_metrics_every_steps']   
+        
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -340,14 +343,23 @@ class Graph_Diffusion_Model(nn.Module):
                 for feature in self.edge_features:
                     features += feature + '_'
                 
-                save_path = '/ceph/hdd/students/schmitj/MA_Diffusion_based_trajectory_prediction/experiments/' + f'{self.wandb_config['exp_name']}' + '/' + f'{self.model_config['transition_mat_type']}' + '_' + f'{self.diffusion_config['type']}/'
+                # Construct the save path relative to self.model_dir
+                save_subdir = f"{self.model_config['transition_mat_type']}_{self.diffusion_config['type']}"
+                save_path = os.path.join(self.model_dir, save_subdir)
+                os.makedirs(save_path, exist_ok=True)
+                
                 if test:
-                    save_path = save_path + 'test_'
+                    save_prefix = 'test_'
+                else:
+                    save_prefix = ''
+                
                 if self.future_len == 0:
-                    save_path = save_path + f'cond_fut_len_{self.test_config['conditional_future_len']}_'
+                    save_prefix += f"cond_fut_len_{self.test_config['conditional_future_len']}_"
+
                 if number_samples == 1:
-                    torch.save(sample_list, save_path + f'samples_one_shot_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
-                    print(f"Samples saved at {save_path}samples_one_shot_{features}hist{self.history_len}_fut_{self.future_len}.pth)!")
+                    sample_file = f"{save_prefix}samples_one_shot_{features}hist{self.history_len}_fut_{self.future_len}.pth"
+                    torch.save(sample_list, os.path.join(save_path, sample_file))
+                    print(f"Samples saved at {os.path.join(save_path, sample_file)}!")
                     fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, ade, fde = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=number_samples)
                     wandb.log({"One-Shot F1 Score": f1})
                     wandb.log({"One-Shot Accuracy": acc})
@@ -358,7 +370,8 @@ class Graph_Diffusion_Model(nn.Module):
                     wandb.log({"One-Shot ADE": ade})
                     wandb.log({"One-Shot FDE": fde})
                 elif number_samples > 1:
-                    torch.save(sample_list, save_path + f'samples_raw_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                    sample_file = f"{save_prefix}samples_raw_{features}hist{self.history_len}_fut_{self.future_len}.pth"
+                    torch.save(sample_list, os.path.join(save_path, sample_file))
                     fut_ratio, f1, acc, tpr, avg_sample_length, valid_sample_ratio, valid_samples, valid_ids, ade, fde, best_f1, best_tpr, best_ade, best_fde = self.eval(sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary, number_samples=number_samples)
                     wandb.log({"Valid Sample F1 Score": f1})
                     wandb.log({"Valid Sample Accuracy": acc})
@@ -372,11 +385,15 @@ class Graph_Diffusion_Model(nn.Module):
                     wandb.log({"Best Sample TPR": best_tpr})
                     wandb.log({"Best Sample ADE": best_ade})
                     wandb.log({"Best Sample FDE": best_fde})
-                    torch.save(valid_samples, save_path + f'samples_valid_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
-                    torch.save(valid_ids, save_path + f'valid_ids_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                    valid_samples_file = f"{save_prefix}samples_valid_{features}hist{self.history_len}_fut_{self.future_len}.pth"
+                    valid_ids_file = f"{save_prefix}valid_ids_{features}hist{self.history_len}_fut_{self.future_len}.pth"
+                    torch.save(valid_samples, os.path.join(save_path, valid_samples_file))
+                    torch.save(valid_ids, os.path.join(save_path, valid_ids_file))
                     
-                torch.save(ground_truth_hist, save_path + f'gt_hist_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
-                torch.save(ground_truth_fut, save_path + f'gt_fut_' + features + f'hist{self.history_len}_fut_{self.future_len}.pth')
+                gt_hist_file = f"{save_prefix}gt_hist_{features}hist{self.history_len}_fut_{self.future_len}.pth"
+                gt_fut_file = f"{save_prefix}gt_fut_{features}hist{self.history_len}_fut_{self.future_len}.pth"
+                torch.save(ground_truth_hist, os.path.join(save_path, gt_hist_file))
+                torch.save(ground_truth_fut, os.path.join(save_path, gt_fut_file))
             else:
                 return sample_binary_list, sample_list, ground_truth_hist, ground_truth_fut, ground_truth_fut_binary
         else:
@@ -1156,9 +1173,8 @@ class Graph_Diffusion_Model(nn.Module):
         features = ''
         for feature in self.edge_features:
             features += feature + '_'
-        save_path = os.path.join(self.model_dir, 
-                                 self.exp_name + '_' + self.model_config['name'] + features + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + 
-                                 f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}.pth')
+        save_filename = self.exp_name + '_' + self.model_config['name'] + features + '_' + f'_hist{self.history_len}' + f'_fut{self.future_len}_' + self.model_config['transition_mat_type'] + '_' +  self.diffusion_config['type'] + f'_hidden_dim_{self.hidden_channels}_time_dim_{str(self.time_embedding_dim)}.pth'
+        save_path = os.path.join(self.model_dir, save_filename)
         torch.save(self.model.state_dict(), save_path)
         self.log.info(f"Model saved at {save_path}!")
         print(f"Model saved at {save_path}")
